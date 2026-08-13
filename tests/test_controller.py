@@ -9,6 +9,7 @@ import pytest
 
 from pressay.config import AppConfig
 from pressay.controller import DictationController, _prepare_insertion_text, _setup_command
+from pressay.platform_support import hotkey_hint
 from pressay.transcriber import TranscriptionResult, TranscriptionTimings
 from pressay.windows_input import ForegroundTarget, send_text as real_send_text
 
@@ -598,7 +599,7 @@ def test_auto_insert_exception_keeps_result_without_copying(monkeypatch) -> None
     assert copied == []
     assert controller.last_transcript == "тестовая фраза"
     assert statuses[-1] == ("Не вставлено — текст сохранён ниже", "warning")
-    assert notifications and "Shift+Alt+X" in str(notifications[-1][1])
+    assert notifications and hotkey_hint("copy") in str(notifications[-1][1])
     controller.close()
 
 
@@ -624,7 +625,7 @@ def test_paste_last_exception_never_falls_back_to_implicit_copy(monkeypatch) -> 
     assert copied == []
     assert controller.last_transcript == "секретный текст"
     assert statuses[-1] == ("Не вставлено — текст сохранён ниже", "warning")
-    assert notifications and "Shift+Alt+X" in str(notifications[-1][1])
+    assert notifications and hotkey_hint("copy") in str(notifications[-1][1])
     controller.close()
 
 
@@ -727,7 +728,7 @@ def test_model_warmup_is_async_and_reports_preparing_then_ready(monkeypatch) -> 
     transcriber.release.set()
     assert controller._warmup_future is not None
     controller._warmup_future.result(timeout=2)
-    assert statuses[-1] == ("Готов — удерживайте Ctrl+Win", "ready")
+    assert statuses[-1] == (f"Готов — удерживайте {hotkey_hint('hold')}", "ready")
     controller.close()
     assert controller.wait_closed(2)
 
@@ -869,8 +870,8 @@ def test_missing_local_model_reports_actionable_warmup_error(monkeypatch) -> Non
     controller._warmup_future.result(timeout=2)
 
     assert statuses[-1][1] == "error"
-    assert ".\\scripts\\setup.ps1 -Model large-v3" in statuses[-1][0]
+    assert _setup_command("large-v3") in statuses[-1][0]
     assert notifications
-    assert ".\\scripts\\setup.ps1 -Model large-v3" in str(notifications[-1][1])
+    assert _setup_command("large-v3") in str(notifications[-1][1])
     controller.close()
     assert controller.wait_closed(2)
