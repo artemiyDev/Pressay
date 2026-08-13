@@ -28,6 +28,11 @@ from pressay.ui import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _windows_app_platform(monkeypatch):
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
+
+
 def test_windows_single_instance_mutex_is_reacquirable() -> None:
     if os.name != "nt":
         pytest.skip("Windows mutex test")

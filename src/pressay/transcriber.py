@@ -1,4 +1,4 @@
-"""Persistent faster-whisper adapter with safe Windows CPU fallback."""
+"""Persistent faster-whisper adapter with safe platform-aware CPU fallback."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import site
+import sys
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -262,6 +263,9 @@ class FasterWhisperTranscriber:
 
     def _attempts(self) -> list[tuple[str, str]]:
         if self.device == "auto":
+            if sys.platform == "darwin":
+                compute_type = "int8" if self.compute_type == "auto" else self.compute_type
+                return [("cpu", compute_type)]
             if self.compute_type == "auto":
                 return [("cuda", "int8_float16"), ("cpu", "int8")]
             return [("cuda", self.compute_type), ("cpu", self.compute_type)]
@@ -308,7 +312,14 @@ class FasterWhisperTranscriber:
             detail = "; ".join(
                 f"{backend}: {type(error).__name__}" for backend, error in errors
             )
-            hint = " Run scripts\\setup.ps1" if self.local_files_only else ""
+            if self.local_files_only:
+                hint = (
+                    " Run scripts/setup-macos.sh"
+                    if sys.platform == "darwin"
+                    else " Run scripts\\setup.ps1"
+                )
+            else:
+                hint = ""
             raise ModelLoadError(
                 f"Could not load local model {self.model_size!r} ({detail}).{hint}"
             )

@@ -1,101 +1,62 @@
-# Pressay
+<p align="center">
+  <img src="src/pressay/assets/wordmark.svg" alt="Pressay" width="760">
+</p>
 
-**Press → say.** Локальная голосовая диктовка для Windows 11 без облачного API, телеметрии и сохранения аудио. Поддерживаются русский и английский языки.
+<p align="center"><strong>Press → say.</strong> Private, local-first voice dictation for Windows and macOS.</p>
 
-## Установка
+<p align="center">
+  <a href="docs/README.en.md">English</a> ·
+  <a href="docs/README.ru.md">Русский</a> ·
+  <a href="docs/TESTING.md">Testing status</a>
+</p>
 
-Откройте PowerShell в папке проекта и выполните одну команду:
+## Status
 
-```powershell
-.\scripts\install.ps1
-```
+| Platform | Status | Installation |
+|---|---|---|
+| Windows 11 | Stable, hardware-tested | `powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1` |
+| macOS 13+ | Developer beta, CI-tested | `bash scripts/install-macos.sh` |
 
-Скрипт без прав администратора:
+Pressay records from the selected microphone, recognizes Russian and English
+locally with faster-whisper, and inserts the final text only if the same
+editable control still owns focus. Audio and transcripts are not uploaded or
+written to disk.
 
-- создаёт изолированное окружение в `%LOCALAPPDATA%\Pressay\venv`;
-- устанавливает зависимости и загружает локальную модель `turbo`;
-- создаёт ярлык в меню «Пуск»;
-- запускает Pressay в системном трее.
+The macOS beta uses CPU inference. CTranslate2 supports Intel and Apple Silicon
+macOS wheels, but its faster-whisper backend does not use Metal/MPS. A real Mac
+is still required for the final microphone, Accessibility, Input Monitoring,
+menu-bar and application-insertion acceptance checklist.
 
-Дополнительные параметры:
+## Quick start
 
-```powershell
-# Добавить ярлык на рабочий стол
-.\scripts\install.ps1 -DesktopShortcut
-
-# Явно включить автозапуск при входе в Windows
-.\scripts\install.ps1 -EnableAutostart
-
-# Установить, но пока не запускать
-.\scripts\install.ps1 -NoLaunch
-```
-
-Автозапуск по умолчанию не включается. Повторный запуск установщика безопасен: управляемые ярлыки проверяются, а одноимённый чужой ярлык не перезаписывается.
-
-## Управление
-
-| Действие | Клавиши |
-|---|---|
-| Говорить, пока клавиши удерживаются | `Ctrl+Win` |
-| Включить или выключить hands-free | `Ctrl+Win+Space` |
-| Отменить текущую диктовку | `Esc` |
-| Вставить последний результат | `Shift+Alt+Z` |
-| Скопировать последний результат | `Shift+Alt+X` |
-
-Язык выбирается в окне настроек: русский, английский или автоматическое определение между ними. Двойной щелчок по значку в трее открывает настройки.
-
-### Личный словарь
-
-В настройках можно добавить по одному правилу на строку:
-
-```text
-фаст апи = FastAPI
-докер композ = Docker Compose
-вайт маркет = White.Market
-```
-
-Правильные написания одновременно используются как локальная подсказка для
-Whisper и как детерминированная замена после распознавания. Словарь хранится
-только в локальном `config.json`.
-
-### Потребление ресурсов
-
-- **Мгновенно** — модель остаётся в GPU; минимальная задержка.
-- **Сбалансированно** — модель выгружается через пять минут простоя.
-- **Экономно** — модель выгружается после каждой фразы; следующая диктовка запускается медленнее.
-
-Режим меняется в окне настроек. Для ежедневной диктовки на RTX рекомендуется
-«Мгновенно», для освобождения видеопамяти — «Сбалансированно».
-
-## Удаление
-
-Удалить только созданные Pressay ярлыки:
+### Windows
 
 ```powershell
-.\scripts\uninstall.ps1
+git clone https://github.com/artemiyDev/Pressay.git
+cd Pressay
+.\scripts\install.ps1 -DesktopShortcut -EnableAutostart
 ```
 
-Конфигурация, локальные модели и окружение Python при этом сохраняются. Дополнительное удаление выполняется только явными параметрами:
+### macOS
 
-```powershell
-# Окружение Python; восстанавливается повторной установкой
-.\scripts\uninstall.ps1 -RemoveRuntime
-
-# config.json и журнал; восстановить их после удаления нельзя
-.\scripts\uninstall.ps1 -RemoveUserData
-
+```bash
+git clone https://github.com/artemiyDev/Pressay.git
+cd Pressay
+bash scripts/install-macos.sh
 ```
 
-Перед `-RemoveRuntime` завершите приложение через меню значка в трее. Общий кэш моделей Hugging Face находится вне `%LOCALAPPDATA%\Pressay` и намеренно не удаляется.
+On macOS, grant Pressay access under **System Settings → Privacy & Security**:
+Microphone, Accessibility, and Input Monitoring. Restart Pressay after changing
+Accessibility or Input Monitoring permissions.
 
-## Диагностика и разработка
+## Privacy and safety
 
-```powershell
-.\scripts\doctor.ps1
-.\scripts\test.ps1 -q
-```
+- Local ASR after the model has been downloaded.
+- RU/EN only; automatic language selection never returns a third language.
+- No telemetry and no audio/transcript files.
+- Focus fingerprint is rechecked before every insertion batch and Enter.
+- Automatic insertion never falls back to overwriting the clipboard.
+- Corrupt configuration disables automatic insertion instead of restoring unsafe defaults.
 
-Приложение рассчитано на Python 3.11. Рабочая конфигурация хранится в `%LOCALAPPDATA%\Pressay\config.json`; после подготовки модели распознавание работает без сети.
-
-Журнал содержит только технические стадии и времена выполнения — текст
-диктовки, аудио и содержимое активного окна в него не записываются.
+MIT licensed. See the full [English guide](docs/README.en.md) or
+[Russian guide](docs/README.ru.md).

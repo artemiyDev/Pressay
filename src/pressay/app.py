@@ -20,6 +20,7 @@ from .audio import AudioCaptureError, AudioRecorder
 from .config import AppConfig, ConfigError
 from .controller import DictationController
 from .ui import MicrophoneChoice, SettingsWindow, StatusOverlay, TrayController, UiSignals
+from .platform_support import input_adapter, is_macos, is_windows, user_data_directory
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,10 +41,24 @@ class _SingleInstance:
 
     def __init__(self, name: str = "Local\\Pressay.Desktop.Singleton") -> None:
         self._handle: int | None = None
+        self._lock_stream: Any | None = None
         self._name = name
 
     def acquire(self) -> bool:
-        if os.name != "nt":
+        if is_macos():
+            import fcntl
+
+            lock_path = user_data_directory() / "pressay.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            stream = lock_path.open("a+b")
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                stream.close()
+                return False
+            self._lock_stream = stream
+            return True
+        if not is_windows():
             return True
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
@@ -58,7 +73,16 @@ class _SingleInstance:
         return True
 
     def close(self) -> None:
-        if self._handle is None or os.name != "nt":
+        if self._lock_stream is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._lock_stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._lock_stream.close()
+                self._lock_stream = None
+            return
+        if self._handle is None or not is_windows():
             return
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
@@ -80,7 +104,7 @@ class _MainThreadDispatcher(QObject):
 
 
 def _configure_logging() -> None:
-    base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Pressay"
+    base = user_data_directory()
     try:
         base.mkdir(parents=True, exist_ok=True)
         log_path = base / "pressay.log"
@@ -281,9 +305,8 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
 
 def _snapshot_target() -> Any | None:
     try:
-        from .windows_input import snapshot_foreground_target, target_looks_editable
-
-        target = snapshot_foreground_target()
+        adapter = input_adapter()
+        target = adapter.snapshot_foreground_target()
         fingerprint = getattr(target, "focused_control", None)
         focus_kind = fingerprint[0] if fingerprint else "none"
         control_type = (
@@ -295,7 +318,7 @@ def _snapshot_target() -> Any | None:
             "recording_target_captured valid=%s editable=%s hwnd=%s pid=%s "
             "focus_kind=%s control_type=%s",
             bool(getattr(target, "is_valid", False)),
-            target_looks_editable(target),
+            adapter.target_looks_editable(target),
             int(getattr(target, "hwnd", 0) or 0),
             int(getattr(target, "pid", 0) or 0),
             focus_kind,
@@ -315,13 +338,15 @@ def main(argv: list[str] | None = None) -> int:
     single_instance = _SingleInstance()
     if not single_instance.acquire():
         LOGGER.info("secondary_instance_exited")
-        if not args.background:
+        if not args.background and is_windows():
             ctypes.windll.user32.MessageBoxW(
                 None,
                 "Pressay уже работает. Откройте его значок в системном трее.",
                 "Pressay",
                 0x40,
             )
+        elif not args.background:
+            print("Pressay is already running in the menu bar.", file=sys.stderr)
         return 0
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Pressay")
@@ -428,7 +453,14 @@ def main(argv: list[str] | None = None) -> int:
 
     hotkey_service: Any | None = None
     try:
-        from .windows_hotkeys import HotkeyAction, WindowsHotkeyService
+        if is_macos():
+            from .macos_hotkeys import HotkeyAction, MacOSHotkeyService
+
+            hotkey_type: Any = MacOSHotkeyService
+        else:
+            from .windows_hotkeys import HotkeyAction, WindowsHotkeyService
+
+            hotkey_type = WindowsHotkeyService
 
         def hotkey_callback(action: Any) -> None:
             def handle() -> None:
@@ -447,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
 
             dispatch_ui(handle)
 
-        hotkey_service = WindowsHotkeyService(hotkey_callback)
+        hotkey_service = hotkey_type(hotkey_callback)
         hotkey_service.start()
     except Exception as exc:
         LOGGER.exception("hotkey_service_failed")

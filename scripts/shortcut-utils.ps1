@@ -16,11 +16,13 @@ function Get-PressayLauncherSpec {
     }
 
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $iconPath = Join-Path $env:LOCALAPPDATA "Pressay\pressay.ico"
     [pscustomobject]@{
         TargetPath       = [System.IO.Path]::GetFullPath($powershell)
         Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`" --background"
         WorkingDirectory = $resolvedProjectRoot
         Description      = $script:PressayShortcutDescription
+        IconLocation     = if (Test-Path -LiteralPath $iconPath -PathType Leaf) { $iconPath } else { "" }
     }
 }
 
@@ -55,11 +57,20 @@ function Test-PressayShortcut {
             [System.StringComparison]::OrdinalIgnoreCase
         )
 
+        $iconMatches = (
+            [string]::IsNullOrWhiteSpace([string]$Spec.IconLocation) -or
+            [string]::Equals(
+                [System.IO.Path]::GetFullPath(($shortcut.IconLocation -split ',')[0]),
+                [System.IO.Path]::GetFullPath([string]$Spec.IconLocation),
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        )
         return (
             $targetMatches -and
             $workingDirectoryMatches -and
             $shortcut.Arguments -ceq [string]$Spec.Arguments -and
-            $shortcut.Description -ceq [string]$Spec.Description
+            $shortcut.Description -ceq [string]$Spec.Description -and
+            $iconMatches
         )
     }
     catch {
@@ -90,7 +101,19 @@ function New-PressayShortcut {
             Write-Host "Shortcut is already ready: $ShortcutPath"
             return
         }
-        throw "Refusing to replace an unmanaged shortcut: $ShortcutPath"
+        $shell = New-Object -ComObject WScript.Shell
+        $existing = $shell.CreateShortcut($ShortcutPath)
+        $owned = (
+            [string]::Equals([System.IO.Path]::GetFullPath($existing.TargetPath), [string]$Spec.TargetPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+            [string]::Equals([System.IO.Path]::GetFullPath($existing.WorkingDirectory), [string]$Spec.WorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase) -and
+            $existing.Arguments -ceq [string]$Spec.Arguments -and
+            $existing.Description -ceq [string]$Spec.Description
+        )
+        [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($existing)
+        [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+        if (-not $owned) {
+            throw "Refusing to replace an unmanaged shortcut: $ShortcutPath"
+        }
     }
 
     $parentDirectory = Split-Path -Parent $ShortcutPath
@@ -107,6 +130,9 @@ function New-PressayShortcut {
         $shortcut.Arguments = [string]$Spec.Arguments
         $shortcut.WorkingDirectory = [string]$Spec.WorkingDirectory
         $shortcut.Description = [string]$Spec.Description
+        if (-not [string]::IsNullOrWhiteSpace([string]$Spec.IconLocation)) {
+            $shortcut.IconLocation = [string]$Spec.IconLocation
+        }
         $shortcut.Save()
     }
     finally {

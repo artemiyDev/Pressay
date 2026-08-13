@@ -17,6 +17,7 @@ from .config import AppConfig
 from .state import SessionState
 from .text import process_transcript
 from .transcriber import FasterWhisperTranscriber, NoSpeechDetected, TranscriptionError
+from .platform_support import hotkey_hint, input_adapter, is_macos
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +27,17 @@ _MODEL_RETIRE_SECONDS: dict[str, float | None] = {
     "balanced": 300.0,
     "eco": 0.0,
 }
+
+
+def _setup_command(model_size: str) -> str:
+    if is_macos():
+        model_argument = f" --model {model_size}" if model_size in _SETUP_MODELS else ""
+        return f"bash scripts/setup-macos.sh{model_argument}"
+    return (
+        f".\\scripts\\setup.ps1 -Model {model_size}"
+        if model_size in _SETUP_MODELS
+        else ".\\scripts\\setup.ps1"
+    )
 
 
 def _insertion_status_text(reason: str) -> str:
@@ -41,7 +53,7 @@ def _insertion_status_text(reason: str) -> str:
     if reason == "focused_control_is_not_editable":
         return "Не вставлено: курсор не в поле ввода"
     if reason == "physical_modifiers_not_released":
-        return "Не вставлено: отпустите Ctrl и Win"
+        return f"Не вставлено: отпустите {hotkey_hint('hold')}"
     if reason in {
         "recording_target_required",
         "foreground_snapshot_failed",
@@ -335,11 +347,7 @@ class DictationController:
                 if not current:
                     LOGGER.debug("stale_model_warmup_failure: %s", type(exc).__name__)
                     return
-                setup_command = (
-                    f".\\scripts\\setup.ps1 -Model {model_size}"
-                    if model_size in _SETUP_MODELS
-                    else ".\\scripts\\setup.ps1"
-                )
+                setup_command = _setup_command(model_size)
                 message = (
                     f"Локальная модель {model_size!r} не загрузилась. "
                     f"Запустите {setup_command} и перезапустите Pressay."
@@ -358,7 +366,9 @@ class DictationController:
                 current = self._warmup_is_current_locked(model_size, generation)
                 session_active = self.state.active
             if current and not session_active:
-                self.status_callback("Готов — удерживайте Ctrl+Win", "ready")
+                self.status_callback(
+                    f"Готов — удерживайте {hotkey_hint('hold')}", "ready"
+                )
         if current:
             self._schedule_model_retirement(self.config.resource_mode)
 
@@ -1004,7 +1014,7 @@ class DictationController:
             self.status_callback("Готово — текст ниже", "success")
             return
         try:
-            from .windows_input import send_text
+            send_text = input_adapter().send_text
 
             insertion_text = _prepare_insertion_text(
                 text,
@@ -1018,7 +1028,7 @@ class DictationController:
                 cancelled=cancelled,
                 # Automatic delivery never overwrites the user's clipboard on
                 # failure. The transcript is already retained in memory/UI;
-                # copying remains an explicit Shift+Alt+X/button action.
+                # copying remains an explicit hotkey/button action.
                 fallback_to_clipboard=False,
             )
         except Exception as exc:
@@ -1031,7 +1041,7 @@ class DictationController:
             self.notification_callback(
                 "Pressay",
                 "Автовставка не сработала; текст сохранён в окне Pressay. "
-                "Скопируйте его кнопкой или Shift+Alt+X.",
+                f"Скопируйте его кнопкой или {hotkey_hint('copy')}.",
                 True,
             )
             return
@@ -1064,21 +1074,9 @@ class DictationController:
     @staticmethod
     def _copy_text(text: str) -> None:
         try:
-            from .windows_input import copy_text
-
-            copy_text(text)
+            input_adapter().copy_text(text)
         except Exception:
-            try:
-                import win32clipboard
-
-                win32clipboard.OpenClipboard()
-                try:
-                    win32clipboard.EmptyClipboard()
-                    win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-                finally:
-                    win32clipboard.CloseClipboard()
-            except Exception:
-                LOGGER.exception("clipboard_copy_failed")
+            LOGGER.exception("clipboard_copy_failed")
 
     def paste_last(self) -> bool:
         with self._lock:
@@ -1086,9 +1084,7 @@ class DictationController:
                 return False
             text = self.last_transcript
         try:
-            from .windows_input import paste_last
-
-            outcome = paste_last(
+            outcome = input_adapter().paste_last(
                 text,
                 cancelled=lambda: not self._last_transcript_is_current(text),
             )
@@ -1107,7 +1103,7 @@ class DictationController:
                     "Pressay",
                     "Не удалось вставить последнюю расшифровку. "
                     "Текст сохранён в окне Pressay; для копирования "
-                    "используйте Shift+Alt+X.",
+                    f"используйте {hotkey_hint('copy')}.",
                     True,
                 )
             return False

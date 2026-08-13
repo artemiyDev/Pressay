@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .platform_support import is_macos, is_windows, platform_label, user_data_directory
+
 
 @dataclass(slots=True)
 class Check:
@@ -118,9 +120,7 @@ def _model_cache_check(model: str) -> Check:
     if explicit:
         cache_roots.append(Path(explicit))
     cache_roots.append(Path.home() / ".cache" / "huggingface" / "hub")
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        cache_roots.append(Path(local_app_data) / "Pressay" / "models")
+    cache_roots.append(user_data_directory() / "models")
 
     folder = aliases.get(model, f"models--Systran--faster-whisper-{model}")
     matches = [root / folder for root in cache_roots if (root / folder).exists()]
@@ -137,8 +137,8 @@ def _model_cache_check(model: str) -> Check:
 def collect_checks(model: str = "turbo") -> tuple[list[Check], list[dict[str, Any]]]:
     checks = [
         Check(
-            "windows",
-            sys.platform == "win32",
+            "platform",
+            is_windows() or is_macos(),
             f"{platform.system()} {platform.release()} {platform.machine()}",
         ),
         Check("python", sys.version_info[:2] == (3, 11), platform.python_version()),
@@ -146,18 +146,32 @@ def collect_checks(model: str = "turbo") -> tuple[list[Check], list[dict[str, An
         _module_check("sounddevice"),
         _module_check("faster_whisper"),
         _module_check("PySide6"),
-        _module_check("win32api"),
-        _cuda_check(),
-        _cuda_runtime_check(),
         _model_cache_check(model),
     ]
+    if is_windows():
+        checks.extend(
+            (_module_check("win32api"), _cuda_check(), _cuda_runtime_check())
+        )
+    elif is_macos():
+        checks.extend(
+            (
+                _module_check("ApplicationServices"),
+                _module_check("Quartz"),
+                Check(
+                    "compute",
+                    True,
+                    "CPU int8 (faster-whisper/CTranslate2 has no Metal backend)",
+                    "optional",
+                ),
+            )
+        )
     microphone_check, devices = _audio_check()
     checks.append(microphone_check)
     return checks, devices
 
 
 def _render_human(checks: list[Check], devices: list[dict[str, Any]]) -> None:
-    print("Pressay doctor")
+    print(f"Pressay doctor ({platform_label()})")
     print(f"Python: {sys.executable}")
     for check in checks:
         symbol = "OK" if check.ok else ("WARN" if check.level == "optional" else "FAIL")

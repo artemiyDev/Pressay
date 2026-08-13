@@ -178,7 +178,7 @@ def _import_sounddevice() -> Any:
     except (ImportError, OSError) as exc:
         raise AudioDeviceError(
             "Microphone support is unavailable. Install sounddevice and "
-            "ensure a Windows input device is enabled."
+            "ensure an input device is enabled."
         ) from exc
     return sounddevice
 
@@ -375,7 +375,7 @@ class AudioRecorder:
         except AudioCaptureError:
             raise
         except Exception as exc:
-            raise AudioDeviceError("Could not enumerate Windows input devices") from exc
+            raise AudioDeviceError("Could not enumerate input devices") from exc
 
     @staticmethod
     def _preferred_device(devices: list[AudioDevice]) -> AudioDevice | None:
@@ -388,7 +388,7 @@ class AudioRecorder:
 
         Stable selectors prefer an exact name/host API/rate match.  Driver
         updates may alter one component, so progressively weaker name matches
-        are allowed.  A missing device deliberately falls back to the Windows
+        are allowed.  A missing device deliberately falls back to the system
         default input instead of accidentally opening an unrelated index.
         """
 

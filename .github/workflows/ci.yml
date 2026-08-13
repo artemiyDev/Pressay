@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: ${{ matrix.os }} / Python 3.11
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install common test dependencies
+        run: python -m pip install --upgrade pip numpy PySide6 pytest pytest-cov
+      - name: Install package metadata
+        run: python -m pip install --no-deps .
+      - name: Install macOS bridges
+        if: runner.os == 'macOS'
+        run: >-
+          python -m pip install
+          "pyobjc-framework-ApplicationServices>=10,<13"
+          "pyobjc-framework-Cocoa>=10,<13"
+          "pyobjc-framework-Quartz>=10,<13"
+      - name: Validate macOS framework imports
+        if: runner.os == 'macOS'
+        run: python -c "import AppKit, ApplicationServices, Quartz; import pressay.macos_input, pressay.macos_hotkeys"
+      - name: Validate shell installers
+        if: runner.os == 'macOS'
+        run: bash -n scripts/*-macos.sh
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -B -m pytest -q

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
@@ -26,6 +27,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .platform_support import platform_label
+
 
 STATE_COLORS = {
     "idle": "#64748b",
@@ -36,6 +39,8 @@ STATE_COLORS = {
     "warning": "#f59e0b",
     "error": "#ef4444",
 }
+ASSET_DIRECTORY = Path(__file__).with_name("assets")
+APP_ICON_PATH = ASSET_DIRECTORY / "app-icon.svg"
 
 
 def format_replacements(replacements: dict[str, str]) -> str:
@@ -125,26 +130,22 @@ class UiSignals(QObject):
     quit_requested = Signal()
 
 
-def make_icon(color: str = STATE_COLORS["ready"], size: int = 64) -> QIcon:
-    """Render a crisp tray icon without relying on an external asset file."""
+def make_icon(color: str | None = None, size: int = 64) -> QIcon:
+    """Load the Pressay artwork and optionally add a small state indicator."""
 
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    source = QIcon(str(APP_ICON_PATH))
+    pixmap = source.pixmap(size, size)
+    if pixmap.isNull():
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor("#081a3a"))
+    if color is None:
+        return QIcon(pixmap)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#111827"))
-    painter.drawRoundedRect(2, 2, size - 4, size - 4, 15, 15)
+    painter.setPen(QColor("#ffffff"))
     painter.setBrush(QColor(color))
-    bar_width = max(3, size // 12)
-    gap = max(2, size // 18)
-    heights = [18, 32, 44, 32, 18]
-    total = len(heights) * bar_width + (len(heights) - 1) * gap
-    x = (size - total) // 2
-    for height in heights:
-        scaled = height * size // 64
-        painter.drawRoundedRect(x, (size - scaled) // 2, bar_width, scaled, bar_width // 2, bar_width // 2)
-        x += bar_width + gap
+    diameter = max(10, size // 4)
+    painter.drawEllipse(size - diameter - 2, size - diameter - 2, diameter, diameter)
     painter.end()
     return QIcon(pixmap)
 
@@ -236,12 +237,21 @@ class SettingsWindow(QMainWindow):
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(16)
 
+        brand_row = QHBoxLayout()
+        brand_icon = QLabel()
+        brand_icon.setPixmap(make_icon(size=64).pixmap(64, 64))
+        brand_icon.setFixedSize(64, 64)
+        brand_text = QVBoxLayout()
         title = QLabel("Pressay")
         title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
-        subtitle = QLabel("Локальная диктовка в любом Windows-приложении")
+        subtitle = QLabel(f"Локальная диктовка в любом приложении {platform_label()}")
         subtitle.setStyleSheet("color: #64748b;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        brand_text.addWidget(title)
+        brand_text.addWidget(subtitle)
+        brand_row.addWidget(brand_icon)
+        brand_row.addLayout(brand_text)
+        brand_row.addStretch(1)
+        layout.addLayout(brand_row)
 
         self.status_label = QLabel("Готов к диктовке")
         self.status_label.setObjectName("statusCard")
@@ -427,7 +437,7 @@ class TrayController(QObject):
         super().__init__(window)
         self.signals = signals
         self.window = window
-        self.tray = QSystemTrayIcon(make_icon(), self)
+        self.tray = QSystemTrayIcon(make_icon(STATE_COLORS["ready"]), self)
         self.tray.setToolTip("Pressay — готов")
 
         menu = QMenu()

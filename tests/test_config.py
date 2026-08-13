@@ -8,6 +8,11 @@ import pytest
 from pressay.config import AppConfig, ConfigError, config_path, legacy_config_path
 
 
+@pytest.fixture(autouse=True)
+def _windows_config_paths(monkeypatch):
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
+
+
 def test_default_path_uses_localappdata(monkeypatch, tmp_path):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 

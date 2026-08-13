@@ -13,6 +13,19 @@ from pressay.transcriber import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _default_transcriber_tests_use_windows_backend_order(monkeypatch) -> None:
+    monkeypatch.setattr("pressay.transcriber.sys.platform", "win32")
+
+
+def test_macos_auto_backend_uses_cpu_int8_without_cuda_probe(monkeypatch) -> None:
+    monkeypatch.setattr("pressay.transcriber.sys.platform", "darwin")
+
+    transcriber = FasterWhisperTranscriber(device="auto", compute_type="auto")
+
+    assert transcriber._attempts() == [("cpu", "int8")]
+
+
 class FakeModel:
     def __init__(
         self,

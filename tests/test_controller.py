@@ -5,16 +5,31 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from pressay.config import AppConfig
-from pressay.controller import DictationController, _prepare_insertion_text
+from pressay.controller import DictationController, _prepare_insertion_text, _setup_command
 from pressay.transcriber import TranscriptionResult, TranscriptionTimings
 from pressay.windows_input import ForegroundTarget, send_text as real_send_text
+
+
+@pytest.fixture(autouse=True)
+def _controller_uses_testable_windows_adapter(monkeypatch):
+    import pressay.windows_input as windows_input
+
+    monkeypatch.setattr("pressay.controller.input_adapter", lambda: windows_input)
 
 
 @dataclass
 class FakeRecording:
     audio: np.ndarray
+
+
+def test_setup_command_is_native_to_each_platform(monkeypatch) -> None:
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "darwin")
+    assert _setup_command("small") == "bash scripts/setup-macos.sh --model small"
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
+    assert _setup_command("small") == ".\\scripts\\setup.ps1 -Model small"
 
 
 class FakeRecorder:

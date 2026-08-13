@@ -39,6 +39,11 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade packaging tools." }
     "pytest-cov>=6,<8"
 if ($LASTEXITCODE -ne 0) { throw "Failed to install Pressay dependencies." }
 
+$iconSource = Join-Path $projectRoot "src\pressay\assets\app-icon.svg"
+$iconTarget = Join-Path $env:LOCALAPPDATA "Pressay\pressay.ico"
+& $venvPython -c "from PySide6.QtCore import Qt; from PySide6.QtGui import QImage; image=QImage(r'$iconSource').scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation); assert not image.isNull() and image.save(r'$iconTarget', 'ICO')"
+if ($LASTEXITCODE -ne 0) { throw "Failed to prepare the Pressay application icon." }
+
 if (-not $SkipModel) {
     $env:PYTHONPATH = Join-Path $projectRoot "src"
     $sitePackages = Join-Path $env:LOCALAPPDATA "Pressay\venv\Lib\site-packages"

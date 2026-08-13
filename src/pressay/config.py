@@ -1,7 +1,7 @@
 """Persistent application settings for Pressay.
 
 The module deliberately has no UI or audio dependencies.  Configuration is
-stored as UTF-8 JSON below ``LOCALAPPDATA`` and replaced atomically so a crash
+stored as UTF-8 JSON in the native per-user data directory and replaced atomically so a crash
 cannot leave a partially-written settings file behind.
 """
 
@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Any, Mapping
+
+from .platform_support import is_windows, user_data_directory
 
 
 APP_DIRECTORY = "Pressay"
@@ -29,15 +31,13 @@ class ConfigError(ValueError):
 def config_path(local_appdata: str | os.PathLike[str] | None = None) -> Path:
     """Return the default per-user configuration path.
 
-    ``LOCALAPPDATA`` is always preferred on Windows.  The fallback makes the
-    module usable in portable/test environments where that variable is absent.
-    A caller may pass *local_appdata* to avoid consulting the environment.
+    A caller may pass *local_appdata* to select an explicit Windows-style base
+    directory in tests or migration tools.
     """
 
-    if local_appdata is None:
-        local_appdata = os.environ.get("LOCALAPPDATA")
-    base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-    return base / APP_DIRECTORY / CONFIG_FILENAME
+    if local_appdata is not None:
+        return Path(local_appdata) / APP_DIRECTORY / CONFIG_FILENAME
+    return user_data_directory() / CONFIG_FILENAME
 
 
 def legacy_config_path(local_appdata: str | os.PathLike[str] | None = None) -> Path:
@@ -82,7 +82,7 @@ class AppConfig:
     """User-editable Pressay settings.
 
     ``microphone`` normally stores the audio backend's stable selector;
-    ``None`` means the Windows default input device.  Integer device indexes
+    ``None`` means the system default input device.  Integer device indexes
     remain accepted so configurations written by older versions can migrate
     on their next UI save. Snippet triggers and replacement keys are
     interpreted by :mod:`pressay.text` as literal text, never as regular
@@ -166,7 +166,7 @@ class AppConfig:
         """Load *path*, returning defaults when the file does not yet exist."""
 
         target = Path(path) if path is not None else config_path()
-        if path is None and not target.exists():
+        if path is None and is_windows() and not target.exists():
             previous = legacy_config_path()
             if previous.is_file():
                 target = previous
