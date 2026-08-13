@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pressay"
+version = "0.1.0"
+description = "Private, local-first voice dictation for Windows"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "faster-whisper>=1.2.1,<2",
+  "numpy>=1.26,<3",
+  "PySide6>=6.8,<7",
+  "pywin32>=306; platform_system == 'Windows'",
+  "sounddevice>=0.5.1,<1",
+  "nvidia-cublas-cu12>=12,<13; platform_system == 'Windows'",
+  "nvidia-cudnn-cu12>=9,<10; platform_system == 'Windows'",
+  "uiautomation>=2.0,<3; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+]
+
+[project.scripts]
+pressay = "pressay.app:main"
+pressay-doctor = "pressay.doctor:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers -p no:cacheprovider"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["pressay"]

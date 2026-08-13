@@ -1,0 +1,493 @@
+"""Qt/Win32 entry point for the desktop application."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+from dataclasses import dataclass
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import sys
+import threading
+from typing import Any
+
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+
+from .audio import AudioCaptureError, AudioRecorder
+from .config import AppConfig, ConfigError
+from .controller import DictationController
+from .ui import MicrophoneChoice, SettingsWindow, StatusOverlay, TrayController, UiSignals
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigLoadResult:
+    """Validated startup settings plus an optional user-facing warning."""
+
+    config: AppConfig
+    warning: str | None = None
+
+
+class _SingleInstance:
+    """Per-user Windows mutex preventing duplicate hooks and tray icons."""
+
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, name: str = "Local\\Pressay.Desktop.Singleton") -> None:
+        self._handle: int | None = None
+        self._name = name
+
+    def acquire(self) -> bool:
+        if os.name != "nt":
+            return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, self._name)
+        if not handle:
+            return False
+        if ctypes.get_last_error() == self.ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self._handle = int(handle)
+        return True
+
+    def close(self) -> None:
+        if self._handle is None or os.name != "nt":
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        kernel32.CloseHandle(self._handle)
+        self._handle = None
+
+
+class _MainThreadDispatcher(QObject):
+    requested = Signal(object, object, object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested.connect(self._run)
+
+    @staticmethod
+    def _run(callback: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        callback(*args, **kwargs)
+
+
+def _configure_logging() -> None:
+    base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Pressay"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        log_path = base / "pressay.log"
+        root_logger = logging.getLogger()
+        if any(
+            bool(getattr(handler, "_pressay_rotating_file", False))
+            for handler in root_logger.handlers
+        ):
+            return
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler._pressay_rotating_file = True  # type: ignore[attr-defined]
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+    except OSError:
+        logging.basicConfig(level=logging.INFO)
+
+
+def _overlay_auto_hide_ms(state: str) -> int:
+    return 1500 if state in {"ready", "success", "warning", "error"} else 0
+
+
+def _start_shutdown_watchdog(
+    shutdown_complete: threading.Event,
+    *,
+    timeout_seconds: float = 3.0,
+    hard_exit: Any = os._exit,
+) -> threading.Thread:
+    """Enforce an overall deadline without touching potentially stuck locks.
+
+    Logging handlers and their locks may themselves be held by a stuck worker,
+    so the deadline thread deliberately performs no logging or flushing. The
+    rotating file handler flushes normal records as they are emitted.
+    """
+
+    def watch() -> None:
+        if shutdown_complete.wait(timeout_seconds):
+            return
+        hard_exit(0)
+
+    thread = threading.Thread(
+        target=watch,
+        name="pressay-shutdown-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _start_native_shutdown(
+    controller: DictationController,
+    hotkey_service: Any | None,
+    *,
+    timeout_seconds: float = 3.0,
+    hard_exit: Any = os._exit,
+) -> tuple[threading.Event, threading.Thread, threading.Thread]:
+    """Stop native services off the GUI thread under one hard deadline.
+
+    Controller/PortAudio cleanup and the low-level keyboard hook are independent
+    daemon workers, so one stuck native call cannot prevent the other cleanup
+    from starting. The watchdog is started first and also covers a synchronous
+    hang inside ``controller.close()`` itself.
+    """
+
+    shutdown_complete = threading.Event()
+    watchdog = _start_shutdown_watchdog(
+        shutdown_complete,
+        timeout_seconds=timeout_seconds,
+        hard_exit=hard_exit,
+    )
+    controller_call_done = threading.Event()
+    hotkey_done = threading.Event()
+
+    def close_controller() -> None:
+        try:
+            controller.close()
+        except Exception:
+            LOGGER.exception("controller_close_failed")
+        finally:
+            controller_call_done.set()
+
+    def stop_hotkeys() -> None:
+        try:
+            if hotkey_service is not None:
+                hotkey_service.stop()
+        except Exception:
+            LOGGER.exception("hotkey_stop_failed")
+        finally:
+            hotkey_done.set()
+
+    controller_thread = threading.Thread(
+        target=close_controller,
+        name="pressay-controller-close",
+        daemon=True,
+    )
+    hotkey_thread = threading.Thread(
+        target=stop_hotkeys,
+        name="pressay-hotkey-close",
+        daemon=True,
+    )
+    controller_thread.start()
+    hotkey_thread.start()
+
+    def coordinate() -> None:
+        controller_call_done.wait()
+        hotkey_done.wait()
+        try:
+            native_closed = controller.wait_closed()
+        except Exception:
+            LOGGER.exception("controller_close_wait_failed")
+            return
+        if native_closed:
+            shutdown_complete.set()
+
+    coordinator = threading.Thread(
+        target=coordinate,
+        name="pressay-shutdown-coordinator",
+        daemon=True,
+    )
+    coordinator.start()
+    return shutdown_complete, watchdog, coordinator
+
+
+def _load_config() -> _ConfigLoadResult:
+    try:
+        return _ConfigLoadResult(AppConfig.load())
+    except ConfigError:
+        # Never include file contents or parser details in the log. More
+        # importantly, a damaged/manual config must not silently restore the
+        # default auto-insert behaviour. The original file is deliberately
+        # left untouched until the user explicitly saves valid settings.
+        LOGGER.warning("configuration_load_failed: ConfigError")
+        safe_config = AppConfig(
+            auto_insert=False,
+            smart_spacing=False,
+            remove_fillers=False,
+            voice_press_enter=False,
+            snippets={},
+            replacements={},
+        )
+        warning = (
+            "Не удалось прочитать config.json: файл повреждён или содержит "
+            "недопустимую настройку. Автовставка и голосовые команды отключены; "
+            "исходный файл не изменён. Проверьте настройки и сохраните их вручную."
+        )
+        return _ConfigLoadResult(safe_config, warning)
+
+
+def _microphones() -> list[MicrophoneChoice]:
+    result = [MicrophoneChoice(None, "Системный микрофон по умолчанию")]
+    try:
+        devices = AudioRecorder.list_input_devices()
+    except AudioCaptureError:
+        return result
+    seen: set[str] = set()
+    for device in sorted(devices, key=lambda item: (not item.is_default, item.index)):
+        selector = device.stable_selector
+        if selector in seen:
+            continue
+        seen.add(selector)
+        suffix = " — по умолчанию" if device.is_default else ""
+        host_api = f", {device.host_api}" if device.host_api else ""
+        result.append(
+            MicrophoneChoice(
+                selector,
+                f"{device.name} ({device.default_sample_rate} Hz{host_api}){suffix}",
+                legacy_index=device.index,
+                device_name=device.name,
+                is_default=device.is_default,
+            )
+        )
+    return result
+
+
+def _settings_dict(config: AppConfig) -> dict[str, Any]:
+    microphone: str | int | None = config.microphone
+    if isinstance(microphone, str) and microphone.isdecimal():
+        microphone = int(microphone)
+    return {
+        "microphone": microphone,
+        "language": config.language,
+        "model": config.model,
+        "resource_mode": config.resource_mode,
+        "auto_insert": config.auto_insert,
+        "smart_spacing": config.smart_spacing,
+        "remove_fillers": config.remove_fillers,
+        "press_enter": config.voice_press_enter,
+        "replacements": dict(config.replacements),
+    }
+
+
+def _snapshot_target() -> Any | None:
+    try:
+        from .windows_input import snapshot_foreground_target, target_looks_editable
+
+        target = snapshot_foreground_target()
+        fingerprint = getattr(target, "focused_control", None)
+        focus_kind = fingerprint[0] if fingerprint else "none"
+        control_type = (
+            fingerprint[-5]
+            if focus_kind == "uia" and len(fingerprint) >= 10
+            else None
+        )
+        LOGGER.info(
+            "recording_target_captured valid=%s editable=%s hwnd=%s pid=%s "
+            "focus_kind=%s control_type=%s",
+            bool(getattr(target, "is_valid", False)),
+            target_looks_editable(target),
+            int(getattr(target, "hwnd", 0) or 0),
+            int(getattr(target, "pid", 0) or 0),
+            focus_kind,
+            control_type,
+        )
+        return target
+    except Exception as exc:
+        LOGGER.warning("recording_target_capture_failed: %s", type(exc).__name__)
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--background", action="store_true", help="Start in the system tray")
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    _configure_logging()
+    single_instance = _SingleInstance()
+    if not single_instance.acquire():
+        LOGGER.info("secondary_instance_exited")
+        if not args.background:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "Pressay уже работает. Откройте его значок в системном трее.",
+                "Pressay",
+                0x40,
+            )
+        return 0
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("Pressay")
+    app.setOrganizationName("Local")
+    app.setQuitOnLastWindowClosed(False)
+    app.aboutToQuit.connect(single_instance.close)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        LOGGER.error("system_tray_unavailable")
+
+    config_load = _load_config()
+    config = config_load.config
+    signals = UiSignals()
+    window = SettingsWindow(signals, _settings_dict(config), _microphones())
+    overlay = StatusOverlay()
+    tray = TrayController(signals, window)
+    app.aboutToQuit.connect(window.prepare_to_quit)
+
+    dispatcher = _MainThreadDispatcher()
+
+    def dispatch_ui(callback: Any, *args: Any, **kwargs: Any) -> None:
+        dispatcher.requested.emit(callback, args, kwargs)
+
+    def status_callback(text: str, state: str) -> None:
+        def update() -> None:
+            window.update_status(text, state)
+            tray.update_state(text, state)
+            auto_hide = _overlay_auto_hide_ms(state)
+            overlay.show_status(text, state, auto_hide_ms=auto_hide)
+
+        dispatch_ui(update)
+
+    def result_callback(text: str) -> None:
+        dispatch_ui(window.set_last_transcript, text)
+
+    def notification_callback(title: str, message: str, warning: bool) -> None:
+        dispatch_ui(tray.notify, title, message, warning=warning)
+
+    controller = DictationController(
+        config,
+        status_callback=status_callback,
+        result_callback=result_callback,
+        notification_callback=notification_callback,
+    )
+
+    def start_or_stop(*, capture_target: bool = False) -> None:
+        if controller.is_recording:
+            controller.request_stop_recording()
+        else:
+            controller.request_start_recording(
+                target=_snapshot_target() if capture_target else None
+            )
+
+    signals.toggle_requested.connect(lambda: start_or_stop(capture_target=False))
+    signals.cancel_requested.connect(controller.request_cancel)
+    signals.paste_last_requested.connect(controller.paste_last)
+    signals.copy_last_requested.connect(controller.copy_last)
+
+    def save_settings(values: dict[str, Any]) -> None:
+        nonlocal config
+        previous_resource_mode = config.resource_mode
+        microphone = values.get("microphone")
+        config = AppConfig(
+            model=str(values.get("model", config.model)),
+            language=str(values.get("language", config.language)),
+            microphone=None if microphone is None else str(microphone),
+            auto_insert=bool(values.get("auto_insert", config.auto_insert)),
+            smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
+            remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
+            voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
+            resource_mode=str(values.get("resource_mode", config.resource_mode)),
+            snippets=dict(config.snippets),
+            replacements=dict(values.get("replacements", config.replacements)),
+        )
+        try:
+            config.save()
+        except ConfigError as exc:
+            tray.notify("Pressay", str(exc), warning=True)
+            return
+        controller.update_config(config)
+        if previous_resource_mode == "eco" and config.resource_mode != "eco":
+            controller.warmup_model()
+        window.update_status("Настройки сохранены", "success")
+
+    signals.save_requested.connect(save_settings)
+
+    def test_microphone() -> None:
+        values = window.current_settings()
+        save_settings(values)
+        window.update_status("Проверяю микрофон…", "processing")
+
+        def work() -> None:
+            try:
+                rate, _ = controller.test_microphone()
+            except Exception as exc:
+                status_callback("Микрофон недоступен", "error")
+                notification_callback("Pressay", str(exc), True)
+            else:
+                status_callback(f"Микрофон готов: {int(rate)} Hz", "success")
+
+        threading.Thread(target=work, name="pressay-mic-test", daemon=True).start()
+
+    signals.microphone_test_requested.connect(test_microphone)
+
+    hotkey_service: Any | None = None
+    try:
+        from .windows_hotkeys import HotkeyAction, WindowsHotkeyService
+
+        def hotkey_callback(action: Any) -> None:
+            def handle() -> None:
+                if action == HotkeyAction.START:
+                    controller.request_start_recording(target=_snapshot_target())
+                elif action == HotkeyAction.STOP:
+                    controller.request_stop_recording()
+                elif action == HotkeyAction.TOGGLE:
+                    start_or_stop(capture_target=True)
+                elif action == HotkeyAction.CANCEL:
+                    controller.request_cancel()
+                elif action == HotkeyAction.PASTE_LAST:
+                    controller.paste_last()
+                elif action == HotkeyAction.COPY_LAST:
+                    controller.copy_last()
+
+            dispatch_ui(handle)
+
+        hotkey_service = WindowsHotkeyService(hotkey_callback)
+        hotkey_service.start()
+    except Exception as exc:
+        LOGGER.exception("hotkey_service_failed")
+        tray.notify("Pressay", f"Глобальные клавиши недоступны: {exc}", warning=True)
+
+    shutdown_started = False
+    shutdown_handle: tuple[threading.Event, threading.Thread, threading.Thread] | None = None
+
+    def begin_shutdown() -> None:
+        nonlocal shutdown_started, shutdown_handle
+        if shutdown_started:
+            return
+        shutdown_started = True
+        # Start the hard deadline before touching PortAudio, CUDA or the
+        # low-level keyboard hook. All native cleanup happens off the Qt thread.
+        shutdown_handle = _start_native_shutdown(controller, hotkey_service)
+
+    def quit_application() -> None:
+        begin_shutdown()
+        window.prepare_to_quit()
+        tray.tray.hide()
+        app.quit()
+
+    signals.quit_requested.connect(quit_application)
+    app.aboutToQuit.connect(begin_shutdown)
+    if not args.background:
+        window.show()
+    if config.resource_mode == "eco":
+        status_callback("Готов — экономный режим", "ready")
+    elif not controller.warmup_model():
+        status_callback("Не удалось запустить подготовку модели", "error")
+    if config_load.warning:
+        window.update_status("Ошибка config.json — автовставка отключена", "error")
+        tray.update_state("Ошибка config.json — автовставка отключена", "error")
+        tray.notify("Pressay", config_load.warning, warning=True)
+    LOGGER.info("application_started")
+    exit_code = int(app.exec())
+    LOGGER.info("application_exited code=%d", exit_code)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

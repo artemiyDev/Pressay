@@ -1,0 +1,861 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import threading
+from types import SimpleNamespace
+
+import numpy as np
+
+from pressay.config import AppConfig
+from pressay.controller import DictationController, _prepare_insertion_text
+from pressay.transcriber import TranscriptionResult, TranscriptionTimings
+from pressay.windows_input import ForegroundTarget, send_text as real_send_text
+
+
+@dataclass
+class FakeRecording:
+    audio: np.ndarray
+
+
+class FakeRecorder:
+    def __init__(self) -> None:
+        self.is_recording = False
+
+    def start(self) -> int:
+        self.is_recording = True
+        return 16_000
+
+    def stop(self) -> FakeRecording:
+        self.is_recording = False
+        return FakeRecording(np.ones(8_000, dtype=np.float32) * 0.1)
+
+    def cancel(self) -> bool:
+        was = self.is_recording
+        self.is_recording = False
+        return was
+
+
+class FakeTranscriber:
+    def __init__(self, model_size: str = "small") -> None:
+        self.model_size = model_size
+        self.options: list[dict[str, object]] = []
+        self.closed = threading.Event()
+
+    def transcribe(self, *_args, **_kwargs) -> TranscriptionResult:
+        self.options.append(dict(_kwargs))
+        return TranscriptionResult(
+            text="тестовая фраза",
+            language="ru",
+            language_probability=0.99,
+            segments=(),
+            audio_duration_seconds=0.5,
+            timings=TranscriptionTimings(0, 0.01, 0.01),
+            device="cpu",
+            compute_type="int8",
+        )
+
+    def warmup(self) -> tuple[str, str]:
+        return "cpu", "int8"
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class BlockingWarmupTranscriber(FakeTranscriber):
+    def __init__(
+        self,
+        *,
+        model_size: str = "small",
+        error: Exception | None = None,
+    ) -> None:
+        super().__init__(model_size)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.closed = threading.Event()
+        self.error = error
+        self.warmup_thread_id: int | None = None
+
+    def warmup(self) -> tuple[str, str]:
+        self.warmup_thread_id = threading.get_ident()
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise RuntimeError("test did not release blocked warmup")
+        if self.error is not None:
+            raise self.error
+        self.finished.set()
+        return super().warmup()
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class BlockingTranscriber(FakeTranscriber):
+    def __init__(
+        self,
+        *,
+        model_size: str = "small",
+        text: str = "исходный текст",
+        error: Exception | None = None,
+    ) -> None:
+        super().__init__(model_size)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+        self.text = text
+        self.error = error
+        self.languages: list[str] = []
+        self.close_thread_id: int | None = None
+
+    def transcribe(self, *_args, **kwargs) -> TranscriptionResult:
+        self.languages.append(str(kwargs["language"]))
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise RuntimeError("test did not release blocked inference")
+        if self.error is not None:
+            raise self.error
+        result = super().transcribe()
+        return TranscriptionResult(
+            text=self.text,
+            language=result.language,
+            language_probability=result.language_probability,
+            segments=result.segments,
+            audio_duration_seconds=result.audio_duration_seconds,
+            timings=result.timings,
+            device=result.device,
+            compute_type=result.compute_type,
+        )
+
+    def close(self) -> None:
+        self.close_thread_id = threading.get_ident()
+        self.closed.set()
+
+
+class BlockingInputBackend:
+    def __init__(self, target: ForegroundTarget) -> None:
+        self.target = target
+        self.snapshot_calls = 0
+        self.before_injection = threading.Event()
+        self.release = threading.Event()
+        self.unicode_batches: list[tuple[int, ...]] = []
+        self.ctrl_v_calls = 0
+        self.enter_calls = 0
+
+    def snapshot_foreground_target(self) -> ForegroundTarget:
+        self.snapshot_calls += 1
+        if self.snapshot_calls == 2:
+            self.before_injection.set()
+            assert self.release.wait(timeout=2)
+        return self.target
+
+    def is_physical_key_down(self, _vk_code: int) -> bool:
+        return False
+
+    def send_unicode_units(self, units: tuple[int, ...]) -> bool:
+        self.unicode_batches.append(tuple(units))
+        return True
+
+    def send_ctrl_v(self) -> bool:
+        self.ctrl_v_calls += 1
+        return True
+
+    def send_enter(self) -> bool:
+        self.enter_calls += 1
+        return True
+
+
+def _auto_insert_controller(
+    monkeypatch,
+) -> tuple[
+    DictationController,
+    BlockingInputBackend,
+    list[tuple[str, str]],
+    list[tuple[object, ...]],
+]:
+    target = ForegroundTarget(
+        hwnd=100,
+        pid=200,
+        title="Editor",
+        focused_control=("win32_focus", 200, 101, "Edit"),
+    )
+    backend = BlockingInputBackend(target)
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+
+    def guarded_send(text, expected_target=None, **kwargs):
+        kwargs.setdefault("fallback_to_clipboard", False)
+        return real_send_text(
+            text,
+            expected_target,
+            backend=backend,
+            **kwargs,
+        )
+
+    monkeypatch.setattr("pressay.windows_input.send_text", guarded_send)
+    assert controller.start_recording(target=target) is True
+    assert controller.stop_recording() is True
+    assert backend.before_injection.wait(timeout=2)
+    return controller, backend, statuses, notifications
+
+
+def test_smart_spacing_only_changes_automatic_insertion(monkeypatch) -> None:
+    inserted: list[str] = []
+    delivery_options: list[dict[str, object]] = []
+    results: list[str] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True),
+        status_callback=lambda *_args: None,
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    def capture_insertion(text, **_kwargs):
+        inserted.append(text)
+        delivery_options.append(dict(_kwargs))
+        return SimpleNamespace(success=True)
+
+    monkeypatch.setattr("pressay.windows_input.send_text", capture_insertion)
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert inserted == ["тестовая фраза "]
+    assert delivery_options[0]["fallback_to_clipboard"] is False
+    assert results == ["тестовая фраза"]
+    assert controller.last_transcript == "тестовая фраза"
+    assert copied == []
+    controller.close()
+
+
+def test_smart_spacing_skips_non_ordinary_text() -> None:
+    assert _prepare_insertion_text(
+        "обычная фраза", press_enter=False, smart_spacing=True
+    ) == "обычная фраза "
+    assert _prepare_insertion_text(
+        "без настройки", press_enter=False, smart_spacing=False
+    ) == "без настройки"
+    assert _prepare_insertion_text(
+        "уже есть\t", press_enter=False, smart_spacing=True
+    ) == "уже есть\t"
+    assert _prepare_insertion_text(
+        "первая\nвторая", press_enter=False, smart_spacing=True
+    ) == "первая\nвторая"
+    assert _prepare_insertion_text(
+        "", press_enter=True, smart_spacing=True
+    ) == ""
+    assert _prepare_insertion_text(
+        "action payload", press_enter=True, smart_spacing=True
+    ) == "action payload"
+
+
+def test_active_job_uses_smart_spacing_snapshot(monkeypatch) -> None:
+    inserted: list[str] = []
+    controller = DictationController(
+        AppConfig(model="small", auto_insert=True, smart_spacing=False),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    transcriber = BlockingTranscriber(text="снимок настройки")
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+
+    def capture_insertion(text, **_kwargs):
+        inserted.append(text)
+        return SimpleNamespace(success=True)
+
+    monkeypatch.setattr("pressay.windows_input.send_text", capture_insertion)
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert transcriber.started.wait(timeout=2)
+    controller.update_config(
+        AppConfig(model="small", auto_insert=True, smart_spacing=True)
+    )
+    transcriber.release.set()
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert inserted == ["снимок настройки"]
+    assert controller.config.smart_spacing is True
+    controller.close()
+
+
+def test_controller_records_transcribes_and_keeps_last(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    results: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    copied: list[str] = []
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert controller.last_transcript == "тестовая фраза"
+    assert results == ["тестовая фраза"]
+    assert copied == []
+    assert any(state == "processing" for _, state in statuses)
+    assert statuses[-1] == ("Готово — текст ниже", "success")
+    controller.close()
+
+
+def test_personal_dictionary_biases_asr_and_canonicalizes_result(monkeypatch) -> None:
+    results: list[str] = []
+    controller = DictationController(
+        AppConfig(
+            auto_insert=False,
+            replacements={
+                "фаст апи": "FastAPI",
+                "докер композ": "Docker Compose",
+            },
+        ),
+        status_callback=lambda *_args: None,
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    transcriber = FakeTranscriber(controller.config.model)
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert transcriber.options == [
+        {"language": "auto", "initial_prompt": "FastAPI, Docker Compose"}
+    ]
+    assert results == ["тестовая фраза"]
+    controller.close()
+
+
+def test_eco_resource_mode_retires_model_after_each_result() -> None:
+    controller = DictationController(
+        AppConfig(auto_insert=False, resource_mode="eco"),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    transcriber = FakeTranscriber(controller.config.model)
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+    assert transcriber.closed.wait(timeout=2)
+    assert controller._transcriber is None
+    controller.close()
+
+
+def test_missing_target_is_display_only_and_does_not_touch_clipboard(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    results: list[str] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    assert controller.start_recording(target=None) is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert controller.last_transcript == "тестовая фраза"
+    assert results == ["тестовая фраза"]
+    assert copied == []
+    assert statuses[-1] == ("Готово — текст ниже", "success")
+    controller.close()
+
+
+def test_update_config_is_serialized_and_active_job_uses_snapshot(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    results: list[str] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(
+            model="small",
+            language="ru",
+            auto_insert=False,
+            replacements={"исходный": "старый"},
+        ),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    transcriber = BlockingTranscriber()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    assert controller.start_recording(target="old-window") is True
+    assert controller.stop_recording() is True
+    assert transcriber.started.wait(timeout=2)
+
+    caller_thread_id = threading.get_ident()
+    controller.update_config(
+        AppConfig(
+            model="medium",
+            language="en",
+            auto_insert=False,
+            replacements={"исходный": "новый"},
+        )
+    )
+    assert not transcriber.closed.is_set()
+
+    transcriber.release.set()
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+    assert transcriber.closed.wait(timeout=2)
+
+    assert transcriber.languages == ["ru"]
+    assert results == ["старый текст"]
+    assert copied == []
+    assert statuses[-1][1] == "success"
+    assert transcriber.close_thread_id != caller_thread_id
+    controller.close()
+
+
+def test_close_invalidates_blocked_result_and_disposes_after_worker(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    results: list[str] = []
+    notifications: list[tuple[object, ...]] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=results.append,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    transcriber = BlockingTranscriber(
+        model_size=controller.config.model,
+        text="секрет после закрытия",
+    )
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    assert controller.start_recording() is True
+    assert controller.stop_recording() is True
+    assert transcriber.started.wait(timeout=2)
+    callbacks_before_close = (list(statuses), list(results), list(notifications), list(copied))
+
+    controller.close()
+    assert not transcriber.closed.is_set()
+    assert controller.last_transcript == ""
+    assert controller.copy_last() is False
+    assert controller.paste_last() is False
+
+    transcriber.release.set()
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+    assert transcriber.closed.wait(timeout=2)
+
+    assert (statuses, results, notifications, copied) == callbacks_before_close
+    assert controller.last_transcript == ""
+
+
+def test_auto_insert_disabled_never_mutates_clipboard(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    results: list[str] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert results == ["тестовая фраза"]
+    assert copied == []
+    assert statuses[-1] == ("Готово — текст ниже", "success")
+    assert controller.last_transcript == "тестовая фраза"
+    controller.close()
+
+
+def test_auto_insert_failure_keeps_result_without_copying(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+    monkeypatch.setattr(
+        "pressay.windows_input.send_text",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            success=False,
+            reason="foreground_target_changed",
+        ),
+    )
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert copied == []
+    assert controller.last_transcript == "тестовая фраза"
+    assert statuses[-1] == ("Не вставлено: сменилось активное окно", "warning")
+    assert notifications and notifications[-1][1] == "foreground_target_changed"
+    controller.close()
+
+
+def test_auto_insert_exception_keeps_result_without_copying(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    def fail_delivery(*_args, **_kwargs):
+        raise RuntimeError("simulated input failure")
+
+    monkeypatch.setattr("pressay.windows_input.send_text", fail_delivery)
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert copied == []
+    assert controller.last_transcript == "тестовая фраза"
+    assert statuses[-1] == ("Не вставлено — текст сохранён ниже", "warning")
+    assert notifications and "Shift+Alt+X" in str(notifications[-1][1])
+    controller.close()
+
+
+def test_paste_last_exception_never_falls_back_to_implicit_copy(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    controller.last_transcript = "секретный текст"
+    monkeypatch.setattr(controller, "_copy_text", copied.append)
+
+    def fail_paste(*_args, **_kwargs):
+        raise RuntimeError("simulated OLE transaction failure")
+
+    monkeypatch.setattr("pressay.windows_input.paste_last", fail_paste)
+
+    assert controller.paste_last() is False
+    assert copied == []
+    assert controller.last_transcript == "секретный текст"
+    assert statuses[-1] == ("Не вставлено — текст сохранён ниже", "warning")
+    assert notifications and "Shift+Alt+X" in str(notifications[-1][1])
+    controller.close()
+
+
+def test_close_during_input_guard_prevents_injection(monkeypatch) -> None:
+    controller, backend, statuses, notifications = _auto_insert_controller(monkeypatch)
+    callbacks_before_close = (list(statuses), list(notifications))
+
+    controller.close()
+    backend.release.set()
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert backend.unicode_batches == []
+    assert backend.ctrl_v_calls == 0
+    assert backend.enter_calls == 0
+    assert (statuses, notifications) == callbacks_before_close
+
+
+def test_cancel_completed_delivery_prevents_injection_and_late_callbacks(monkeypatch) -> None:
+    controller, backend, statuses, notifications = _auto_insert_controller(monkeypatch)
+
+    assert controller.cancel() is True
+    callbacks_after_cancel = (list(statuses), list(notifications))
+    backend.release.set()
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert backend.unicode_batches == []
+    assert backend.ctrl_v_calls == 0
+    assert backend.enter_calls == 0
+    assert (statuses, notifications) == callbacks_after_cancel
+    controller.close()
+
+
+def test_cancel_suppresses_late_worker_error() -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    transcriber = BlockingTranscriber(
+        model_size=controller.config.model,
+        error=RuntimeError("late failure"),
+    )
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+
+    assert controller.start_recording() is True
+    assert controller.stop_recording() is True
+    assert transcriber.started.wait(timeout=2)
+    assert controller.cancel() is True
+    callbacks_after_cancel = (list(statuses), list(notifications))
+
+    transcriber.release.set()
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert (statuses, notifications) == callbacks_after_cancel
+    controller.close()
+
+
+def test_cancel_discards_active_recording() -> None:
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+
+    assert controller.start_recording() is True
+    assert controller.cancel() is True
+    assert recorder.is_recording is False
+    assert controller.state.active is False
+    controller.close()
+
+
+def test_model_warmup_is_async_and_reports_preparing_then_ready(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    controller = DictationController(
+        AppConfig(model="small"),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    transcriber = BlockingWarmupTranscriber(model_size="small")
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: transcriber)
+
+    caller_thread_id = threading.get_ident()
+    assert controller.warmup_model() is True
+    assert transcriber.started.wait(timeout=2)
+    assert statuses == [("Подготавливаю локальную модель…", "processing")]
+    assert transcriber.warmup_thread_id != caller_thread_id
+
+    transcriber.release.set()
+    assert controller._warmup_future is not None
+    controller._warmup_future.result(timeout=2)
+    assert statuses[-1] == ("Готов — удерживайте Ctrl+Win", "ready")
+    controller.close()
+    assert controller.wait_closed(2)
+
+
+def test_recording_can_start_while_warmup_blocks_and_transcription_queues(
+    monkeypatch,
+) -> None:
+    results: list[str] = []
+    controller = DictationController(
+        AppConfig(model="small", auto_insert=False),
+        status_callback=lambda *_args: None,
+        result_callback=results.append,
+        notification_callback=lambda *_args: None,
+    )
+    transcriber = BlockingWarmupTranscriber(model_size="small")
+    recorder = FakeRecorder()
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: transcriber)
+    monkeypatch.setattr(controller, "_new_recorder", lambda: recorder)
+    monkeypatch.setattr(controller, "_copy_text", lambda _text: None)
+
+    assert controller.warmup_model() is True
+    assert transcriber.started.wait(timeout=2)
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    assert controller._future.done() is False
+
+    transcriber.release.set()
+    controller._future.result(timeout=2)
+    assert results == ["тестовая фраза"]
+    controller.close()
+    assert controller.wait_closed(2)
+
+
+def test_model_change_invalidates_old_warmup_and_preloads_new_model(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    old_model = BlockingWarmupTranscriber(model_size="small")
+    new_model = BlockingWarmupTranscriber(model_size="medium")
+    created: list[str] = []
+    controller = DictationController(
+        AppConfig(model="small"),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+
+    def factory(model_size: str) -> BlockingWarmupTranscriber:
+        created.append(model_size)
+        return old_model if model_size == "small" else new_model
+
+    monkeypatch.setattr(controller, "_new_transcriber", factory)
+    assert controller.warmup_model() is True
+    assert old_model.started.wait(timeout=2)
+
+    controller.update_config(AppConfig(model="medium"))
+    old_model.release.set()
+    assert new_model.started.wait(timeout=2)
+    assert old_model.closed.wait(timeout=2)
+    new_model.release.set()
+    assert controller._warmup_future is not None
+    controller._warmup_future.result(timeout=2)
+
+    assert created == ["small", "medium"]
+    assert [state for _, state in statuses].count("ready") == 1
+    controller.close()
+    assert controller.wait_closed(2)
+
+
+def test_close_during_blocked_warmup_suppresses_late_callbacks(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    controller = DictationController(
+        AppConfig(model="small"),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    transcriber = BlockingWarmupTranscriber(model_size="small")
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: transcriber)
+
+    assert controller.warmup_model() is True
+    assert transcriber.started.wait(timeout=2)
+    callbacks_before_close = (list(statuses), list(notifications))
+    controller.close()
+    assert controller.wait_closed(0.01) is False
+
+    transcriber.release.set()
+    assert controller.wait_closed(2)
+    assert transcriber.closed.is_set()
+    assert (statuses, notifications) == callbacks_before_close
+
+
+def test_cancel_recording_suppresses_late_warmup_ready(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    controller = DictationController(
+        AppConfig(model="small"),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    transcriber = BlockingWarmupTranscriber(model_size="small")
+    recorder = FakeRecorder()
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: transcriber)
+    monkeypatch.setattr(controller, "_new_recorder", lambda: recorder)
+
+    assert controller.warmup_model() is True
+    assert transcriber.started.wait(timeout=2)
+    assert controller.start_recording() is True
+    assert controller.cancel() is True
+    callbacks_after_cancel = list(statuses)
+
+    transcriber.release.set()
+    assert controller._warmup_future is not None
+    controller._warmup_future.result(timeout=2)
+    assert statuses == callbacks_after_cancel
+    controller.close()
+    assert controller.wait_closed(2)
+
+
+def test_missing_local_model_reports_actionable_warmup_error(monkeypatch) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    controller = DictationController(
+        AppConfig(model="large-v3"),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    transcriber = BlockingWarmupTranscriber(
+        model_size="large-v3",
+        error=RuntimeError("model files are absent"),
+    )
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: transcriber)
+
+    assert controller.warmup_model() is True
+    assert transcriber.started.wait(timeout=2)
+    transcriber.release.set()
+    assert controller._warmup_future is not None
+    controller._warmup_future.result(timeout=2)
+
+    assert statuses[-1][1] == "error"
+    assert ".\\scripts\\setup.ps1 -Model large-v3" in statuses[-1][0]
+    assert notifications
+    assert ".\\scripts\\setup.ps1 -Model large-v3" in str(notifications[-1][1])
+    controller.close()
+    assert controller.wait_closed(2)
