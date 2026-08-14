@@ -5,6 +5,10 @@
 <p align="center"><strong>Press → say.</strong> Private, local-first voice dictation for Windows and macOS.</p>
 
 <p align="center">
+  <a href="https://github.com/artemiyDev/Pressay/actions/workflows/ci.yml"><img src="https://github.com/artemiyDev/Pressay/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
+<p align="center">
   <a href="docs/README.en.md">English</a> ·
   <a href="docs/README.ru.md">Русский</a> ·
   <a href="docs/TESTING.md">Testing status</a>
