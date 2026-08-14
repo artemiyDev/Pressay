@@ -17,34 +17,35 @@ import time
 from types import SimpleNamespace
 from typing import Callable, Mapping, Optional, Sequence
 
+from .hotkey_bindings import (
+    CTRL_KEYS as _CTRL_KEYS,
+    Chord,
+    HotkeyBindings,
+    MODIFIER_KEYS,
+    VK_CONTROL,
+    VK_ESCAPE,
+    VK_LCONTROL,
+    VK_LMENU,
+    VK_LSHIFT,
+    VK_LWIN,
+    VK_MENU,
+    VK_RCONTROL,
+    VK_RMENU,
+    VK_RSHIFT,
+    VK_RWIN,
+    VK_SHIFT,
+    VK_SPACE,
+    WIN_KEYS as _WIN_KEYS,
+)
+
 
 LOG = logging.getLogger(__name__)
 
-# Virtual-key values are constants in the Win32 ABI and are safe to define on
-# every platform.  Keeping them here also makes the state machine easy to test.
-VK_BACK = 0x08
-VK_TAB = 0x09
-VK_RETURN = 0x0D
-VK_SHIFT = 0x10
-VK_CONTROL = 0x11
-VK_MENU = 0x12  # Alt
-VK_ESCAPE = 0x1B
-VK_SPACE = 0x20
+# Virtual-key values are constants in the Win32 ABI.  The shared ones live in
+# hotkey_bindings, which owns the modifier families; these two are only needed
+# for the default paste/copy chords and for tests.
 VK_X = 0x58
 VK_Z = 0x5A
-VK_LWIN = 0x5B
-VK_RWIN = 0x5C
-VK_LSHIFT = 0xA0
-VK_RSHIFT = 0xA1
-VK_LCONTROL = 0xA2
-VK_RCONTROL = 0xA3
-VK_LMENU = 0xA4
-VK_RMENU = 0xA5
-
-_CTRL_KEYS = frozenset((VK_CONTROL, VK_LCONTROL, VK_RCONTROL))
-_WIN_KEYS = frozenset((VK_LWIN, VK_RWIN))
-_SHIFT_KEYS = frozenset((VK_SHIFT, VK_LSHIFT, VK_RSHIFT))
-_ALT_KEYS = frozenset((VK_MENU, VK_LMENU, VK_RMENU))
 
 
 class HotkeyAction(str, Enum):
@@ -83,31 +84,68 @@ class _HookDecision:
 class _HookKeySuppressor:
     """Keep Pressay's modifier-only gesture away from foreground apps.
 
-    A Windows-key press is held back briefly.  If Ctrl joins it, both physical
-    modifiers belong to Pressay.  Otherwise the Win key is replayed before
+    The gesture's deferred modifier (Win, or Alt when Win is not in the pair)
+    is held back briefly.  If the other modifier joins it, both physical
+    modifiers belong to Pressay.  Otherwise the deferred key is replayed before
     the next key so ordinary Win shortcuts and a plain Win tap still work.
+
+    A Ctrl+Shift pair has no deferred modifier: neither key means anything
+    pressed alone, and both are constantly used with the mouse, whose events
+    this hook never sees.  A withheld Ctrl could not be replayed in time for
+    Ctrl+click, so such a pair is passed through untouched and only the toggle
+    key and Esc are swallowed while the gesture is active.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, bindings: HotkeyBindings | None = None) -> None:
+        self._bindings = bindings or HotkeyBindings()
+        first, second = self._bindings.hold_key_sets
+        self._hold_keys = first | second
+        deferred = self._bindings.deferred_modifier
+        if deferred is None:
+            self._deferred_keys: frozenset[int] = frozenset()
+            self._other_keys: frozenset[int] = frozenset()
+        else:
+            self._deferred_keys = MODIFIER_KEYS[deferred]
+            self._other_keys = self._hold_keys - self._deferred_keys
+        toggle_vk = self._bindings.toggle_vk
+        self._gesture_swallowed = frozenset(
+            code for code in (toggle_vk, VK_ESCAPE) if code is not None
+        )
+        # Without a deferred modifier the hold keys are never withheld, so they
+        # must not be swallowed on auto-repeat either.
+        self._active_suppression = (
+            self._hold_keys | self._gesture_swallowed
+            if self._deferred_keys
+            else self._gesture_swallowed
+        )
         self._pressed: set[int] = set()
-        self._pending_win: set[int] = set()
-        self._forwarded_win: set[int] = set()
-        self._forwarded_ctrl: set[int] = set()
+        self._pending_deferred: set[int] = set()
+        self._forwarded_deferred: set[int] = set()
+        self._forwarded_other: set[int] = set()
         self._gesture_active = False
         self._swallowed_keys: set[int] = set()
 
-    def _ctrl_down(self) -> bool:
-        return not self._pressed.isdisjoint(_CTRL_KEYS)
+    def _deferred_down(self) -> bool:
+        return not self._pressed.isdisjoint(self._deferred_keys)
 
-    def _win_down(self) -> bool:
-        return not self._pressed.isdisjoint(_WIN_KEYS)
+    def _other_down(self) -> bool:
+        return not self._pressed.isdisjoint(self._other_keys)
+
+    def _any_hold_down(self) -> bool:
+        return not self._pressed.isdisjoint(self._hold_keys)
+
+    def _hold_chord_down(self) -> bool:
+        first, second = self._bindings.hold_key_sets
+        return not self._pressed.isdisjoint(first) and not self._pressed.isdisjoint(
+            second
+        )
 
     def _activate_gesture(self) -> tuple[tuple[int, bool], ...]:
         self._gesture_active = True
-        self._pending_win.clear()
-        releases = tuple((vk_code, False) for vk_code in self._forwarded_ctrl)
-        self._swallowed_keys.update(self._forwarded_ctrl)
-        self._forwarded_ctrl.clear()
+        self._pending_deferred.clear()
+        releases = tuple((vk_code, False) for vk_code in self._forwarded_other)
+        self._swallowed_keys.update(self._forwarded_other)
+        self._forwarded_other.clear()
         return releases
 
     def process(self, event: KeyEvent) -> _HookDecision:
@@ -121,42 +159,47 @@ class _HookKeySuppressor:
             if repeated:
                 return _HookDecision(
                     suppress=(
-                        vk_code in self._pending_win
+                        vk_code in self._pending_deferred
                         or (
                             self._gesture_active
-                            and vk_code in (_CTRL_KEYS | _WIN_KEYS | {VK_SPACE, VK_ESCAPE})
+                            and vk_code in self._active_suppression
                         )
                     )
                 )
 
-            if vk_code in _WIN_KEYS:
-                if self._gesture_active or self._ctrl_down():
-                    synthetic = self._activate_gesture()
+            if self._deferred_keys:
+                if vk_code in self._deferred_keys:
+                    if self._gesture_active or self._other_down():
+                        synthetic = self._activate_gesture()
+                        self._swallowed_keys.add(vk_code)
+                        return _HookDecision(True, synthetic)
+                    self._pending_deferred.add(vk_code)
                     self._swallowed_keys.add(vk_code)
-                    return _HookDecision(True, synthetic)
-                self._pending_win.add(vk_code)
-                self._swallowed_keys.add(vk_code)
-                return _HookDecision(suppress=True)
+                    return _HookDecision(suppress=True)
 
-            if vk_code in _CTRL_KEYS:
-                if self._gesture_active or self._win_down():
-                    synthetic = self._activate_gesture()
-                    self._swallowed_keys.add(vk_code)
-                    return _HookDecision(True, synthetic)
-                self._forwarded_ctrl.add(vk_code)
+                if vk_code in self._other_keys:
+                    if self._gesture_active or self._deferred_down():
+                        synthetic = self._activate_gesture()
+                        self._swallowed_keys.add(vk_code)
+                        return _HookDecision(True, synthetic)
+                    self._forwarded_other.add(vk_code)
+                    return _HookDecision()
+            elif vk_code in self._hold_keys:
+                if self._hold_chord_down():
+                    self._gesture_active = True
                 return _HookDecision()
 
             if self._gesture_active:
-                if vk_code in (VK_SPACE, VK_ESCAPE):
+                if vk_code in self._gesture_swallowed:
                     self._swallowed_keys.add(vk_code)
                     return _HookDecision(suppress=True)
                 return _HookDecision()
 
-            if self._pending_win:
-                synthetic = tuple((win_key, True) for win_key in self._pending_win)
-                self._forwarded_win.update(self._pending_win)
-                self._swallowed_keys.difference_update(self._pending_win)
-                self._pending_win.clear()
+            if self._pending_deferred:
+                synthetic = tuple((key, True) for key in self._pending_deferred)
+                self._forwarded_deferred.update(self._pending_deferred)
+                self._swallowed_keys.difference_update(self._pending_deferred)
+                self._pending_deferred.clear()
                 return _HookDecision(False, synthetic)
             return _HookDecision()
 
@@ -164,20 +207,22 @@ class _HookKeySuppressor:
 
         if vk_code in self._swallowed_keys:
             self._swallowed_keys.discard(vk_code)
-            if self._gesture_active and not self._ctrl_down() and not self._win_down():
+            if self._gesture_active and not self._any_hold_down():
                 self._gesture_active = False
-            if vk_code in _WIN_KEYS and vk_code in self._pending_win:
-                self._pending_win.discard(vk_code)
+            if vk_code in self._deferred_keys and vk_code in self._pending_deferred:
+                self._pending_deferred.discard(vk_code)
                 return _HookDecision(
                     True,
                     ((vk_code, True), (vk_code, False)),
                 )
             return _HookDecision(suppress=True)
 
-        if vk_code in self._forwarded_win:
-            self._forwarded_win.discard(vk_code)
-        if vk_code in self._forwarded_ctrl:
-            self._forwarded_ctrl.discard(vk_code)
+        if self._gesture_active and not self._any_hold_down():
+            self._gesture_active = False
+        if vk_code in self._forwarded_deferred:
+            self._forwarded_deferred.discard(vk_code)
+        if vk_code in self._forwarded_other:
+            self._forwarded_other.discard(vk_code)
         return _HookDecision()
 
 
@@ -189,10 +234,18 @@ class HotkeyStateMachine:
     With a positive value, callers should invoke :meth:`flush_due` regularly.
     """
 
-    def __init__(self, hold_delay_s: float = 0.12) -> None:
+    def __init__(
+        self,
+        hold_delay_s: float = 0.12,
+        bindings: HotkeyBindings | None = None,
+    ) -> None:
         if hold_delay_s < 0:
             raise ValueError("hold_delay_s must be non-negative")
         self.hold_delay_s = float(hold_delay_s)
+        self.bindings = bindings or HotkeyBindings()
+        first, second = self.bindings.hold_key_sets
+        self._hold_key_sets = (first, second)
+        self._hold_keys = first | second
         self._pressed: set[int] = set()
         self._hold_pending_since: Optional[float] = None
         self._hold_active = False
@@ -213,11 +266,16 @@ class HotkeyStateMachine:
     def _any_pressed(self, keys: Sequence[int] | frozenset[int]) -> bool:
         return not self._pressed.isdisjoint(keys)
 
-    def _ctrl_win_down(self) -> bool:
-        return self._any_pressed(_CTRL_KEYS) and self._any_pressed(_WIN_KEYS)
+    def _hold_chord_down(self) -> bool:
+        first, second = self._hold_key_sets
+        return self._any_pressed(first) and self._any_pressed(second)
 
-    def _shift_alt_down(self) -> bool:
-        return self._any_pressed(_SHIFT_KEYS) and self._any_pressed(_ALT_KEYS)
+    def _chord_fired(self, chord: Chord | None, vk_code: int) -> bool:
+        """Whether *vk_code* completes *chord* with its modifiers already down."""
+
+        if chord is None or vk_code != chord.vk_code:
+            return False
+        return all(self._any_pressed(keys) for keys in chord.modifier_key_sets)
 
     def process(self, event: KeyEvent) -> tuple[HotkeyAction, ...]:
         """Process one event, ignoring injected and auto-repeat events."""
@@ -226,8 +284,10 @@ class HotkeyStateMachine:
             return ()
 
         actions: list[HotkeyAction] = []
-        was_ctrl_win = self._ctrl_win_down()
-        space_consumed_as_toggle = False
+        was_hold_chord = self._hold_chord_down()
+        toggle_consumed = False
+        toggle_vk = self.bindings.toggle_vk
+        push_to_talk = self.bindings.push_to_talk
 
         if event.is_key_down:
             if event.vk_code in self._pressed:
@@ -238,7 +298,7 @@ class HotkeyStateMachine:
                 return self.flush_due(event.timestamp)
             self._pressed.remove(event.vk_code)
 
-        is_ctrl_win = self._ctrl_win_down()
+        is_hold_chord = self._hold_chord_down()
 
         if event.is_key_down:
             if event.vk_code == VK_ESCAPE:
@@ -246,46 +306,52 @@ class HotkeyStateMachine:
                 # prevents a later modifier release from also issuing STOP.
                 self._hold_pending_since = None
                 self._hold_active = False
-                self._suppress_hold_until_release = is_ctrl_win
+                self._suppress_hold_until_release = is_hold_chord
                 actions.append(HotkeyAction.CANCEL)
-            elif event.vk_code == VK_SPACE and is_ctrl_win:
-                # Space only wins while Ctrl+Win is still in its explicit
-                # disambiguation window.  Once push-to-talk has started it
-                # owns the lifecycle until modifier release, so Space cannot
-                # silently replace the active hold with a toggle operation.
+            elif toggle_vk is not None and event.vk_code == toggle_vk and is_hold_chord:
+                # The toggle key only wins while the hold chord is still in its
+                # explicit disambiguation window.  Once push-to-talk has started
+                # it owns the lifecycle until modifier release, so the toggle
+                # key cannot silently replace the active hold.  With
+                # push-to-talk switched off there is no window to wait for and
+                # no hold to replace, so the toggle fires straight away.
                 pending_since = self._hold_pending_since
-                if (
+                if not push_to_talk or (
                     pending_since is not None
                     and event.timestamp - pending_since < self.hold_delay_s
                 ):
                     self._hold_pending_since = None
                     self._suppress_hold_until_release = True
-                    space_consumed_as_toggle = True
+                    toggle_consumed = True
                     actions.append(HotkeyAction.TOGGLE)
-            elif event.vk_code == VK_Z and self._shift_alt_down():
+            elif self._chord_fired(self.bindings.paste_last, event.vk_code):
                 actions.append(HotkeyAction.PASTE_LAST)
-            elif event.vk_code == VK_X and self._shift_alt_down():
+            elif self._chord_fired(self.bindings.copy_last, event.vk_code):
                 actions.append(HotkeyAction.COPY_LAST)
 
-        if not was_ctrl_win and is_ctrl_win and not self._suppress_hold_until_release:
+        if (
+            not was_hold_chord
+            and is_hold_chord
+            and not self._suppress_hold_until_release
+        ):
             # Low-level keyboard events for a three-key chord are ordered, even
-            # when the user presses the keys together.  Space may therefore
-            # already be down when the second Ctrl/Win modifier arrives.  That
-            # is the same toggle gesture as Ctrl -> Win -> Space and must not
-            # accidentally become push-to-talk merely because of event order.
-            if VK_SPACE in self._pressed:
+            # when the user presses the keys together.  The toggle key may
+            # therefore already be down when the second hold modifier arrives.
+            # That is the same toggle gesture and must not accidentally become
+            # push-to-talk merely because of event order.
+            if toggle_vk is not None and toggle_vk in self._pressed:
                 self._hold_pending_since = None
                 self._suppress_hold_until_release = True
-                space_consumed_as_toggle = True
+                toggle_consumed = True
                 actions.append(HotkeyAction.TOGGLE)
-            else:
+            elif push_to_talk:
                 self._hold_pending_since = event.timestamp
                 if self.hold_delay_s == 0:
                     self._hold_pending_since = None
                     self._hold_active = True
                     actions.append(HotkeyAction.HOLD_START)
 
-        if was_ctrl_win and not is_ctrl_win:
+        if was_hold_chord and not is_hold_chord:
             self._hold_pending_since = None
             if self._hold_active:
                 self._hold_active = False
@@ -294,31 +360,28 @@ class HotkeyStateMachine:
 
         # A non-modifier event may arrive after the deadline while the
         # dispatcher was busy. Resolve the pending hold without waiting for
-        # another queue timeout. A Space consumed inside the disambiguation
-        # window is excluded so the toggle chord wins; overdue Space instead
-        # resolves the hold. Modifier key-up is excluded so a quick Ctrl+Win
-        # tap stays a no-op.
-        releasing_ctrl_win_modifier = (
+        # another queue timeout. A toggle key consumed inside the
+        # disambiguation window is excluded so the toggle chord wins; an
+        # overdue one instead resolves the hold. Modifier key-up is excluded so
+        # a quick tap of the hold chord stays a no-op.
+        releasing_hold_modifier = (
             not event.is_key_down
-            and event.vk_code in (_CTRL_KEYS | _WIN_KEYS)
-            and not is_ctrl_win
+            and event.vk_code in self._hold_keys
+            and not is_hold_chord
         )
-        if not (
-            space_consumed_as_toggle
-            or releasing_ctrl_win_modifier
-        ):
+        if not (toggle_consumed or releasing_hold_modifier):
             actions.extend(self.flush_due(event.timestamp))
         return tuple(actions)
 
     def flush_due(self, now: Optional[float] = None) -> tuple[HotkeyAction, ...]:
-        """Start a pending Ctrl+Win hold once its disambiguation delay passes."""
+        """Start a pending hold once its disambiguation delay passes."""
 
         if self._hold_pending_since is None:
             return ()
         now = time.monotonic() if now is None else now
         if now - self._hold_pending_since < self.hold_delay_s:
             return ()
-        if not self._ctrl_win_down() or self._suppress_hold_until_release:
+        if not self._hold_chord_down() or self._suppress_hold_until_release:
             self._hold_pending_since = None
             return ()
         self._hold_pending_since = None
@@ -334,6 +397,89 @@ class HotkeyStateMachine:
         self._hold_active = False
         self._suppress_hold_until_release = False
         return actions
+
+
+_WATCHED_MODIFIER_KEYS = _CTRL_KEYS | _WIN_KEYS
+
+
+class _HookWatchdog:
+    """Recover a ``WH_KEYBOARD_LL`` hook silently dropped by Windows.
+
+    Windows removes a low-level keyboard hook without notice once its
+    procedure runs longer than ``LowLevelHooksTimeout`` (~300ms by default),
+    which is plausible for a GIL-bound Python callback during model loading
+    or transcription.  This class only *decides* when a reinstall is needed;
+    it never touches Win32 itself, so it is fully testable with plain
+    stand-ins on any platform.  All Win32 interaction is injected.
+
+    Earlier designs tried to actively *detect* the drop: first by comparing
+    physical key state to what the hook itself had seen (unreliable --
+    the application's own synthetic replay desyncs the two during its own
+    gesture, and the generic ``VK_CONTROL`` never matches the side-specific
+    code the hook receives), then by injecting a synthetic probe event and
+    watching for it to arrive (worse -- any periodic synthetic keyboard
+    input resets Windows' idle timer via ``GetLastInputInfo``, which
+    permanently defeats screen blanking, the screensaver, auto-lock and
+    sleep for as long as Pressay runs in the background).
+
+    This design detects nothing.  It just reinstalls the hook on a fixed
+    interval, whenever that is provably safe: if no watched modifier is
+    pressed there is nothing to lose, and if one has been pressed for far
+    longer than any legitimate recording can last, the state is almost
+    certainly stuck on a dead hook and worth resetting.  A live gesture in
+    progress is left completely alone.
+    """
+
+    def __init__(
+        self,
+        *,
+        pressed_snapshot: Callable[[], tuple[frozenset[int], float]],
+        now: Callable[[], float],
+        hook_ready: Callable[[], bool],
+        request_reinstall: Callable[[bool], None],
+        wait: Callable[[float], bool],
+        reinstall_interval_s: float = 30.0,
+        stale_after_s: float = 360.0,
+    ) -> None:
+        self._pressed_snapshot = pressed_snapshot
+        self._now = now
+        self._hook_ready = hook_ready
+        self._request_reinstall = request_reinstall
+        self._wait = wait
+        self.reinstall_interval_s = reinstall_interval_s
+        self.stale_after_s = stale_after_s
+
+    def poll_once(self) -> None:
+        """Run a single decision cycle; called every ``reinstall_interval_s``."""
+
+        if not self._hook_ready():
+            # Startup or shutdown: nothing to do yet.
+            return
+        pressed, changed_at = self._pressed_snapshot()
+        if not pressed:
+            # The common case, and the one that matters: a hook lost to
+            # LowLevelHooksTimeout during model loading or transcription
+            # drops because the hook procedure was slow, not because of
+            # what the user's fingers were doing -- so the modifiers are
+            # essentially always already released by the time we notice.
+            # Nothing is at risk; just reinstall.
+            self._request_reinstall(False)
+            return
+        if self._now() - changed_at < self.stale_after_s:
+            # A live gesture, or one that only just ended; leave it alone.
+            return
+        # The watched modifiers have looked pressed for far longer than any
+        # legitimate recording can last: the hook almost certainly died
+        # mid-hold and the release never arrived.  Recover and unstick it.
+        self._request_reinstall(True)
+
+    def run(self) -> None:
+        """Run on an interval until ``wait`` reports a stop request."""
+
+        while True:
+            self.poll_once()
+            if self._wait(self.reinstall_interval_s):
+                return
 
 
 class WindowsHotkeyError(RuntimeError):
@@ -441,6 +587,12 @@ def _load_win32_api() -> SimpleNamespace:
 
 
 _STOP = object()
+_RESET_MACHINE = object()
+
+# Custom thread message the watchdog uses to ask the hook thread to reinstall
+# a dropped hook.  Must live in the WM_APP+ range so it cannot collide with a
+# system message delivered to the same thread queue.
+_WM_REINSTALL_HOOK = 0x8001
 
 
 class WindowsHotkeyService:
@@ -456,7 +608,9 @@ class WindowsHotkeyService:
         *,
         callbacks: Optional[Mapping[HotkeyAction | str, Callable[[], None]]] = None,
         hold_delay_s: float = 0.12,
+        bindings: HotkeyBindings | None = None,
     ) -> None:
+        self.bindings = bindings or HotkeyBindings()
         self._callback = callback
         self._callbacks: dict[HotkeyAction, list[Callable[[], None]]] = {
             action: [] for action in HotkeyAction
@@ -465,8 +619,10 @@ class WindowsHotkeyService:
             for action, action_callback in callbacks.items():
                 self._callbacks[HotkeyAction(action)].append(action_callback)
         self._callback_lock = threading.RLock()
-        self._machine = HotkeyStateMachine(hold_delay_s=hold_delay_s)
-        self._suppressor = _HookKeySuppressor()
+        self._machine = HotkeyStateMachine(
+            hold_delay_s=hold_delay_s, bindings=self.bindings
+        )
+        self._suppressor = _HookKeySuppressor(self.bindings)
         self._events: queue.Queue[KeyEvent | object] = queue.Queue()
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
@@ -478,6 +634,18 @@ class WindowsHotkeyService:
         self._hook_proc: object | None = None
         self._startup_error: Optional[BaseException] = None
         self._lifecycle_lock = threading.RLock()
+        # Snapshot of watched modifiers the state machine currently believes
+        # are pressed, paired with when that set last changed.  Only the
+        # dispatcher thread writes it (by reassigning the tuple, which is
+        # atomic under the GIL); the watchdog thread only reads it, so no
+        # lock is needed.
+        self._hook_known_pressed: tuple[frozenset[int], float] = (
+            frozenset(),
+            time.monotonic(),
+        )
+        self._watchdog: Optional[_HookWatchdog] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
 
     @property
     def is_running(self) -> bool:
@@ -512,7 +680,16 @@ class WindowsHotkeyService:
             self._startup_error = None
             self._hook_thread_id = None
             self._events = queue.Queue()
-            self._suppressor = _HookKeySuppressor()
+            self._suppressor = _HookKeySuppressor(self.bindings)
+            self._hook_known_pressed = (frozenset(), time.monotonic())
+            self._watchdog_stop.clear()
+            self._watchdog = _HookWatchdog(
+                pressed_snapshot=lambda: self._hook_known_pressed,
+                now=time.monotonic,
+                hook_ready=self._hook_thread_ready,
+                request_reinstall=self._request_hook_reinstall,
+                wait=self._watchdog_stop.wait,
+            )
             self._dispatch_thread = threading.Thread(
                 target=self._dispatch_loop,
                 name="PressayHotkeyDispatch",
@@ -523,8 +700,14 @@ class WindowsHotkeyService:
                 name="PressayKeyboardHook",
                 daemon=True,
             )
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog.run,
+                name="PressayHotkeyWatchdog",
+                daemon=True,
+            )
             self._dispatch_thread.start()
             self._hook_thread.start()
+            self._watchdog_thread.start()
 
         if not self._ready.wait(timeout_s):
             self.stop()
@@ -541,6 +724,7 @@ class WindowsHotkeyService:
 
         with self._lifecycle_lock:
             self._stop_requested.set()
+            self._watchdog_stop.set()
             api = self._api
             thread_id = self._hook_thread_id
             if api is not None and thread_id is not None:
@@ -549,8 +733,11 @@ class WindowsHotkeyService:
                 api.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
             hook_thread = self._hook_thread
             dispatch_thread = self._dispatch_thread
+            watchdog_thread = self._watchdog_thread
 
         current = threading.current_thread()
+        if watchdog_thread is not None and watchdog_thread is not current:
+            watchdog_thread.join(timeout_s)
         if hook_thread is not None and hook_thread is not current:
             hook_thread.join(timeout_s)
         self._events.put(_STOP)
@@ -560,6 +747,8 @@ class WindowsHotkeyService:
         with self._lifecycle_lock:
             self._hook_thread = None
             self._dispatch_thread = None
+            self._watchdog_thread = None
+            self._watchdog = None
             self._hook_thread_id = None
             self._hook_handle = None
             self._hook_proc = None
@@ -571,6 +760,84 @@ class WindowsHotkeyService:
 
     def __exit__(self, *_exc_info: object) -> None:
         self.stop()
+
+    def _hook_thread_ready(self) -> bool:
+        """Whether the hook thread has finished loading the Win32 API.
+
+        Guards the watchdog from probing -- and therefore from counting a
+        failure -- before ``start()`` has finished installing the hook.
+        """
+
+        return self._api is not None and self._hook_thread_id is not None
+
+    def _publish_pressed_snapshot(self) -> None:
+        """Refresh the watched-modifier snapshot the watchdog reads.
+
+        Only bumps the "last changed" timestamp when the watched set
+        actually differs from the published one, since the watchdog needs
+        to know how long it has been unchanged, not merely how recently
+        this was called.
+        """
+
+        watched_pressed = self._machine.pressed_keys & _WATCHED_MODIFIER_KEYS
+        if watched_pressed != self._hook_known_pressed[0]:
+            self._hook_known_pressed = (watched_pressed, time.monotonic())
+
+    def _request_hook_reinstall(self, reset: bool) -> None:
+        """Ask the hook thread to reinstall its hook; runs on the watchdog thread.
+
+        ``SetWindowsHookExW`` must be called from the thread pumping the
+        message loop the hook procedure runs on, so this only posts a
+        request rather than reinstalling anything itself.  ``reset`` rides
+        along as the message's wParam (0/1) instead of a second message,
+        since ``PostThreadMessageW`` already carries one.
+        """
+
+        api = self._api
+        thread_id = self._hook_thread_id
+        if api is None or thread_id is None:
+            return
+        api.user32.PostThreadMessageW(thread_id, _WM_REINSTALL_HOOK, int(reset), 0)
+
+    def _reinstall_hook(
+        self, api: SimpleNamespace, old_handle: object | None, *, reset: bool
+    ) -> object | None:
+        """Swap the hook for a fresh one; runs on the hook thread only.
+
+        The new hook is installed *before* the old one is unhooked: if
+        ``SetWindowsHookExW`` fails, the previous (possibly still-live) hook
+        is left in place instead of leaving the service with no hook at all
+        until the next attempt.  A brief window with both installed is
+        harmless -- the duplicate event it would produce is just an
+        auto-repeat as far as both the state machine (``vk_code in
+        self._pressed``) and the suppressor (``repeated``) are concerned,
+        and both already handle that safely.
+
+        ``reset`` only applies when the watchdog decided the state machine
+        looks stuck (a watched modifier pressed far longer than any
+        legitimate recording): the suppressor is recreated directly (only
+        the hook thread ever touches it) and the dispatcher ends an active
+        hold via the normal callback path, since user callbacks always run
+        on the dispatcher thread, not here.  A routine reinstall (nothing
+        pressed) resets nothing -- there is nothing to reset.
+        """
+
+        module = api.kernel32.GetModuleHandleW(None)
+        new_handle = api.user32.SetWindowsHookExW(13, self._hook_proc, module, 0)
+        if not new_handle:
+            error_code = api.ctypes.get_last_error()
+            LOG.warning("Pressay keyboard hook reinstall failed (%s)", error_code)
+            return old_handle
+        if old_handle:
+            api.user32.UnhookWindowsHookEx(old_handle)
+        self._hook_handle = new_handle
+        if reset:
+            LOG.info("Pressay keyboard hook state looked stuck; reinstalled and reset")
+            self._suppressor = _HookKeySuppressor(self.bindings)
+            self._events.put(_RESET_MACHINE)
+        else:
+            LOG.debug("Pressay keyboard hook routine reinstall")
+        return new_handle
 
     def _emit(self, action: HotkeyAction) -> None:
         with self._callback_lock:
@@ -590,22 +857,33 @@ class WindowsHotkeyService:
     def _dispatch_loop(self) -> None:
         try:
             while True:
+                # A short timeout is only needed to poll flush_due() for a
+                # pending Ctrl+Win hold; with nothing pending there is no
+                # reason to wake up 40 times a second, so block indefinitely.
+                timeout = 0.025 if self._machine.hold_pending else None
                 try:
-                    item = self._events.get(timeout=0.025)
+                    item = self._events.get(timeout=timeout)
                 except queue.Empty:
                     item = None
                 if item is _STOP:
                     break
+                if item is _RESET_MACHINE:
+                    for action in self._machine.shutdown():
+                        self._emit(action)
+                    self._publish_pressed_snapshot()
+                    continue
                 actions = (
                     self._machine.process(item)
                     if isinstance(item, KeyEvent)
                     else self._machine.flush_due()
                 )
+                self._publish_pressed_snapshot()
                 for action in actions:
                     self._emit(action)
         finally:
             for action in self._machine.shutdown():
                 self._emit(action)
+            self._publish_pressed_snapshot()
 
     def _hook_loop(self) -> None:
         hook_handle = None
@@ -660,6 +938,11 @@ class WindowsHotkeyService:
                 if result == -1:
                     error_code = api.ctypes.get_last_error()
                     raise WindowsHotkeyError(f"GetMessageW failed ({error_code})")
+                if msg.message == _WM_REINSTALL_HOOK:
+                    hook_handle = self._reinstall_hook(
+                        api, hook_handle, reset=bool(msg.wParam)
+                    )
+                    continue
                 api.user32.TranslateMessage(api.ctypes.byref(msg))
                 api.user32.DispatchMessageW(api.ctypes.byref(msg))
         except BaseException as exc:

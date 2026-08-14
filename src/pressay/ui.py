@@ -8,7 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCloseEvent,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QPainter,
+    QPalette,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -17,6 +27,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -27,7 +38,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import hotkey_bindings
 from .platform_support import platform_label
+from .text import replacement_key
 
 
 STATE_COLORS = {
@@ -39,8 +52,72 @@ STATE_COLORS = {
     "warning": "#f59e0b",
     "error": "#ef4444",
 }
+# Same keys as STATE_COLORS, but brightened where the light-mode accent reads
+# below WCAG AA (4.5:1) against the dark status-card background (#1e293b).
+STATE_COLORS_DARK = {
+    "idle": "#94a3b8",
+    "ready": "#22c55e",
+    "recording": "#f87171",
+    "processing": "#a78bfa",
+    "success": "#22c55e",
+    "warning": "#f59e0b",
+    "error": "#f87171",
+}
 ASSET_DIRECTORY = Path(__file__).with_name("assets")
 APP_ICON_PATH = ASSET_DIRECTORY / "app-icon.svg"
+
+# Color tokens for the pieces of SettingsWindow that used to hardcode light
+# colors. Light values are the original literals verbatim so the light look
+# stays pixel-identical.
+LIGHT_THEME = {
+    "status_bg": "#f1f5f9",
+    "status_text": "#0f172a",
+    "subtitle_text": "#64748b",
+    "privacy_bg": "#ecfdf5",
+    "privacy_text": "#475569",
+}
+DARK_THEME = {
+    "status_bg": "#1e293b",
+    "status_text": "#f1f5f9",
+    "subtitle_text": "#94a3b8",
+    "privacy_bg": "#0f172a",
+    "privacy_text": "#e2e8f0",
+}
+
+
+def theme_tokens(scheme: Qt.ColorScheme) -> dict[str, str]:
+    """Pure lookup: color tokens for the given Qt color scheme."""
+
+    return DARK_THEME if scheme == Qt.ColorScheme.Dark else LIGHT_THEME
+
+
+def state_colors_for_scheme(scheme: Qt.ColorScheme) -> dict[str, str]:
+    """Pure lookup: state accent colors tuned for readability on the given scheme."""
+
+    return STATE_COLORS_DARK if scheme == Qt.ColorScheme.Dark else STATE_COLORS
+
+
+def detect_color_scheme() -> Qt.ColorScheme:
+    """Detect the active Windows/Qt color scheme.
+
+    Defensive by design: ``colorScheme()`` is missing on some Qt 6 builds and
+    there may be no QApplication yet when this runs, so both cases fall back
+    to reading the lightness of the current palette's window color.
+    """
+
+    if QApplication.instance() is None:
+        return Qt.ColorScheme.Light
+    try:
+        style_hints = QGuiApplication.styleHints()
+        color_scheme = getattr(style_hints, "colorScheme", None)
+        if color_scheme is not None:
+            scheme = color_scheme()
+            if scheme != Qt.ColorScheme.Unknown:
+                return scheme
+    except Exception:
+        pass
+    window_color = QApplication.palette().color(QPalette.ColorRole.Window)
+    return Qt.ColorScheme.Dark if window_color.lightness() < 128 else Qt.ColorScheme.Light
 
 
 def format_replacements(replacements: dict[str, str]) -> str:
@@ -63,7 +140,9 @@ def parse_replacements(text: str) -> dict[str, str]:
         alias, canonical = (part.strip() for part in line.split("=", 1))
         if not alias or not canonical:
             raise ValueError(f"Строка {line_number}: обе части должны быть заполнены")
-        folded = alias.casefold()
+        folded = replacement_key(alias)
+        if not folded:
+            raise ValueError(f"Строка {line_number}: вариант «{alias}» становится пустым")
         if folded in seen:
             raise ValueError(f"Строка {line_number}: повторяется вариант «{alias}»")
         seen.add(folded)
@@ -183,7 +262,9 @@ class StatusOverlay(QWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
-        self._apply_color(STATE_COLORS["ready"])
+        # The overlay plate is always dark, in either system theme, so it uses
+        # the accents tuned for dark backgrounds rather than the window ones.
+        self._apply_color(STATE_COLORS_DARK["ready"])
 
     def _apply_color(self, color: str) -> None:
         self._frame.setStyleSheet(
@@ -199,7 +280,7 @@ class StatusOverlay(QWidget):
     def show_status(self, text: str, state: str, *, auto_hide_ms: int = 0) -> None:
         self._hide_timer.stop()
         self._label.setText(text)
-        self._apply_color(STATE_COLORS.get(state, STATE_COLORS["idle"]))
+        self._apply_color(STATE_COLORS_DARK.get(state, STATE_COLORS_DARK["idle"]))
         self.adjustSize()
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -231,6 +312,13 @@ class SettingsWindow(QMainWindow):
         self.resize(620, 790)
         self._really_close = False
         self._recent_transcripts: deque[str] = deque(maxlen=2)
+        # Remembered so a later theme switch can redraw the status card
+        # without a second, competing definition of "what the status is".
+        self._status_text = "Готов к диктовке"
+        self._status_state: str | None = None
+        # Muted explanatory lines; recolored together on a theme switch.
+        self._hint_labels: list[QLabel] = []
+        self._color_scheme = detect_color_scheme()
 
         root = QWidget()
         layout = QVBoxLayout(root)
@@ -244,21 +332,16 @@ class SettingsWindow(QMainWindow):
         brand_text = QVBoxLayout()
         title = QLabel("Pressay")
         title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
-        subtitle = QLabel(f"Локальная диктовка в любом приложении {platform_label()}")
-        subtitle.setStyleSheet("color: #64748b;")
+        self._subtitle_label = QLabel(f"Локальная диктовка в любом приложении {platform_label()}")
         brand_text.addWidget(title)
-        brand_text.addWidget(subtitle)
+        brand_text.addWidget(self._subtitle_label)
         brand_row.addWidget(brand_icon)
         brand_row.addLayout(brand_text)
         brand_row.addStretch(1)
         layout.addLayout(brand_row)
 
-        self.status_label = QLabel("Готов к диктовке")
+        self.status_label = QLabel(self._status_text)
         self.status_label.setObjectName("statusCard")
-        self.status_label.setStyleSheet(
-            "QLabel#statusCard { background: #f1f5f9; color: #0f172a;"
-            " border-radius: 10px; padding: 13px; font-weight: 600; }"
-        )
         layout.addWidget(self.status_label)
 
         form = QFormLayout()
@@ -280,6 +363,14 @@ class SettingsWindow(QMainWindow):
         language_index = self.language_combo.findData(settings.get("language", "auto"))
         self.language_combo.setCurrentIndex(max(0, language_index))
         form.addRow("Язык", self.language_combo)
+        language_hint = QLabel(
+            "Постоянный язык примерно на треть быстрее: определение языка "
+            "пропускается. Но речь на другом языке будет не распознана, "
+            "а переведена — без предупреждения."
+        )
+        language_hint.setWordWrap(True)
+        self._hint_labels.append(language_hint)
+        form.addRow("", language_hint)
 
         self.model_combo = QComboBox()
         for label, value in (
@@ -319,6 +410,72 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self.smart_spacing_checkbox)
         layout.addWidget(self.remove_fillers_checkbox)
         layout.addWidget(self.press_enter_checkbox)
+
+        hotkeys_defaults = hotkey_bindings.HotkeyBindings().to_mapping()
+        hotkeys_settings = settings.get("hotkeys", hotkeys_defaults)
+
+        hotkeys_label = QLabel("Горячие клавиши")
+        hotkeys_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(hotkeys_label)
+
+        hotkeys_form = QFormLayout()
+        hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        hotkeys_form.setVerticalSpacing(12)
+
+        self.hold_modifiers_combo = QComboBox()
+        for pair in hotkey_bindings.HOLD_MODIFIER_PAIRS:
+            canonical = "+".join(pair)
+            label = "+".join(part.capitalize() for part in pair)
+            self.hold_modifiers_combo.addItem(label, canonical)
+        hold_index = self.hold_modifiers_combo.findData(
+            hotkeys_settings.get("hold_modifiers", hotkeys_defaults["hold_modifiers"])
+        )
+        self.hold_modifiers_combo.setCurrentIndex(max(0, hold_index))
+        hotkeys_form.addRow("Комбинация удержания", self.hold_modifiers_combo)
+
+        self.push_to_talk_checkbox = QCheckBox(
+            "Push-to-talk (при выключении запись включается и выключается только "
+            "сочетанием с клавишей переключения, без удержания)"
+        )
+        self.push_to_talk_checkbox.setChecked(
+            bool(hotkeys_settings.get("push_to_talk", hotkeys_defaults["push_to_talk"]))
+        )
+        hotkeys_form.addRow(self.push_to_talk_checkbox)
+
+        self.toggle_key_edit = QLineEdit(
+            str(hotkeys_settings.get("toggle_key", hotkeys_defaults["toggle_key"]))
+        )
+        hotkeys_form.addRow("Клавиша переключения", self.toggle_key_edit)
+
+        self.paste_last_edit = QLineEdit(
+            str(hotkeys_settings.get("paste_last", hotkeys_defaults["paste_last"]))
+        )
+        hotkeys_form.addRow("Вставить последнюю", self.paste_last_edit)
+
+        self.copy_last_edit = QLineEdit(
+            str(hotkeys_settings.get("copy_last", hotkeys_defaults["copy_last"]))
+        )
+        hotkeys_form.addRow("Скопировать", self.copy_last_edit)
+        layout.addLayout(hotkeys_form)
+
+        hotkeys_format_label = QLabel(
+            "Части сочетания пишутся через «+»: модификаторы ctrl, win, shift, alt "
+            "и одна обычная клавиша — буква, цифра, space или f1–f12. Слово none "
+            "отключает действие."
+        )
+        hotkeys_format_label.setWordWrap(True)
+        self._hint_labels.append(hotkeys_format_label)
+        layout.addWidget(hotkeys_format_label)
+
+        hotkeys_conflict_label = QLabel(
+            "Внимание, возможные конфликты: Ctrl+Alt на многих раскладках равносилен "
+            "AltGr и используется для ввода символов; Ctrl+Shift и Shift+Alt — "
+            "стандартные сочетания переключения раскладки Windows; Ctrl+Win "
+            "(по умолчанию) конфликтов не имеет."
+        )
+        hotkeys_conflict_label.setWordWrap(True)
+        self._hint_labels.append(hotkeys_conflict_label)
+        layout.addWidget(hotkeys_conflict_label)
 
         dictionary_label = QLabel("Личный словарь: произношение = правильное написание")
         dictionary_label.setStyleSheet("font-weight: 600;")
@@ -366,15 +523,23 @@ class SettingsWindow(QMainWindow):
         last_actions.addStretch(1)
         layout.addLayout(last_actions)
 
-        privacy = QLabel(
+        self._privacy_label = QLabel(
             "🔒 Аудио не покидает компьютер и не сохраняется на диск. "
             "Сеть нужна только для первой загрузки модели."
         )
-        privacy.setWordWrap(True)
-        privacy.setStyleSheet("color: #475569; background: #ecfdf5; padding: 10px; border-radius: 8px;")
-        layout.addWidget(privacy)
+        self._privacy_label.setWordWrap(True)
+        layout.addWidget(self._privacy_label)
 
         self.setCentralWidget(root)
+        self._apply_theme(self._color_scheme)
+
+        # The style hints singleton outlives this window; PySide auto-drops
+        # the connection once this QObject (the receiver) is destroyed, so
+        # there is nothing to disconnect by hand.
+        style_hints = QGuiApplication.styleHints()
+        color_scheme_changed = getattr(style_hints, "colorSchemeChanged", None)
+        if color_scheme_changed is not None:
+            color_scheme_changed.connect(self._on_color_scheme_changed)
 
     def current_settings(self) -> dict[str, Any]:
         return {
@@ -387,24 +552,79 @@ class SettingsWindow(QMainWindow):
             "remove_fillers": self.remove_fillers_checkbox.isChecked(),
             "press_enter": self.press_enter_checkbox.isChecked(),
             "replacements": parse_replacements(self.dictionary_edit.toPlainText()),
+            "hotkeys": self._current_hotkeys(),
         }
+
+    def _current_hotkeys(self) -> dict[str, Any]:
+        raw = {
+            "hold_modifiers": self.hold_modifiers_combo.currentData(),
+            "toggle_key": self.toggle_key_edit.text(),
+            "paste_last": self.paste_last_edit.text(),
+            "copy_last": self.copy_last_edit.text(),
+            "push_to_talk": self.push_to_talk_checkbox.isChecked(),
+        }
+        try:
+            bindings = hotkey_bindings.from_mapping(raw)
+        except hotkey_bindings.HotkeyBindingError as exc:
+            raise ValueError(f"Горячие клавиши: {exc}") from exc
+        return bindings.to_mapping()
 
     def _emit_save(self) -> None:
         try:
             settings = self.current_settings()
         except ValueError as exc:
-            QMessageBox.warning(self, "Ошибка словаря", str(exc))
+            QMessageBox.warning(self, "Ошибка настроек", str(exc))
             return
         self.signals.save_requested.emit(settings)
 
     def update_status(self, text: str, state: str = "idle") -> None:
+        self._status_text = text
+        self._status_state = state
         self.status_label.setText(text)
-        color = STATE_COLORS.get(state, STATE_COLORS["idle"])
+        self._restyle_status()
+        self.toggle_button.setText("Завершить тест" if state == "recording" else "Тестовая диктовка")
+
+    def _restyle_status(self) -> None:
+        """Apply the status-card stylesheet for the current text/state and theme.
+
+        The one spot that turns (state, scheme) into a stylesheet, so a
+        theme switch just needs to call this again with the remembered
+        state instead of duplicating the color logic.
+        """
+
+        tokens = theme_tokens(self._color_scheme)
+        if self._status_state is None:
+            # Initial "untouched" look: plain readable text, no state accent.
+            self.status_label.setStyleSheet(
+                f"QLabel#statusCard {{ background: {tokens['status_bg']}; color: {tokens['status_text']};"
+                " border-radius: 10px; padding: 13px; font-weight: 600; }"
+            )
+            return
+        accents = state_colors_for_scheme(self._color_scheme)
+        color = accents.get(self._status_state, accents["idle"])
         self.status_label.setStyleSheet(
-            f"QLabel#statusCard {{ background: #f1f5f9; color: {color};"
+            f"QLabel#statusCard {{ background: {tokens['status_bg']}; color: {color};"
             " border-radius: 10px; padding: 13px; font-weight: 700; }"
         )
-        self.toggle_button.setText("Завершить тест" if state == "recording" else "Тестовая диктовка")
+
+    def _apply_theme(self, scheme: Qt.ColorScheme) -> None:
+        """Recolor every themed widget in this window for ``scheme``."""
+
+        self._color_scheme = scheme
+        tokens = theme_tokens(scheme)
+        self._subtitle_label.setStyleSheet(f"color: {tokens['subtitle_text']};")
+        for hint in self._hint_labels:
+            hint.setStyleSheet(f"color: {tokens['subtitle_text']};")
+        self._privacy_label.setStyleSheet(
+            f"color: {tokens['privacy_text']}; background: {tokens['privacy_bg']};"
+            " padding: 10px; border-radius: 8px;"
+        )
+        self._restyle_status()
+
+    def _on_color_scheme_changed(self, scheme: Qt.ColorScheme) -> None:
+        if scheme == Qt.ColorScheme.Unknown:
+            scheme = detect_color_scheme()
+        self._apply_theme(scheme)
 
     def set_last_transcript(self, text: str) -> None:
         if not text:

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 from types import ModuleType
+from typing import Any
 
 
 def is_windows() -> bool:
@@ -52,7 +53,12 @@ def input_adapter() -> ModuleType:
     raise RuntimeError(f"Pressay does not support text delivery on {sys.platform}")
 
 
-def hotkey_hint(action: str) -> str:
+def hotkey_hint(action: str, bindings: Any | None = None) -> str | None:
+    """Label for a gesture; ``None`` when the user disabled that action.
+
+    macOS chords are fixed for now, so *bindings* only affects Windows.
+    """
+
     mac = {
         "hold": "Control+Option",
         "toggle": "Control+Option+Space",
@@ -60,14 +66,23 @@ def hotkey_hint(action: str) -> str:
         "paste": "Control+Option+V",
         "copy": "Control+Option+C",
     }
-    windows = {
-        "hold": "Ctrl+Win",
-        "toggle": "Ctrl+Win+Space",
+    if is_macos():
+        return mac[action]
+    if bindings is None:
+        return {
+            "hold": "Ctrl+Win",
+            "toggle": "Ctrl+Win+Space",
+            "cancel": "Esc",
+            "paste": "Shift+Alt+Z",
+            "copy": "Shift+Alt+X",
+        }[action]
+    return {
+        "hold": bindings.hold_label(),
+        "toggle": bindings.toggle_label(),
         "cancel": "Esc",
-        "paste": "Shift+Alt+Z",
-        "copy": "Shift+Alt+X",
-    }
-    return (mac if is_macos() else windows)[action]
+        "paste": None if bindings.paste_last is None else bindings.paste_last.label(),
+        "copy": None if bindings.copy_last is None else bindings.copy_last.label(),
+    }[action]
 
 
 __all__ = [

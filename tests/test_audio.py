@@ -118,6 +118,42 @@ def test_resample_sanitizes_bad_values_and_validates_rates() -> None:
         resample_audio([0.0], 0)
 
 
+def test_resample_upsample_matches_reference_linear_interpolation() -> None:
+    ramp = np.linspace(-0.5, 0.5, 100, dtype=np.float32)
+
+    result = resample_audio(ramp, 16_000, 48_000)
+
+    positions = np.arange(result.size, dtype=np.float64) * 16_000 / 48_000
+    positions = np.minimum(positions, ramp.size - 1)
+    expected = np.interp(positions, np.arange(ramp.size), ramp.astype(np.float64))
+
+    assert result.shape == (300,)
+    np.testing.assert_allclose(result, expected, atol=1e-6)
+
+
+def test_resample_downsample_preserves_inband_amplitude() -> None:
+    source_rate = 48_000
+    target_rate = 16_000
+    t = np.arange(int(source_rate * 0.05), dtype=np.float64) / source_rate
+    tone = (0.5 * np.sin(2 * np.pi * 1_000 * t)).astype(np.float32)
+
+    result = resample_audio(tone, source_rate, target_rate)
+
+    assert audio_rms(result) == pytest.approx(audio_rms(tone), rel=0.03)
+
+
+def test_resample_does_not_crash_on_empty_single_or_short_buffers() -> None:
+    assert resample_audio(np.array([], dtype=np.float32), 48_000, 16_000).size == 0
+
+    single = resample_audio(np.array([0.25], dtype=np.float32), 48_000, 16_000)
+    assert single.tolist() == pytest.approx([0.25])
+
+    short = np.ones(5, dtype=np.float32) * 0.2
+    result = resample_audio(short, 48_000, 16_000)
+    assert np.isfinite(result).all()
+    assert result.size >= 1
+
+
 def test_default_silence_floor_accepts_quiet_laptop_microphone_arrays() -> None:
     recorder = AudioRecorder()
 
@@ -374,6 +410,11 @@ def test_duration_limit_retains_exact_native_sample_bound_and_signals_once(
         max_duration_seconds=0.001,
         min_duration_seconds=0,
         silence_rms_threshold=0,
+        # Opt into the legacy discard-the-whole-capture behaviour: this test
+        # exercises that path specifically (see
+        # test_stop_returns_truncated_recording_when_limit_reached for the
+        # default toggle-dictation behaviour).
+        discard_on_limit=True,
     )
 
     assert recorder.start() == 48_000
@@ -400,6 +441,61 @@ def test_duration_limit_retains_exact_native_sample_bound_and_signals_once(
     assert recorder.wait_for_duration_limit() is False
     assert recorder.retained_samples == 0
     assert recorder.max_retained_samples is None
+
+
+def test_stop_returns_truncated_recording_when_limit_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(
+        [
+            np.ones(30, dtype=np.float32) * 0.1,
+            np.ones(30, dtype=np.float32) * 0.1,
+        ]
+    )
+    install_fake(monkeypatch, fake)
+    # discard_on_limit defaults to False: toggle dictation must recognize the
+    # captured tail instead of losing the whole recording.
+    recorder = AudioRecorder(
+        max_duration_seconds=0.001,
+        min_duration_seconds=0,
+        silence_rms_threshold=0,
+    )
+
+    recorder.start()
+    recording = recorder.stop()
+
+    assert recording.limit_reached is True
+    assert recording.audio.size > 0
+    assert recording.duration_seconds == pytest.approx(0.001)
+    assert recording.source_sample_rate == 48_000
+
+
+@pytest.mark.parametrize("discard_on_limit", [False, True])
+def test_stream_error_outranks_duration_limit_regardless_of_discard_setting(
+    monkeypatch: pytest.MonkeyPatch,
+    discard_on_limit: bool,
+) -> None:
+    # A single oversized callback both trips the PortAudio integrity signal
+    # and fills the (tiny) duration bound, so both failure paths are live at
+    # once. AudioStreamError must win either way.
+    fake = FakeSoundDevice([np.ones(4_800, dtype=np.float32) * 0.1])
+    fake.status = "input overflow"
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(
+        max_duration_seconds=0.05,
+        min_duration_seconds=0,
+        silence_rms_threshold=0,
+        discard_on_limit=discard_on_limit,
+    )
+
+    recorder.start()
+    assert recorder.duration_limit_reached is True
+    assert recorder.wait_for_stop_signal() is True
+
+    with pytest.raises(AudioStreamError) as caught:
+        recorder.stop()
+
+    assert caught.value.reason == "portaudio_status"
 
 
 def test_duration_limit_metadata_is_available_when_validation_is_disabled(

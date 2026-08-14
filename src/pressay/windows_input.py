@@ -383,30 +383,91 @@ def target_guard(expected: ForegroundTarget, current: ForegroundTarget) -> bool:
     return targets_match(expected, current)
 
 
+@dataclass(frozen=True, slots=True)
+class FocusFingerprint:
+    """Named view over the opaque tuple written by the two focus probes.
+
+    Fields not present in a given ``kind``'s tuple format stay ``None``
+    rather than a guessed default, so callers can tell "not evidenced" apart
+    from "evidenced false".
+    """
+
+    kind: str  # "uia" or "win32_focus"
+    process_id: int
+    control_type: int | None = None
+    enabled: bool | None = None
+    keyboard_focusable: bool | None = None
+    value_writable: bool | None = None
+    text_editable: bool | None = None
+    class_name: str | None = None
+
+
+def parse_focus_fingerprint(
+    fingerprint: tuple[object, ...] | None,
+) -> FocusFingerprint | None:
+    """Decode ``_read_fingerprint``/``_native_focused_control_fingerprint`` output.
+
+    Returns ``None`` for a missing fingerprint, the explicit
+    ``_FOCUS_UNAVAILABLE`` sentinel, and any tuple whose shape does not match
+    a known ``uia``/``win32_focus`` format; callers must treat all three the
+    same way (no positive evidence of editability).
+    """
+
+    if not fingerprint or fingerprint == _FOCUS_UNAVAILABLE:
+        return None
+    kind = fingerprint[0]
+    if kind == "win32_focus":
+        return FocusFingerprint(
+            kind="win32_focus",
+            process_id=int(fingerprint[1]) if len(fingerprint) > 1 else 0,
+            class_name=str(fingerprint[3]) if len(fingerprint) > 3 else None,
+        )
+    if kind == "uia" and len(fingerprint) >= 10:
+        return FocusFingerprint(
+            kind="uia",
+            process_id=int(fingerprint[1]),
+            control_type=int(fingerprint[-5]),
+            enabled=bool(fingerprint[-4]),
+            keyboard_focusable=bool(fingerprint[-3]),
+            value_writable=bool(fingerprint[-2]),
+            text_editable=bool(fingerprint[-1]),
+            class_name=str(fingerprint[-6]),
+        )
+    return None
+
+
 def target_looks_editable(target: ForegroundTarget) -> bool:
     """Allow only controls with positive evidence that they accept text."""
 
-    fingerprint = target.focused_control
-    if not fingerprint or fingerprint == _FOCUS_UNAVAILABLE:
+    parsed = parse_focus_fingerprint(target.focused_control)
+    if parsed is None:
         return False
-    if fingerprint[0] == "win32_focus":
+    if parsed.kind == "win32_focus":
         return True
-    if fingerprint[0] != "uia" or len(fingerprint) < 10:
-        return False
-    control_type = int(fingerprint[-5])
-    enabled = bool(fingerprint[-4])
-    keyboard_focusable = bool(fingerprint[-3])
-    value_writable = bool(fingerprint[-2])
-    text_editable = bool(fingerprint[-1])
     # UIA Edit, Document and Custom.  Control type alone is insufficient:
     # read-only edits/documents and arbitrary focusable custom widgets remain
     # blocked unless they expose a writable ValuePattern or TextEditPattern.
     return (
-        control_type in {50004, 50030, 50025}
-        and enabled
-        and keyboard_focusable
-        and (value_writable or text_editable)
+        parsed.control_type in {50004, 50030, 50025}
+        and bool(parsed.enabled)
+        and bool(parsed.keyboard_focusable)
+        and (bool(parsed.value_writable) or bool(parsed.text_editable))
     )
+
+
+def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
+    """Return log-safe primitives describing the captured focus fingerprint.
+
+    ``focus_kind`` mirrors the raw fingerprint tag (including the
+    ``"focus_unavailable"`` sentinel tag) so existing log consumers keep
+    seeing the same values; only a missing fingerprint becomes ``"none"``.
+    """
+
+    fingerprint = getattr(target, "focused_control", None) if target is not None else None
+    focus_kind = fingerprint[0] if fingerprint else "none"
+    parsed = parse_focus_fingerprint(fingerprint)
+    control_type = parsed.control_type if parsed is not None else None
+    return {"focus_kind": focus_kind, "control_type": control_type}
 
 
 def utf16_code_units(text: str) -> tuple[int, ...]:
@@ -2082,6 +2143,7 @@ __all__ = [
     "ClipboardPasteResult",
     "ClipboardReplaceError",
     "ClipboardSnapshot",
+    "FocusFingerprint",
     "ForegroundTarget",
     "InputBackend",
     "InputOutcome",
@@ -2098,7 +2160,9 @@ __all__ = [
     "clipboard_paste_transaction",
     "copy_last",
     "copy_text",
+    "describe_focus",
     "insert_text",
+    "parse_focus_fingerprint",
     "paste_last",
     "send_text",
     "snapshot_foreground_target",

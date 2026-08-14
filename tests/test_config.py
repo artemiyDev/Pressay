@@ -115,6 +115,45 @@ def test_invalid_json_and_known_setting_types_fail_closed(tmp_path):
         AppConfig.load(target)
 
 
+def test_replacements_with_colliding_keys_after_normalization_fail_closed():
+    with pytest.raises(ConfigError, match="replacements"):
+        AppConfig.from_dict({"replacements": {"Foo": "a", "foo": "b"}})
+
+    # Collision is detected after collapsing internal whitespace, matching
+    # apply_replacements' own normalization -- not just a raw casefold.
+    with pytest.raises(ConfigError, match="replacements"):
+        AppConfig.from_dict(
+            {"replacements": {"фаст  апи": "FastAPI", "фаст апи": "x"}}
+        )
+
+
+def test_snippets_with_colliding_keys_after_trailing_punctuation_strip_fail_closed():
+    # snippet_key trims trailing command punctuation, so "привет." and
+    # "привет" collide even though they differ as raw JSON keys.
+    with pytest.raises(ConfigError, match="snippets"):
+        AppConfig.from_dict({"snippets": {"привет.": "a", "привет": "b"}})
+
+
+def test_key_that_normalizes_to_empty_string_fails_closed():
+    # A zero-width space is not blank by str.strip(), but normalize_text
+    # removes it as an invisible artifact, leaving an unusable empty key.
+    zero_width_space = chr(0x200B)
+    with pytest.raises(ConfigError, match="replacements"):
+        AppConfig.from_dict({"replacements": {zero_width_space: "a"}})
+
+
+def test_non_colliding_replacements_and_snippets_load_unchanged():
+    raw = {
+        "replacements": {"вайт маркет": "White.Market", "фаст апи": "FastAPI"},
+        "snippets": {"моя подпись": "С уважением, Анна"},
+    }
+
+    config = AppConfig.from_dict(raw)
+
+    assert config.replacements == raw["replacements"]
+    assert config.snippets == raw["snippets"]
+
+
 def test_failed_replace_keeps_previous_file_and_removes_temp(monkeypatch, tmp_path):
     target = tmp_path / "config.json"
     target.write_text('{"model": "old"}', encoding="utf-8")

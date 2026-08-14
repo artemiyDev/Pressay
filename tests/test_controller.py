@@ -24,6 +24,7 @@ def _controller_uses_testable_windows_adapter(monkeypatch):
 @dataclass
 class FakeRecording:
     audio: np.ndarray
+    limit_reached: bool = False
 
 
 def test_setup_command_is_native_to_each_platform(monkeypatch) -> None:
@@ -34,8 +35,15 @@ def test_setup_command_is_native_to_each_platform(monkeypatch) -> None:
 
 
 class FakeRecorder:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        limit_reached: bool = False,
+        max_duration_seconds: float = 300.0,
+    ) -> None:
         self.is_recording = False
+        self.limit_reached = limit_reached
+        self.max_duration_seconds = max_duration_seconds
 
     def start(self) -> int:
         self.is_recording = True
@@ -43,12 +51,34 @@ class FakeRecorder:
 
     def stop(self) -> FakeRecording:
         self.is_recording = False
-        return FakeRecording(np.ones(8_000, dtype=np.float32) * 0.1)
+        return FakeRecording(
+            np.ones(8_000, dtype=np.float32) * 0.1,
+            limit_reached=self.limit_reached,
+        )
 
     def cancel(self) -> bool:
         was = self.is_recording
         self.is_recording = False
         return was
+
+
+class BlockingLimitRecorder(FakeRecorder):
+    """Reaches the duration limit but blocks stop() until the test releases it.
+
+    Used to interleave a cancellation between the native ``stop()`` call and
+    the controller's post-stop lock check, so the truncation notification can
+    be proven to skip a session that went stale in between.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(limit_reached=True, max_duration_seconds=300.0)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stop(self) -> FakeRecording:
+        self.started.set()
+        assert self.release.wait(timeout=2)
+        return super().stop()
 
 
 class FakeTranscriber:
@@ -846,6 +876,74 @@ def test_cancel_recording_suppresses_late_warmup_ready(monkeypatch) -> None:
     assert statuses == callbacks_after_cancel
     controller.close()
     assert controller.wait_closed(2)
+
+
+def test_duration_limit_reached_still_transcribes_and_warns_once() -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    results: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=results.append,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder(limit_reached=True, max_duration_seconds=300.0)
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    # Recognition still ran on the truncated buffer.
+    assert results == ["тестовая фраза"]
+    assert notifications == [
+        (
+            "Pressay",
+            "Достигнут предел записи 5 мин — распознаётся только записанная часть.",
+            True,
+        )
+    ]
+    controller.close()
+
+
+def test_duration_limit_notification_suppressed_for_stale_session() -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = BlockingLimitRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+
+    assert controller.start_recording(target="window") is True
+    stop_command = controller._request_stop_recording()
+    assert stop_command is not None
+    assert recorder.started.wait(timeout=2)
+
+    # Cancel while the native stop() is still in flight: this bumps the
+    # capture generation the queued stop command was issued with.
+    accepted, cancel_command, _session_id = controller._request_cancel()
+    assert accepted is True
+
+    recorder.release.set()
+    assert stop_command.completion is not None
+    assert stop_command.completion.wait(timeout=2)
+    if cancel_command is not None:
+        assert cancel_command.completion is not None
+        assert cancel_command.completion.wait(timeout=2)
+
+    # The stop command is stale by the time recorder.stop() returns: no
+    # notification, and recognition never got submitted.
+    assert notifications == []
+    assert controller._future is None
+    controller.close()
 
 
 def test_missing_local_model_reports_actionable_warmup_error(monkeypatch) -> None:

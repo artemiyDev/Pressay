@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from dataclasses import dataclass
 import logging
@@ -11,12 +12,13 @@ import os
 from pathlib import Path
 import sys
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
-from .audio import AudioCaptureError, AudioRecorder
+from . import hotkey_bindings
+from .audio import AudioCaptureError, AudioRecorder, normalize_device_selector
 from .config import AppConfig, ConfigError
 from .controller import DictationController
 from .ui import MicrophoneChoice, SettingsWindow, StatusOverlay, TrayController, UiSignals
@@ -101,6 +103,36 @@ class _MainThreadDispatcher(QObject):
     @staticmethod
     def _run(callback: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         callback(*args, **kwargs)
+
+
+class _InputActionWorker:
+    """Serialize paste/copy clipboard transactions off the Qt thread.
+
+    A single-worker ``ThreadPoolExecutor`` (rather than a bare
+    ``threading.Lock``) is used so a burst of paste/copy requests queues
+    cleanly on one daemon-style worker instead of spawning a new thread per
+    request that then blocks on a lock.
+    """
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pressay-input"
+        )
+
+    def submit(self, action: Callable[[], Any]) -> None:
+        self._executor.submit(self._run, action)
+
+    @staticmethod
+    def _run(action: Callable[[], Any]) -> None:
+        try:
+            action()
+        except Exception:
+            # A failed paste/copy transaction must not strand the single
+            # serializing worker; the next queued request still has to run.
+            LOGGER.exception("input_action_failed")
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False)
 
 
 def _configure_logging() -> None:
@@ -300,19 +332,72 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "remove_fillers": config.remove_fillers,
         "press_enter": config.voice_press_enter,
         "replacements": dict(config.replacements),
+        "hotkeys": config.hotkeys.to_mapping(),
     }
+
+
+def _test_microphone_device(value: Any) -> int | str | None:
+    """Normalize a combo-box selection the same way the controller does.
+
+    The form stores the stable selector (``str | None``) chosen by the user;
+    a purely numeric string is a legacy device index and must become ``int``.
+    """
+
+    return normalize_device_selector(value)
+
+
+def _build_microphone_test_handler(
+    *,
+    window: Any,
+    tray: Any,
+    status_callback: Callable[[str, str], None],
+    notification_callback: Callable[[str, str, bool], None],
+    recorder_factory: Callable[..., AudioRecorder] = AudioRecorder,
+    thread_factory: Callable[..., threading.Thread] = threading.Thread,
+) -> Callable[[], None]:
+    """Build the microphone-test slot: no settings save, form's own device.
+
+    Reading the form happens synchronously on the caller (Qt) thread, exactly
+    like ``_emit_save`` in ``ui.py``. A ``ValueError`` from a broken personal
+    dictionary is reported the same way, without ever writing config.json.
+    """
+
+    def test_microphone() -> None:
+        try:
+            values = window.current_settings()
+        except ValueError as exc:
+            window.update_status(str(exc), "error")
+            tray.notify("Pressay", str(exc), warning=True)
+            return
+        window.update_status("Проверяю микрофон…", "processing")
+        device = _test_microphone_device(values.get("microphone"))
+
+        def work() -> None:
+            try:
+                recorder = recorder_factory(device=device)
+                rate = recorder.warmup(0.10)
+            except Exception as exc:
+                status_callback("Микрофон недоступен", "error")
+                notification_callback("Pressay", str(exc), True)
+            else:
+                status_callback(f"Микрофон готов: {int(rate)} Hz", "success")
+
+        thread_factory(target=work, name="pressay-mic-test", daemon=True).start()
+
+    return test_microphone
 
 
 def _snapshot_target() -> Any | None:
     try:
         adapter = input_adapter()
         target = adapter.snapshot_foreground_target()
-        fingerprint = getattr(target, "focused_control", None)
-        focus_kind = fingerprint[0] if fingerprint else "none"
-        control_type = (
-            fingerprint[-5]
-            if focus_kind == "uia" and len(fingerprint) >= 10
-            else None
+        # The adapter is chosen dynamically; a future third platform without
+        # describe_focus must still produce a loggable (if uninformative) line.
+        describe_focus = getattr(adapter, "describe_focus", None)
+        focus_info = (
+            describe_focus(target)
+            if callable(describe_focus)
+            else {"focus_kind": "none", "control_type": None}
         )
         LOGGER.info(
             "recording_target_captured valid=%s editable=%s hwnd=%s pid=%s "
@@ -321,8 +406,8 @@ def _snapshot_target() -> Any | None:
             adapter.target_looks_editable(target),
             int(getattr(target, "hwnd", 0) or 0),
             int(getattr(target, "pid", 0) or 0),
-            focus_kind,
-            control_type,
+            focus_info.get("focus_kind", "none"),
+            focus_info.get("control_type"),
         )
         return target
     except Exception as exc:
@@ -400,16 +485,34 @@ def main(argv: list[str] | None = None) -> int:
                 target=_snapshot_target() if capture_target else None
             )
 
+    # paste_last/copy_last touch Win32 clipboard/COM with retries that can take
+    # up to roughly a second; both the Qt-signal path and the hotkey path run
+    # them on this one serialized worker so they never block the GUI thread.
+    input_worker = _InputActionWorker()
+
     signals.toggle_requested.connect(lambda: start_or_stop(capture_target=False))
     signals.cancel_requested.connect(controller.request_cancel)
-    signals.paste_last_requested.connect(controller.paste_last)
-    signals.copy_last_requested.connect(controller.copy_last)
+    signals.paste_last_requested.connect(lambda: input_worker.submit(controller.paste_last))
+    signals.copy_last_requested.connect(lambda: input_worker.submit(controller.copy_last))
+
+    # Filled in once the hotkey service exists; empty when it failed to start.
+    hotkey_restart: dict[str, Any] = {}
 
     def save_settings(values: dict[str, Any]) -> None:
         nonlocal config
         previous_resource_mode = config.resource_mode
+        previous_hotkeys = config.hotkeys
         microphone = values.get("microphone")
-        config = AppConfig(
+        try:
+            hotkeys = hotkey_bindings.from_mapping(
+                values.get("hotkeys", config.hotkeys.to_mapping())
+            )
+        except hotkey_bindings.HotkeyBindingError as exc:
+            message = f"Горячие клавиши: {exc}"
+            window.update_status(message, "error")
+            tray.notify("Pressay", message, warning=True)
+            return
+        updated = AppConfig(
             model=str(values.get("model", config.model)),
             language=str(values.get("language", config.language)),
             microphone=None if microphone is None else str(microphone),
@@ -420,35 +523,32 @@ def main(argv: list[str] | None = None) -> int:
             resource_mode=str(values.get("resource_mode", config.resource_mode)),
             snippets=dict(config.snippets),
             replacements=dict(values.get("replacements", config.replacements)),
+            hotkeys=hotkeys,
         )
         try:
-            config.save()
+            updated.save()
         except ConfigError as exc:
+            # Keep the previous config in memory: a failed write must not leave
+            # the running app on settings that were never persisted.
             tray.notify("Pressay", str(exc), warning=True)
             return
+        config = updated
         controller.update_config(config)
         if previous_resource_mode == "eco" and config.resource_mode != "eco":
             controller.warmup_model()
+        restart_hotkeys = hotkey_restart.get("restart")
+        if hotkeys != previous_hotkeys and restart_hotkeys is not None:
+            restart_hotkeys(hotkeys)
         window.update_status("Настройки сохранены", "success")
 
     signals.save_requested.connect(save_settings)
 
-    def test_microphone() -> None:
-        values = window.current_settings()
-        save_settings(values)
-        window.update_status("Проверяю микрофон…", "processing")
-
-        def work() -> None:
-            try:
-                rate, _ = controller.test_microphone()
-            except Exception as exc:
-                status_callback("Микрофон недоступен", "error")
-                notification_callback("Pressay", str(exc), True)
-            else:
-                status_callback(f"Микрофон готов: {int(rate)} Hz", "success")
-
-        threading.Thread(target=work, name="pressay-mic-test", daemon=True).start()
-
+    test_microphone = _build_microphone_test_handler(
+        window=window,
+        tray=tray,
+        status_callback=status_callback,
+        notification_callback=notification_callback,
+    )
     signals.microphone_test_requested.connect(test_microphone)
 
     hotkey_service: Any | None = None
@@ -463,6 +563,16 @@ def main(argv: list[str] | None = None) -> int:
             hotkey_type = WindowsHotkeyService
 
         def hotkey_callback(action: Any) -> None:
+            # PASTE_LAST/COPY_LAST must not go through the Qt-thread dispatch
+            # below; they share the same serialized input worker as the
+            # Qt-signal path so a hotkey and a button click never race.
+            if action == HotkeyAction.PASTE_LAST:
+                input_worker.submit(controller.paste_last)
+                return
+            if action == HotkeyAction.COPY_LAST:
+                input_worker.submit(controller.copy_last)
+                return
+
             def handle() -> None:
                 if action == HotkeyAction.START:
                     controller.request_start_recording(target=_snapshot_target())
@@ -472,15 +582,47 @@ def main(argv: list[str] | None = None) -> int:
                     start_or_stop(capture_target=True)
                 elif action == HotkeyAction.CANCEL:
                     controller.request_cancel()
-                elif action == HotkeyAction.PASTE_LAST:
-                    controller.paste_last()
-                elif action == HotkeyAction.COPY_LAST:
-                    controller.copy_last()
 
             dispatch_ui(handle)
 
-        hotkey_service = hotkey_type(hotkey_callback)
+        # macOS chords are still fixed, so only the Windows service is
+        # configurable; passing bindings it does not accept would break it.
+        hotkey_kwargs = {} if is_macos() else {"bindings": config.hotkeys}
+        hotkey_service = hotkey_type(hotkey_callback, **hotkey_kwargs)
         hotkey_service.start()
+
+        if not is_macos():
+
+            def restart_hotkeys(bindings: Any) -> None:
+                """Swap the keyboard hook for one bound to the new chords.
+
+                Runs off the Qt thread: stopping the service joins the hook,
+                dispatcher and watchdog threads, which must not freeze the
+                settings window.
+                """
+
+                def swap() -> None:
+                    nonlocal hotkey_service
+                    try:
+                        if hotkey_service is not None:
+                            hotkey_service.stop()
+                        service = hotkey_type(hotkey_callback, bindings=bindings)
+                        service.start()
+                        hotkey_service = service
+                    except Exception as exc:
+                        LOGGER.exception("hotkey_restart_failed")
+                        notification_callback(
+                            "Pressay",
+                            f"Не удалось применить новые клавиши: {exc}. "
+                            "Перезапустите Pressay.",
+                            True,
+                        )
+
+                threading.Thread(
+                    target=swap, name="pressay-hotkey-swap", daemon=True
+                ).start()
+
+            hotkey_restart["restart"] = restart_hotkeys
     except Exception as exc:
         LOGGER.exception("hotkey_service_failed")
         tray.notify("Pressay", f"Глобальные клавиши недоступны: {exc}", warning=True)
@@ -496,6 +638,8 @@ def main(argv: list[str] | None = None) -> int:
         # Start the hard deadline before touching PortAudio, CUDA or the
         # low-level keyboard hook. All native cleanup happens off the Qt thread.
         shutdown_handle = _start_native_shutdown(controller, hotkey_service)
+        # Never block application exit on a queued/in-flight paste or copy.
+        input_worker.shutdown()
 
     def quit_application() -> None:
         begin_shutdown()

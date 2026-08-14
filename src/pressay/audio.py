@@ -23,7 +23,6 @@ MICROPHONE_SELECTOR_PREFIX = "pressay:microphone:v1?"
 LEGACY_MICROPHONE_SELECTOR_PREFIX = "whisperflow:microphone:v1?"
 _UNRESOLVED_DEVICE = object()
 
-
 class AudioCaptureError(RuntimeError):
     """Base error for microphone capture failures."""
 
@@ -147,6 +146,22 @@ def parse_microphone_selector(value: object) -> tuple[str, str, int] | None:
     return name, host_api, sample_rate
 
 
+def normalize_device_selector(value: object) -> int | str | None:
+    """Interpret a persisted microphone setting as a PortAudio selector.
+
+    ``None`` selects the system default input. A purely numeric value is a
+    device index written by an older version and must stay an ``int``, since
+    :meth:`AudioRecorder._resolve_device` treats the two forms differently.
+    """
+
+    if value is None:
+        return None
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return value  # type: ignore[return-value]
+
+
 def _match_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).strip().casefold()
 
@@ -222,6 +237,11 @@ def resample_audio(
     handled here and avoids making SciPy a required desktop dependency.  The
     output length is derived from the rate ratio, so repeated calls do not
     accumulate timestamp drift.
+
+    Downsampling deliberately runs without an anti-aliasing low-pass: measured
+    end to end against the real model, filtering changed neither the detected
+    language nor a single character of the transcript, while costing tens of
+    milliseconds on every dictation.
     """
 
     source_rate = float(source_sample_rate)
@@ -270,6 +290,11 @@ class AudioRecorder:
         silence_rms_threshold: float = 0.0003,
         blocksize: int = 0,
         latency: str | float | None = "low",
+        # Push-to-talk callers may prefer the legacy behaviour of discarding
+        # the whole capture when the duration bound is hit (a stuck key is
+        # more likely than a legitimate five-minute utterance there). Toggle
+        # dictation keeps the default: return the truncated recording.
+        discard_on_limit: bool = False,
     ) -> None:
         if target_sample_rate <= 0:
             raise ValueError("target_sample_rate must be positive")
@@ -290,6 +315,7 @@ class AudioRecorder:
         self.silence_rms_threshold = float(silence_rms_threshold)
         self.blocksize = int(blocksize)
         self.latency = latency
+        self.discard_on_limit = bool(discard_on_limit)
 
         self._lock = threading.RLock()
         self._stream: Any | None = None
@@ -807,9 +833,11 @@ class AudioRecorder:
                 captured_samples=retained_samples,
                 source_rate=native,
             )
-        if validate and limit_reached:
-            # Fail before concatenating, sanitizing or resampling the complete
-            # bounded capture. The exception carries lightweight metadata only.
+        if validate and limit_reached and self.discard_on_limit:
+            # Opt-in legacy behaviour: fail before concatenating, sanitizing
+            # or resampling the complete bounded capture, discarding it
+            # entirely. Toggle dictation instead falls through below and
+            # returns the truncated recording with limit_reached=True.
             raise AudioDurationLimitError(
                 max_duration_seconds=self.max_duration_seconds,
                 duration_seconds=duration,

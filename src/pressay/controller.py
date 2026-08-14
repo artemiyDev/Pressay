@@ -12,7 +12,13 @@ import threading
 import time
 from typing import Any, Callable
 
-from .audio import AudioCaptureError, AudioRecorder, SilentAudioError, AudioTooShortError
+from .audio import (
+    AudioCaptureError,
+    AudioRecorder,
+    AudioTooShortError,
+    SilentAudioError,
+    normalize_device_selector,
+)
 from .config import AppConfig
 from .state import SessionState
 from .text import process_transcript
@@ -40,7 +46,7 @@ def _setup_command(model_size: str) -> str:
     )
 
 
-def _insertion_status_text(reason: str) -> str:
+def _insertion_status_text(reason: str, bindings: Any | None = None) -> str:
     """Turn privacy-safe adapter reason codes into concise user guidance."""
 
     if reason in {
@@ -53,7 +59,7 @@ def _insertion_status_text(reason: str) -> str:
     if reason == "focused_control_is_not_editable":
         return "Не вставлено: курсор не в поле ввода"
     if reason == "physical_modifiers_not_released":
-        return f"Не вставлено: отпустите {hotkey_hint('hold')}"
+        return f"Не вставлено: отпустите {hotkey_hint('hold', bindings)}"
     if reason in {
         "recording_target_required",
         "foreground_snapshot_failed",
@@ -61,6 +67,21 @@ def _insertion_status_text(reason: str) -> str:
     }:
         return "Не вставлено: поле ввода не определено"
     return "Не вставлено — текст сохранён ниже"
+
+
+def _duration_limit_notification_text(max_duration_seconds: float) -> str:
+    """Russian warning naming the recorder's own configured duration bound."""
+
+    minutes = max_duration_seconds / 60.0
+    minutes_text = (
+        str(int(round(minutes)))
+        if abs(minutes - round(minutes)) < 1e-6
+        else f"{minutes:.1f}"
+    )
+    return (
+        f"Достигнут предел записи {minutes_text} мин — "
+        "распознаётся только записанная часть."
+    )
 
 
 def _initial_prompt(replacements: dict[str, str], *, limit: int = 512) -> str | None:
@@ -248,13 +269,24 @@ class DictationController:
             }
 
     def _microphone_device(self) -> int | str | None:
-        value = self.config.microphone
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return value
+        return normalize_device_selector(self.config.microphone)
+
+    def _ready_status_text(self) -> str:
+        """Name whichever gesture actually starts a recording right now."""
+
+        bindings = self.config.hotkeys
+        if bindings.push_to_talk:
+            return f"Готов — удерживайте {hotkey_hint('hold', bindings)}"
+        toggle = hotkey_hint("toggle", bindings)
+        return "Готов к диктовке" if toggle is None else f"Готов — {toggle}"
+
+    def _copy_hint_sentence(self) -> str:
+        """Closing sentence about copying, minus the shortcut when disabled."""
+
+        shortcut = hotkey_hint("copy", self.config.hotkeys)
+        if shortcut is None:
+            return "Скопируйте его кнопкой в окне Pressay."
+        return f"Скопируйте его кнопкой или {shortcut}."
 
     def _new_recorder(self) -> AudioRecorder:
         return AudioRecorder(device=self._microphone_device())
@@ -366,9 +398,7 @@ class DictationController:
                 current = self._warmup_is_current_locked(model_size, generation)
                 session_active = self.state.active
             if current and not session_active:
-                self.status_callback(
-                    f"Готов — удерживайте {hotkey_hint('hold')}", "ready"
-                )
+                self.status_callback(self._ready_status_text(), "ready")
         if current:
             self._schedule_model_retirement(self.config.resource_mode)
 
@@ -777,11 +807,12 @@ class DictationController:
         audio_finalize_seconds = time.perf_counter() - finalize_started
 
         with self._lock:
-            if not self._capture_is_current_locked(
+            current = self._capture_is_current_locked(
                 command.generation,
                 session_id,
                 recorder=recorder,
-            ):
+            )
+            if not current:
                 return False
             self._capture_intent = _CaptureIntent.IDLE
             self._recorder = None
@@ -799,6 +830,14 @@ class DictationController:
                 display_only=target is None,
                 released_at=command.requested_at,
                 audio_finalize_seconds=audio_finalize_seconds,
+            )
+        if recording.limit_reached and current and self._session_is_current(session_id):
+            # Recognition proceeds on the truncated buffer below; the user
+            # still needs to know the tail of a long dictation was cut.
+            self.notification_callback(
+                "Pressay",
+                _duration_limit_notification_text(recorder.max_duration_seconds),
+                True,
             )
         if self._job_is_active(session_id):
             self.status_callback("Распознаю локально…", "processing")
@@ -1041,7 +1080,7 @@ class DictationController:
             self.notification_callback(
                 "Pressay",
                 "Автовставка не сработала; текст сохранён в окне Pressay. "
-                f"Скопируйте его кнопкой или {hotkey_hint('copy')}.",
+                + self._copy_hint_sentence(),
                 True,
             )
             return
@@ -1066,7 +1105,9 @@ class DictationController:
             reason = str(getattr(outcome, "reason", "Целевое окно изменилось"))
             if cancelled() or not self._result_is_current(session_id):
                 return
-            self.status_callback(_insertion_status_text(reason), "warning")
+            self.status_callback(
+                _insertion_status_text(reason, self.config.hotkeys), "warning"
+            )
             if cancelled() or not self._result_is_current(session_id):
                 return
             self.notification_callback("Pressay", reason, True)
@@ -1102,8 +1143,7 @@ class DictationController:
                 self.notification_callback(
                     "Pressay",
                     "Не удалось вставить последнюю расшифровку. "
-                    "Текст сохранён в окне Pressay; для копирования "
-                    f"используйте {hotkey_hint('copy')}.",
+                    "Текст сохранён в окне Pressay. " + self._copy_hint_sentence(),
                     True,
                 )
             return False
@@ -1122,11 +1162,6 @@ class DictationController:
     def _last_transcript_is_current(self, text: str) -> bool:
         with self._lock:
             return not self._closed and self.last_transcript == text
-
-    def test_microphone(self) -> tuple[float, float]:
-        recorder = self._new_recorder()
-        rate = recorder.warmup(0.10)
-        return float(rate), 0.10
 
     def update_config(self, config: AppConfig) -> None:
         with self._warmup_status_gate:

@@ -64,9 +64,11 @@ class LanguageAwareFakeModel:
         responses: dict[str | None, tuple[list[object], str | None]],
         *,
         failures: set[str | None] | None = None,
+        language_probs: list[tuple[str, float]] | None = None,
     ) -> None:
         self.responses = responses
         self.failures = failures or set()
+        self.language_probs = language_probs
         self.calls: list[str | None] = []
 
     def transcribe(self, _audio: np.ndarray, **kwargs: object):
@@ -82,6 +84,7 @@ class LanguageAwareFakeModel:
         info = SimpleNamespace(
             language=self.responses[language][1],
             language_probability=0.91,
+            all_language_probs=self.language_probs,
         )
         return generate(), info
 
@@ -224,10 +227,58 @@ def test_auto_wrong_or_missing_language_uses_only_ru_en_candidates(
 
     result = transcriber.transcribe(speech(), language="auto")
 
-    assert model.calls == [None, "ru", "en"]
+    # Without per-language probabilities the historical RU-then-EN order
+    # applies, and a trustworthy RU transcript ends the search.
+    assert model.calls == [None, "ru"]
     assert result.language == "ru"
     assert result.text == "русский вариант"
     assert "nicht" not in result.text
+
+
+def test_auto_fallback_follows_the_model_language_posterior_not_text_score() -> None:
+    # RU would win on transcript score alone (much better avg_logprob), but the
+    # model itself is confident the audio is English, and only RU/EN exist.
+    model = LanguageAwareFakeModel(
+        {
+            None: ([segment("kalt draussen")], "de"),
+            "ru": ([segment("совершенно другое", avg_logprob=-0.05)], "ru"),
+            "en": ([segment("the actual sentence", avg_logprob=-0.60)], "en"),
+        },
+        language_probs=[("de", 0.44), ("en", 0.40), ("ru", 0.02)],
+    )
+    transcriber = FasterWhisperTranscriber(
+        device="cpu",
+        model_factory=lambda *_args, **_kwargs: model,
+        min_audio_seconds=0.05,
+    )
+
+    result = transcriber.transcribe(speech(), language="auto")
+
+    assert model.calls == [None, "en"]
+    assert result.language == "en"
+    assert result.text == "the actual sentence"
+
+
+def test_auto_fallback_still_tries_the_other_language_when_preferred_one_fails() -> None:
+    model = LanguageAwareFakeModel(
+        {
+            None: ([segment("bonjour")], "fr"),
+            "en": ([segment("   ")], "en"),
+            "ru": ([segment("нормальный текст", avg_logprob=-0.2)], "ru"),
+        },
+        language_probs=[("fr", 0.5), ("en", 0.3), ("ru", 0.1)],
+    )
+    transcriber = FasterWhisperTranscriber(
+        device="cpu",
+        model_factory=lambda *_args, **_kwargs: model,
+        min_audio_seconds=0.05,
+    )
+
+    result = transcriber.transcribe(speech(), language="auto")
+
+    assert model.calls == [None, "en", "ru"]
+    assert result.language == "ru"
+    assert result.text == "нормальный текст"
 
 
 def test_auto_ru_en_fast_path_does_not_run_fixed_candidates() -> None:

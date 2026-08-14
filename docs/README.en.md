@@ -8,12 +8,14 @@ English are the only supported languages.
 
 ## Features
 
-- push-to-talk and hands-free global hotkeys;
+- configurable push-to-talk and hands-free global hotkeys, with shipped defaults and a conflict warning for keyboard layouts;
 - local faster-whisper recognition;
 - personal vocabulary and deterministic term replacements;
 - focused editable-control verification before every insertion batch;
 - only two recent transcripts retained in application memory;
-- explicit copy, with no hidden clipboard overwrite after insertion failures.
+- explicit copy, with no hidden clipboard overwrite after insertion failures;
+- on Windows, automatic insertion still uses the clipboard for multiline text and characters outside the Basic Multilingual Plane (emoji), restoring the previous content afterward — "Insert last" and "Copy" always use it; on macOS, automatic insertion and "Insert last" never touch the pasteboard, only "Copy" does;
+- if Windows Clipboard History (Win+V) is on, a fragment delivered this way stays in the history after Pressay restores the clipboard, and syncs to other devices when cloud clipboard sync is on — turn it off under **Settings → System → Clipboard** if that matters to you.
 
 ## Windows 11 — stable
 
@@ -37,13 +39,30 @@ starts Pressay in the system tray.
 .\scripts\test.ps1 -q
 ```
 
-| Action | Windows hotkey |
+Windows hotkeys are configurable in Pressay's settings window, in the
+"Горячие клавиши" ("Hotkeys") group; the table below lists the shipped
+defaults.
+
+| Action | Windows hotkey (default) |
 |---|---|
 | Hold to dictate | `Ctrl+Win` |
 | Toggle hands-free | `Ctrl+Win+Space` |
 | Cancel | `Esc` |
 | Insert the last transcript | `Shift+Alt+Z` |
 | Copy the last transcript | `Shift+Alt+X` |
+
+The hold-to-talk combination is chosen from six modifier pairs (`ctrl`,
+`win`, `shift`, `alt`). The toggle key, "Insert last" and "Copy" are entered
+as text of the form `modifier+modifier+key` (for example, `shift+alt+z`):
+parts are joined with `+`, modifiers are `ctrl`, `win`, `shift`, `alt`, and
+the regular key is a letter, a digit, `space`, or `f1`–`f12`. The word
+`none` disables an action. Push-to-talk can be turned off — then recording
+starts and stops only with the toggle-key combination, without holding
+anything down. Cancel (`Esc`) is not configurable.
+
+Conflict warning: `Ctrl+Alt` is AltGr on many keyboard layouts and is used to
+type characters; `Ctrl+Shift` and `Shift+Alt` are standard Windows
+layout-switching shortcuts; `Ctrl+Win` (the default) has no conflicts.
 
 ## macOS 13+ — developer beta
 

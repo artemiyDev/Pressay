@@ -6,6 +6,7 @@ from pressay.macos_input import (
     ForegroundTarget,
     InputStatus,
     copy_text,
+    describe_focus,
     paste_last,
     send_text,
     targets_match,
@@ -98,6 +99,16 @@ def test_noneditable_and_held_modifiers_never_inject() -> None:
     outcome = send_text("text", expected_target=expected, backend=backend)
     assert outcome.status is InputStatus.MODIFIERS_HELD
     assert backend.unicode == []
+
+
+def test_describe_focus_has_same_shape_as_windows_input() -> None:
+    assert describe_focus(None) == {"focus_kind": "none", "control_type": None}
+
+    no_control = ForegroundTarget(pid=42, focused_control=None, editable=False)
+    assert describe_focus(no_control) == {"focus_kind": "none", "control_type": None}
+
+    focused = target()
+    assert describe_focus(focused) == {"focus_kind": "ax", "control_type": None}
 
 
 def test_explicit_paste_is_direct_and_copy_is_explicit() -> None:

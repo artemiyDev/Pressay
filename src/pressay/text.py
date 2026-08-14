@@ -115,6 +115,12 @@ def remove_filler_words(
     return normalize_text(without_fillers)
 
 
+def replacement_key(text: str) -> str:
+    """Return the exact key :func:`apply_replacements` matches text against."""
+
+    return normalize_text(text).casefold()
+
+
 def apply_replacements(text: str, replacements: Mapping[str, str]) -> str:
     """Apply literal, case-insensitive whole-token replacements in one pass.
 
@@ -162,7 +168,15 @@ def apply_replacements(text: str, replacements: Mapping[str, str]) -> str:
     return pattern.sub(replace, normalized)
 
 
-def _whole_phrase_key(text: str) -> str:
+def snippet_key(text: str) -> str:
+    """Return the exact key :func:`expand_snippet` matches an utterance against.
+
+    Trailing command punctuation (a spoken period, comma, ellipsis, ...) is
+    stripped in addition to the :func:`replacement_key` normalization, since a
+    snippet trigger is compared against a whole dictated utterance rather than
+    a token inside one.
+    """
+
     normalized = normalize_text(text)
     normalized = _TRAILING_COMMAND_PUNCTUATION_RE.sub("", normalized)
     return normalized.casefold()
@@ -172,7 +186,7 @@ def expand_snippet(text: str, snippets: Mapping[str, str]) -> tuple[str, bool]:
     """Expand a snippet only when its trigger is the entire utterance."""
 
     normalized = normalize_text(text)
-    utterance_key = _whole_phrase_key(normalized)
+    utterance_key = snippet_key(normalized)
     matches: dict[str, str] = {}
 
     for trigger, expansion in snippets.items():
@@ -180,7 +194,7 @@ def expand_snippet(text: str, snippets: Mapping[str, str]) -> tuple[str, bool]:
             raise ValueError("snippet triggers must be non-empty strings")
         if not isinstance(expansion, str):
             raise TypeError("snippet expansions must be strings")
-        key = _whole_phrase_key(trigger)
+        key = snippet_key(trigger)
         if key in matches:
             raise ValueError(f"duplicate snippet trigger after normalization: {trigger!r}")
         matches[key] = expansion
@@ -195,7 +209,7 @@ def is_press_enter_command(text: str, *, enabled: bool = False) -> bool:
 
     if not enabled:
         return False
-    return _whole_phrase_key(text) in PRESS_ENTER_PHRASES
+    return snippet_key(text) in PRESS_ENTER_PHRASES
 
 
 def process_transcript(

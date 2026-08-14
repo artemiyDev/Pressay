@@ -3,17 +3,22 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import threading
+import time
+from types import SimpleNamespace
 import uuid
 
 import pytest
 
 from pressay.app import (
+    _InputActionWorker,
     _SingleInstance,
+    _build_microphone_test_handler,
     _load_config,
     _microphones,
     _overlay_auto_hide_ms,
     _settings_dict,
     _start_native_shutdown,
+    _test_microphone_device,
 )
 from pressay.controller import DictationController
 from pressay.audio import AudioDevice
@@ -110,6 +115,11 @@ def test_personal_dictionary_text_round_trip_and_validation() -> None:
         parse_replacements("broken rule")
     with pytest.raises(ValueError, match="повторяется"):
         parse_replacements("Редис = Redis\nредис = REDIS")
+    # Duplicate detection must use the same normalization as apply_replacements
+    # (collapsed internal whitespace), not just a raw casefold of the alias.
+    with pytest.raises(ValueError, match="Строка 2") as excinfo:
+        parse_replacements("фаст  апи = FastAPI\nфаст апи = X")
+    assert "повторяется" in str(excinfo.value)
 
 
 def test_settings_window_keeps_only_two_recent_transcripts_in_memory(
@@ -247,3 +257,236 @@ def test_shutdown_deadline_covers_blocking_recorder_cancel() -> None:
     recorder.release.set()
     coordinator.join(timeout=1)
     assert complete.is_set()
+
+
+def test_microphone_device_normalizes_digit_strings_only() -> None:
+    assert _test_microphone_device(None) is None
+    assert _test_microphone_device("7") == 7
+    assert _test_microphone_device("stable-usb-selector") == "stable-usb-selector"
+
+
+class _FakeMicTestWindow:
+    def __init__(self, settings: dict | None = None, *, error: str | None = None) -> None:
+        self._settings = settings or {}
+        self._error = error
+        self.status_calls: list[tuple[str, str]] = []
+
+    def current_settings(self) -> dict:
+        if self._error is not None:
+            raise ValueError(self._error)
+        return self._settings
+
+    def update_status(self, text: str, state: str) -> None:
+        self.status_calls.append((text, state))
+
+
+class _FakeMicTestTray:
+    def __init__(self) -> None:
+        self.notifications: list[tuple[str, str, bool]] = []
+
+    def notify(self, title: str, message: str, *, warning: bool = False) -> None:
+        self.notifications.append((title, message, warning))
+
+
+def test_microphone_test_handler_reports_form_error_without_raising() -> None:
+    window = _FakeMicTestWindow(error="строка должна содержать знак =")
+    tray = _FakeMicTestTray()
+
+    handler = _build_microphone_test_handler(
+        window=window,
+        tray=tray,
+        status_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+
+    handler()  # must not raise ValueError out of the Qt slot
+
+    assert window.status_calls == [("строка должна содержать знак =", "error")]
+    assert tray.notifications == [
+        ("Pressay", "строка должна содержать знак =", True)
+    ]
+
+
+def test_microphone_test_handler_never_saves_settings(monkeypatch) -> None:
+    def _forbidden_save(self) -> None:
+        raise AssertionError("test_microphone must not write config.json")
+
+    monkeypatch.setattr(AppConfig, "save", _forbidden_save)
+    window = _FakeMicTestWindow({"microphone": None})
+    tray = _FakeMicTestTray()
+    done = threading.Event()
+
+    def status_callback(_text: str, _state: str) -> None:
+        done.set()
+
+    handler = _build_microphone_test_handler(
+        window=window,
+        tray=tray,
+        status_callback=status_callback,
+        notification_callback=lambda *_args: None,
+        recorder_factory=lambda device: SimpleNamespace(warmup=lambda _s: 48_000),
+    )
+
+    handler()
+
+    assert done.wait(timeout=1)
+
+
+def test_microphone_test_handler_uses_form_device_not_saved_config() -> None:
+    window = _FakeMicTestWindow({"microphone": "5"})
+    tray = _FakeMicTestTray()
+    seen_devices: list[object] = []
+    done = threading.Event()
+
+    def recorder_factory(device: object) -> SimpleNamespace:
+        seen_devices.append(device)
+        return SimpleNamespace(warmup=lambda _s: 44_100)
+
+    def status_callback(_text: str, _state: str) -> None:
+        done.set()
+
+    handler = _build_microphone_test_handler(
+        window=window,
+        tray=tray,
+        status_callback=status_callback,
+        notification_callback=lambda *_args: None,
+        recorder_factory=recorder_factory,
+    )
+
+    handler()
+
+    assert done.wait(timeout=1)
+    assert seen_devices == [5]
+
+
+def test_microphone_test_handler_runs_off_the_calling_thread() -> None:
+    window = _FakeMicTestWindow({"microphone": None})
+    tray = _FakeMicTestTray()
+    entered = threading.Event()
+    release = threading.Event()
+    status_events: list[tuple[str, str]] = []
+
+    class BlockingRecorder:
+        def __init__(self, device: object) -> None:
+            self.device = device
+
+        def warmup(self, _duration: float) -> int:
+            entered.set()
+            assert release.wait(timeout=2)
+            return 16_000
+
+    handler = _build_microphone_test_handler(
+        window=window,
+        tray=tray,
+        status_callback=lambda text, state: status_events.append((text, state)),
+        notification_callback=lambda *_args: None,
+        recorder_factory=BlockingRecorder,
+    )
+
+    handler()
+
+    # The call above must return before the blocking warmup() unblocks.
+    assert entered.wait(timeout=1)
+    assert status_events == []
+    release.set()
+
+    deadline = time.monotonic() + 1
+    while not status_events and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert status_events == [("Микрофон готов: 16000 Hz", "success")]
+
+
+def test_microphone_test_handler_reports_recorder_failure() -> None:
+    window = _FakeMicTestWindow({"microphone": None})
+    tray = _FakeMicTestTray()
+    status_events: list[tuple[str, str]] = []
+    notifications: list[tuple[str, str, bool]] = []
+    done = threading.Event()
+
+    def recorder_factory(device: object) -> SimpleNamespace:
+        raise RuntimeError("микрофон занят")
+
+    def status_callback(text: str, state: str) -> None:
+        status_events.append((text, state))
+        done.set()
+
+    def notification_callback(title: str, message: str, warning: bool) -> None:
+        notifications.append((title, message, warning))
+
+    handler = _build_microphone_test_handler(
+        window=window,
+        tray=tray,
+        status_callback=status_callback,
+        notification_callback=notification_callback,
+        recorder_factory=recorder_factory,
+    )
+
+    handler()
+
+    assert done.wait(timeout=1)
+    assert status_events == [("Микрофон недоступен", "error")]
+    assert notifications == [("Pressay", "микрофон занят", True)]
+
+
+def test_input_action_worker_submit_returns_before_action_completes() -> None:
+    worker = _InputActionWorker()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_action() -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+
+    started_at = time.monotonic()
+    worker.submit(blocking_action)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.2
+    assert entered.wait(timeout=1)
+    release.set()
+    worker.shutdown()
+
+
+def test_input_action_worker_serializes_queued_requests() -> None:
+    worker = _InputActionWorker()
+    order: list[str] = []
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_done = threading.Event()
+
+    def first() -> None:
+        first_entered.set()
+        assert release_first.wait(timeout=2)
+        order.append("first")
+
+    def second() -> None:
+        order.append("second")
+        second_done.set()
+
+    worker.submit(first)
+    assert first_entered.wait(timeout=1)
+    worker.submit(second)
+    time.sleep(0.05)
+    assert order == []  # second must not run while first still holds the worker
+
+    release_first.set()
+    assert second_done.wait(timeout=1)
+    assert order == ["first", "second"]
+    worker.shutdown()
+
+
+def test_input_action_worker_survives_action_exception() -> None:
+    worker = _InputActionWorker()
+    done = threading.Event()
+
+    def failing_action() -> None:
+        raise RuntimeError("clipboard exploded")
+
+    def next_action() -> None:
+        done.set()
+
+    worker.submit(failing_action)
+    worker.submit(next_action)
+
+    assert done.wait(timeout=1)
+    worker.shutdown()

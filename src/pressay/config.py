@@ -12,9 +12,11 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from . import hotkey_bindings
 from .platform_support import is_windows, user_data_directory
+from .text import replacement_key, snippet_key
 
 
 APP_DIRECTORY = "Pressay"
@@ -49,18 +51,44 @@ def legacy_config_path(local_appdata: str | os.PathLike[str] | None = None) -> P
     return base / LEGACY_APP_DIRECTORY / CONFIG_FILENAME
 
 
-def _string_map(value: object, setting: str) -> dict[str, str]:
+def _string_map(
+    value: object, setting: str, key_func: Callable[[str], str]
+) -> dict[str, str]:
+    """Validate a snippets/replacements mapping against its runtime key rule.
+
+    *key_func* must be the same normalization the matching runtime function in
+    :mod:`pressay.text` applies (``replacement_key`` for ``apply_replacements``,
+    ``snippet_key`` for ``expand_snippet``), so a config that passes here is
+    guaranteed not to raise ``ValueError`` there.
+    """
+
     if not isinstance(value, Mapping):
         raise ConfigError(f"{setting} must be a JSON object")
 
     result: dict[str, str] = {}
+    seen_keys: set[str] = set()
     for key, replacement in value.items():
         if not isinstance(key, str) or not key.strip():
             raise ConfigError(f"{setting} keys must be non-empty strings")
         if not isinstance(replacement, str):
             raise ConfigError(f"{setting} values must be strings")
+        normalized_key = key_func(key)
+        if not normalized_key:
+            raise ConfigError(f"{setting} key {key!r} normalizes to an empty string")
+        if normalized_key in seen_keys:
+            raise ConfigError(f"{setting} keys must be unique after normalization: {key!r}")
+        seen_keys.add(normalized_key)
         result[key] = replacement
     return result
+
+
+def _hotkeys(value: object) -> hotkey_bindings.HotkeyBindings:
+    """Parse the ``hotkeys`` section, reporting problems as ConfigError."""
+
+    try:
+        return hotkey_bindings.from_mapping(value)
+    except hotkey_bindings.HotkeyBindingError as exc:
+        raise ConfigError(f"hotkeys: {exc}") from exc
 
 
 def _bool(value: object, setting: str) -> bool:
@@ -99,6 +127,9 @@ class AppConfig:
     resource_mode: str = "instant"
     snippets: dict[str, str] = field(default_factory=dict)
     replacements: dict[str, str] = field(default_factory=dict)
+    hotkeys: hotkey_bindings.HotkeyBindings = field(
+        default_factory=hotkey_bindings.HotkeyBindings
+    )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "AppConfig":
@@ -147,19 +178,30 @@ class AppConfig:
                 "voice_press_enter",
             ),
             resource_mode=resource_mode,
-            snippets=_string_map(raw.get("snippets", defaults.snippets), "snippets"),
-            replacements=_string_map(
-                raw.get("replacements", defaults.replacements), "replacements"
+            snippets=_string_map(
+                raw.get("snippets", defaults.snippets), "snippets", snippet_key
             ),
+            replacements=_string_map(
+                raw.get("replacements", defaults.replacements), "replacements", replacement_key
+            ),
+            hotkeys=_hotkeys(raw.get("hotkeys")),
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a validated, JSON-serializable representation."""
 
+        # asdict() recurses into the nested binding dataclasses and would emit
+        # their internal shape (including a frozenset of modifier names), which
+        # is neither JSON-serializable nor what from_dict() accepts. The
+        # bindings therefore carry their own canonical text form.
+        raw = asdict(self)
+        raw["hotkeys"] = self.hotkeys.to_mapping()
         # Round-tripping through the validator also protects callers that
         # mutated one of the dictionary fields after construction.
-        validated = type(self).from_dict(asdict(self))
-        return asdict(validated)
+        validated = type(self).from_dict(raw)
+        result = asdict(validated)
+        result["hotkeys"] = validated.hotkeys.to_mapping()
+        return result
 
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> "AppConfig":

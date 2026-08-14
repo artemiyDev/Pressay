@@ -102,6 +102,18 @@ def target_looks_editable(target: ForegroundTarget) -> bool:
     return target.is_valid and target.editable
 
 
+def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
+    """Return log-safe primitives; same shape as windows_input.describe_focus.
+
+    The AX fingerprint has no numeric control type equivalent, so that field
+    is always ``None`` here.
+    """
+
+    fingerprint = getattr(target, "focused_control", None) if target is not None else None
+    focus_kind = fingerprint[0] if fingerprint else "none"
+    return {"focus_kind": focus_kind, "control_type": None}
+
+
 def _load_frameworks() -> SimpleNamespace:
     if not macos_input_available():
         raise MacOSInputUnavailable("macOS input is only available on macOS")
@@ -398,6 +410,7 @@ __all__ = [
     "MacOSInputError",
     "MacOSInputUnavailable",
     "copy_text",
+    "describe_focus",
     "macos_input_available",
     "paste_last",
     "send_text",

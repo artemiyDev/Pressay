@@ -7,6 +7,8 @@ from pressay.text import (
     normalize_text,
     process_transcript,
     remove_filler_words,
+    replacement_key,
+    snippet_key,
 )
 
 
@@ -70,3 +72,14 @@ def test_pipeline_keeps_enter_action_out_of_inserted_text():
     assert command.press_enter is True
     assert text.text == "скажи White.Market"
     assert text.press_enter is False
+
+
+def test_replacement_key_normalizes_case_and_spacing_but_keeps_punctuation():
+    assert replacement_key("Фаст  API") == replacement_key("фаст api")
+    assert replacement_key("привет.") != replacement_key("привет")
+
+
+def test_snippet_key_also_strips_trailing_command_punctuation():
+    assert snippet_key("Привет.") == snippet_key("привет")
+    assert snippet_key("Моя подпись ...") == snippet_key("моя подпись")
+    assert snippet_key("Фаст  API") == snippet_key("фаст api")

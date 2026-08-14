@@ -377,6 +377,29 @@ class FasterWhisperTranscriber:
         return list(segments), info
 
     @staticmethod
+    def _supported_languages_by_preference(info: Any) -> tuple[str, ...]:
+        """Order RU and EN by the model's own posterior for this audio.
+
+        Auto-detection ranges over every language Whisper knows, but only these
+        two are ever produced, so when detection lands outside them the choice
+        between RU and EN should come from the model's probabilities rather
+        than from comparing how plausible the two transcripts look.  Older
+        faster-whisper builds omit ``all_language_probs``; those keep the
+        historical RU-then-EN order.
+        """
+
+        probabilities = _field(info, "all_language_probs", None) or ()
+        table: dict[str, float] = {}
+        try:
+            for code, value in probabilities:
+                table[str(code).casefold().strip()] = float(value)
+        except (TypeError, ValueError):
+            table = {}
+        return tuple(
+            sorted(("ru", "en"), key=lambda code: table.get(code, 0.0), reverse=True)
+        )
+
+    @staticmethod
     def _reported_language(info: Any) -> str | None:
         language = _field(info, "language", None)
         if not language:
@@ -574,9 +597,12 @@ class FasterWhisperTranscriber:
                     language_probability=probability,
                 )
             else:
+                # Detection wandered outside the two supported languages. Ask
+                # the model which of them it actually prefers and stop at the
+                # first trustworthy transcript instead of always running both.
                 fixed_candidates: list[_TranscriptionCandidate] = []
                 inference_errors: list[TranscriptionError] = []
-                for fixed_language in ("ru", "en"):
+                for fixed_language in self._supported_languages_by_preference(info):
                     try:
                         fixed_segments, fixed_info = infer(fixed_language)
                         fixed_candidates.append(
@@ -596,6 +622,11 @@ class FasterWhisperTranscriber:
                         continue
                     except TranscriptionError as exc:
                         inference_errors.append(exc)
+                    else:
+                        # The model's preferred language produced a usable
+                        # transcript; transcribing the other one cannot improve
+                        # on a choice the model already made.
+                        break
                 if not fixed_candidates:
                     if len(inference_errors) == 2:
                         raise TranscriptionError(

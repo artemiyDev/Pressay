@@ -20,7 +20,9 @@
 Pressay records from the selected microphone, recognizes Russian and English
 locally with faster-whisper, and inserts the final text only if the same
 editable control still owns focus. Audio and transcripts are not uploaded or
-written to disk.
+written to disk. Hotkeys (hold-to-talk, toggle, insert, copy) are
+configurable in Pressay's settings window; the guides below list the shipped
+defaults and known keyboard-layout conflicts.
 
 The macOS beta uses CPU inference. CTranslate2 supports Intel and Apple Silicon
 macOS wheels, but its faster-whisper backend does not use Metal/MPS. A real Mac
@@ -56,6 +58,8 @@ Accessibility or Input Monitoring permissions.
 - No telemetry and no audio/transcript files.
 - Focus fingerprint is rechecked before every insertion batch and Enter.
 - Automatic insertion never falls back to overwriting the clipboard.
+- On Windows, automatic insertion still uses the clipboard for multiline text and characters outside the Basic Multilingual Plane (emoji), restoring the previous content afterward; "Insert last" and "Copy" always use it. On macOS, automatic insertion and "Insert last" never touch the pasteboard — only "Copy" does.
+- If Windows Clipboard History (Win+V) is on, a fragment delivered this way stays in the history after Pressay restores the clipboard, and syncs to other devices when cloud clipboard sync is on. Turn it off under **Settings → System → Clipboard** if that matters to you.
 - Corrupt configuration disables automatic insertion instead of restoring unsafe defaults.
 
 MIT licensed. See the full [English guide](docs/README.en.md) or

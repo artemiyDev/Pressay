@@ -16,12 +16,15 @@ from pressay.windows_input import (
     _native_focused_control_fingerprint,
     ClipboardReplaceError,
     ForegroundTarget,
+    FocusFingerprint,
     InputStatus,
     Win32Clipboard,
     Win32InputBackend,
     clipboard_paste_transaction,
     copy_last,
     copy_text,
+    describe_focus,
+    parse_focus_fingerprint,
     paste_last,
     send_text,
     target_looks_editable,
@@ -520,6 +523,86 @@ def test_uia_editability_requires_text_control_and_writable_capability(
     )
 
     assert target_looks_editable(target) is expected
+
+
+def test_parse_focus_fingerprint_rejects_missing_unavailable_and_unknown() -> None:
+    assert parse_focus_fingerprint(None) is None
+    assert parse_focus_fingerprint(_FOCUS_UNAVAILABLE) is None
+    assert parse_focus_fingerprint(()) is None
+    assert parse_focus_fingerprint(("something_else", 1)) is None
+    assert parse_focus_fingerprint(_uia_fingerprint()[:9]) is None  # too short
+
+
+def test_parse_focus_fingerprint_decodes_uia_format() -> None:
+    fingerprint = _uia_fingerprint(
+        process_id=321,
+        class_name="RichEdit",
+        control_type=50004,
+        enabled=True,
+        keyboard_focusable=False,
+        value_writable=True,
+        text_editable=False,
+    )
+
+    parsed = parse_focus_fingerprint(fingerprint)
+
+    assert parsed == FocusFingerprint(
+        kind="uia",
+        process_id=321,
+        control_type=50004,
+        enabled=True,
+        keyboard_focusable=False,
+        value_writable=True,
+        text_editable=False,
+        class_name="RichEdit",
+    )
+
+
+def test_parse_focus_fingerprint_decodes_win32_focus_format() -> None:
+    fingerprint = ("win32_focus", 200, 222, "Edit")
+
+    parsed = parse_focus_fingerprint(fingerprint)
+
+    assert parsed == FocusFingerprint(
+        kind="win32_focus",
+        process_id=200,
+        class_name="Edit",
+    )
+
+
+def test_describe_focus_reports_none_for_missing_fingerprint() -> None:
+    target = ForegroundTarget(hwnd=100, pid=200, focused_control=None)
+
+    assert describe_focus(target) == {"focus_kind": "none", "control_type": None}
+    assert describe_focus(None) == {"focus_kind": "none", "control_type": None}
+
+
+def test_describe_focus_reports_uia_control_type() -> None:
+    target = ForegroundTarget(
+        hwnd=100,
+        pid=200,
+        focused_control=_uia_fingerprint(control_type=50030),
+    )
+
+    assert describe_focus(target) == {"focus_kind": "uia", "control_type": 50030}
+
+
+def test_describe_focus_reports_win32_focus_without_control_type() -> None:
+    target = ForegroundTarget(
+        hwnd=100,
+        pid=200,
+        focused_control=("win32_focus", 200, 222, "Edit"),
+    )
+
+    assert describe_focus(target) == {"focus_kind": "win32_focus", "control_type": None}
+
+
+def test_describe_focus_keeps_reporting_the_unavailable_sentinel_tag() -> None:
+    # The sentinel is a truthy, non-empty tuple; a failed UIA probe must keep
+    # surfacing "focus_unavailable" in the log exactly as before this refactor.
+    target = ForegroundTarget(hwnd=100, pid=200, focused_control=_FOCUS_UNAVAILABLE)
+
+    assert describe_focus(target) == {"focus_kind": "focus_unavailable", "control_type": None}
 
 
 def test_press_enter_only_sends_enter_to_same_target() -> None:
