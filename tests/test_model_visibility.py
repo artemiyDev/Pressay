@@ -68,6 +68,27 @@ def test_cached_model_skips_download_progress_with_substituted_loader() -> None:
     assert progress == []
 
 
+def test_model_itself_always_loads_offline_even_in_network_mode() -> None:
+    factory_kwargs: list[dict[str, object]] = []
+
+    def factory(_size: str, **kwargs: object) -> _SilentModel:
+        factory_kwargs.append(dict(kwargs))
+        return _SilentModel()
+
+    transcriber = FasterWhisperTranscriber(
+        "turbo",
+        device="cpu",
+        local_files_only=False,
+        model_factory=factory,
+        model_downloader=lambda _size, **_kwargs: "cached-path",
+    )
+
+    assert transcriber.warmup() == ("cpu", "int8")
+    # Networking is confined to the absent-model download path; a cold load of
+    # a cached model must never re-resolve revisions online.
+    assert [call["local_files_only"] for call in factory_kwargs] == [True]
+
+
 class _BlockingProgressTranscriber:
     def __init__(self, model_size: str) -> None:
         self.model_size = model_size

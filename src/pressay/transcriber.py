@@ -344,7 +344,12 @@ class FasterWhisperTranscriber:
             "device": device,
             "compute_type": compute_type,
             "num_workers": self.num_workers,
-            "local_files_only": self.local_files_only,
+            # The model itself always loads offline. `local_files_only=False`
+            # on the transcriber only unlocks _prepare_model_download for an
+            # absent model; letting it reach WhisperModel would make every
+            # cold load re-resolve the model revision over the network, which
+            # a local-first dictation app must never do on its own.
+            "local_files_only": True,
         }
         if self.cpu_threads > 0:
             kwargs["cpu_threads"] = self.cpu_threads
