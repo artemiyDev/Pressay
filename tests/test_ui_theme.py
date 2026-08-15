@@ -164,3 +164,67 @@ def test_theme_switch_recolors_the_shown_status_without_losing_text(monkeypatch)
         window.prepare_to_quit()
         window.close()
         app.processEvents()
+
+
+def test_transcript_history_keeps_twenty_newest_items_and_rejects_adjacent_duplicates(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = _app()
+    window = SettingsWindow(
+        UiSignals(),
+        _settings_dict(AppConfig()),
+        [MicrophoneChoice(None, "Системный микрофон")],
+    )
+    try:
+        for index in range(21):
+            window.set_last_transcript(f"фраза {index}")
+
+        assert list(window._recent_transcripts) == [
+            f"фраза {index}" for index in range(20, 0, -1)
+        ]
+        assert window.last_transcript.count() == 20
+        assert window.last_transcript.item(0).data(Qt.ItemDataRole.UserRole) == "фраза 20"
+        assert window.last_transcript.item(19).data(Qt.ItemDataRole.UserRole) == "фраза 1"
+
+        window.set_last_transcript("фраза 20")
+        assert window.last_transcript.count() == 20
+    finally:
+        window.prepare_to_quit()
+        window.close()
+        app.processEvents()
+
+
+def test_transcript_history_copies_full_text_and_can_be_cleared(monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = _app()
+    window = SettingsWindow(
+        UiSignals(),
+        _settings_dict(AppConfig()),
+        [MicrophoneChoice(None, "Системный микрофон")],
+    )
+    long_text = "длинная фраза " * 20
+    try:
+        window.set_last_transcript(long_text)
+        item = window.last_transcript.item(0)
+
+        assert item.text().endswith("…")
+        assert item.toolTip() == long_text
+
+        window.copy_transcript_button.click()
+        assert QApplication.clipboard().text() == long_text
+        assert window.status_label.text() == "Скопировано"
+        assert window._status_state == "success"
+
+        QApplication.clipboard().clear()
+        window.last_transcript.itemDoubleClicked.emit(item)
+        assert QApplication.clipboard().text() == long_text
+
+        window.clear_transcript_history_button.click()
+        assert not window._recent_transcripts
+        assert window.last_transcript.count() == 0
+        assert not window.copy_transcript_button.isEnabled()
+    finally:
+        window.prepare_to_quit()
+        window.close()
+        app.processEvents()

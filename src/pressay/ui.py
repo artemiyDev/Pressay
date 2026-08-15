@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -70,6 +72,19 @@ RECORDING_LEVEL_ACTIVE_COLOR = "#4ade80"
 RECORDING_LEVEL_QUIET_COLOR = "#64748b"
 ASSET_DIRECTORY = Path(__file__).with_name("assets")
 APP_ICON_PATH = ASSET_DIRECTORY / "app-icon.svg"
+_TRANSCRIPT_DISPLAY_LIMIT = 120
+
+
+class _TranscriptHistoryList(QListWidget):
+    """History list with the legacy text-readout method kept for callers."""
+
+    def toPlainText(self) -> str:  # noqa: N802 - Qt compatibility spelling
+        labels = ("Последняя", "Предыдущая")
+        return "\n\n".join(
+            f"{labels[index]}:\n{self.item(index).data(Qt.ItemDataRole.UserRole)}"
+            for index in range(min(self.count(), len(labels)))
+        )
+
 
 # Color tokens for the pieces of SettingsWindow that used to hardcode light
 # colors. Light values are the original literals verbatim so the light look
@@ -378,7 +393,7 @@ class SettingsWindow(QMainWindow):
         self.setMinimumWidth(560)
         self.resize(620, 790)
         self._really_close = False
-        self._recent_transcripts: deque[str] = deque(maxlen=2)
+        self._recent_transcripts: deque[str] = deque(maxlen=20)
         # Remembered so a later theme switch can redraw the status card
         # without a second, competing definition of "what the status is".
         self._status_text = "Готов к диктовке"
@@ -574,22 +589,29 @@ class SettingsWindow(QMainWindow):
         actions.addWidget(save_button)
         layout.addLayout(actions)
 
-        last_label = QLabel("Последние две расшифровки (только в памяти)")
-        last_label.setStyleSheet("font-weight: 600;")
-        self.last_transcript = QTextEdit()
-        self.last_transcript.setReadOnly(True)
-        self.last_transcript.setPlaceholderText("Здесь появятся два последних результата")
-        self.last_transcript.setMaximumHeight(155)
-        layout.addWidget(last_label)
+        history_label = QLabel("История расшифровок")
+        history_label.setStyleSheet("font-weight: 600;")
+        history_hint = QLabel("До 20 записей, только в памяти до закрытия приложения.")
+        history_hint.setWordWrap(True)
+        self._hint_labels.append(history_hint)
+        self.last_transcript = _TranscriptHistoryList()
+        self.last_transcript.setMaximumHeight(190)
+        self.last_transcript.itemDoubleClicked.connect(self._copy_transcript_item)
+        layout.addWidget(history_label)
+        layout.addWidget(history_hint)
         layout.addWidget(self.last_transcript)
 
         last_actions = QHBoxLayout()
         paste_button = QPushButton("Вставить последнюю")
         paste_button.clicked.connect(signals.paste_last_requested)
-        copy_button = QPushButton("Копировать")
-        copy_button.clicked.connect(signals.copy_last_requested)
+        self.copy_transcript_button = QPushButton("Копировать")
+        self.copy_transcript_button.setEnabled(False)
+        self.copy_transcript_button.clicked.connect(self._copy_selected_transcript)
+        self.clear_transcript_history_button = QPushButton("Очистить историю")
+        self.clear_transcript_history_button.clicked.connect(self._clear_transcript_history)
         last_actions.addWidget(paste_button)
-        last_actions.addWidget(copy_button)
+        last_actions.addWidget(self.copy_transcript_button)
+        last_actions.addWidget(self.clear_transcript_history_button)
         last_actions.addStretch(1)
         layout.addLayout(last_actions)
 
@@ -706,14 +728,41 @@ class SettingsWindow(QMainWindow):
     def set_last_transcript(self, text: str) -> None:
         if not text:
             return
-        if not self._recent_transcripts or self._recent_transcripts[0] != text:
-            self._recent_transcripts.appendleft(text)
-        labels = ("Последняя", "Предыдущая")
-        rendered = [
-            f"{labels[index]}:\n{value}"
-            for index, value in enumerate(self._recent_transcripts)
-        ]
-        self.last_transcript.setPlainText("\n\n".join(rendered))
+        if self._recent_transcripts and self._recent_transcripts[0] == text:
+            return
+        self._recent_transcripts.appendleft(text)
+        self._render_transcript_history()
+
+    def _render_transcript_history(self) -> None:
+        self.last_transcript.clear()
+        for transcript in self._recent_transcripts:
+            item = QListWidgetItem(self._display_transcript(transcript))
+            item.setData(Qt.ItemDataRole.UserRole, transcript)
+            item.setToolTip(transcript)
+            self.last_transcript.addItem(item)
+        if self._recent_transcripts:
+            self.last_transcript.setCurrentRow(0)
+        self.copy_transcript_button.setEnabled(bool(self._recent_transcripts))
+
+    @staticmethod
+    def _display_transcript(text: str) -> str:
+        if len(text) <= _TRANSCRIPT_DISPLAY_LIMIT:
+            return text
+        return f"{text[:_TRANSCRIPT_DISPLAY_LIMIT].rstrip()}…"
+
+    def _copy_selected_transcript(self) -> None:
+        item = self.last_transcript.currentItem()
+        if item is not None:
+            self._copy_transcript_item(item)
+
+    def _copy_transcript_item(self, item: QListWidgetItem) -> None:
+        QApplication.clipboard().setText(str(item.data(Qt.ItemDataRole.UserRole)))
+        self.update_status("Скопировано", "success")
+
+    def _clear_transcript_history(self) -> None:
+        self._recent_transcripts.clear()
+        self.last_transcript.clear()
+        self.copy_transcript_button.setEnabled(False)
 
     def confirm(self, title: str, text: str) -> None:
         QMessageBox.information(self, title, text)
