@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 import threading
+
+import pytest
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
@@ -19,6 +22,7 @@ class _SilentModel:
 
 
 def test_missing_model_download_reports_progress_through_substituted_loader() -> None:
+    pytest.importorskip("tqdm", reason="percentages need tqdm; the download itself does not")
     downloader_calls: list[dict[str, object]] = []
     progress: list[int] = []
 
@@ -66,6 +70,37 @@ def test_cached_model_skips_download_progress_with_substituted_loader() -> None:
     assert transcriber.warmup() == ("cpu", "int8")
     assert [call["local_files_only"] for call in downloader_calls] == [True]
     assert progress == []
+
+
+def test_missing_model_downloads_silently_when_tqdm_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Simulate the lean environment (macOS CI) where tqdm is not installed.
+    monkeypatch.setitem(sys.modules, "tqdm", None)
+    monkeypatch.setitem(sys.modules, "tqdm.auto", None)
+    downloader_calls: list[dict[str, object]] = []
+    progress: list[int] = []
+
+    def downloader(_size: str, **kwargs: object) -> str:
+        downloader_calls.append(dict(kwargs))
+        if kwargs["local_files_only"]:
+            raise RuntimeError("not cached")
+        return "cached-path"
+
+    transcriber = FasterWhisperTranscriber(
+        "large-v3",
+        device="cpu",
+        local_files_only=False,
+        model_factory=lambda *_args, **_kwargs: _SilentModel(),
+        model_downloader=downloader,
+    )
+    transcriber.set_download_progress_callback(progress.append)
+
+    assert transcriber.warmup() == ("cpu", "int8")
+    assert [call["local_files_only"] for call in downloader_calls] == [True, False]
+    # The download must proceed without tqdm; only the percentages are lost.
+    assert "tqdm_class" not in downloader_calls[1]
+    assert progress == [0]
 
 
 def test_model_itself_always_loads_offline_even_in_network_mode() -> None:

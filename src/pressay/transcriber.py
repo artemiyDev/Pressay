@@ -382,21 +382,39 @@ class FasterWhisperTranscriber:
         if callback is not None:
             callback(0)
 
-        from tqdm.auto import tqdm
+        # tqdm ships with huggingface_hub in the desktop install, but leaner
+        # environments (macOS CI) run these code paths without it. Percentages
+        # are a nicety: without tqdm the download simply proceeds silently.
+        progress_class: type[Any] | None = None
+        if callback is not None:
+            try:
+                from tqdm.auto import tqdm
+            except ImportError:
+                progress_class = None
+            else:
 
-        class DownloadProgress(tqdm):
-            def update(self, count: int = 1) -> bool | None:
-                changed = super().update(count)
-                if self.total and callback is not None:
-                    callback(min(100, round(self.n / self.total * 100)))
-                return changed
+                class DownloadProgress(tqdm):
+                    def update(self, count: int = 1) -> bool | None:
+                        changed = super().update(count)
+                        if self.total and callback is not None:
+                            callback(min(100, round(self.n / self.total * 100)))
+                        return changed
 
-        self._model_downloader(
-            self.model_size,
-            local_files_only=False,
-            cache_dir=self.download_root,
-            tqdm_class=DownloadProgress,
-        )
+                progress_class = DownloadProgress
+
+        if progress_class is None:
+            self._model_downloader(
+                self.model_size,
+                local_files_only=False,
+                cache_dir=self.download_root,
+            )
+        else:
+            self._model_downloader(
+                self.model_size,
+                local_files_only=False,
+                cache_dir=self.download_root,
+                tqdm_class=progress_class,
+            )
 
     def load(self) -> Any:
         """Load once; auto mode tries CUDA int8_float16 then CPU int8."""
