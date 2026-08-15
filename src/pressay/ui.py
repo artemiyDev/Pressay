@@ -374,15 +374,18 @@ class SettingsWindow(QMainWindow):
 
         self.model_combo = QComboBox()
         for label, value in (
-            ("Small — быстрый старт", "small"),
-            ("Medium — выше качество", "medium"),
-            ("Turbo — рекомендован для RTX", "turbo"),
-            ("Large v3 — максимум качества", "large-v3"),
+            ("Small — быстрый старт (~0.5 ГБ)", "small"),
+            ("Medium — выше качество (~1.5 ГБ)", "medium"),
+            ("Turbo — рекомендован для RTX (~1.5 ГБ)", "turbo"),
+            ("Large v3 — максимум качества (~3 ГБ)", "large-v3"),
         ):
             self.model_combo.addItem(label, value)
         model_index = self.model_combo.findData(settings.get("model", "turbo"))
         self.model_combo.setCurrentIndex(max(0, model_index))
         form.addRow("Модель", self.model_combo)
+        self.active_model_label = QLabel("Модель ещё не загружалась")
+        self._hint_labels.append(self.active_model_label)
+        form.addRow("", self.active_model_label)
 
         self.resource_mode_combo = QComboBox()
         for label, value in (
@@ -583,6 +586,13 @@ class SettingsWindow(QMainWindow):
         self.status_label.setText(text)
         self._restyle_status()
         self.toggle_button.setText("Завершить тест" if state == "recording" else "Тестовая диктовка")
+
+    def update_active_model(self, model: str, device: str, compute_type: str) -> None:
+        """Show the backend that successfully completed model warmup."""
+
+        self.active_model_label.setText(
+            f"Активна: {model} · {device.upper()} · {compute_type}"
+        )
 
     def _restyle_status(self) -> None:
         """Apply the status-card stylesheet for the current text/state and theme.

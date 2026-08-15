@@ -75,6 +75,8 @@ class _TranscriptionCandidate:
 
 
 ModelFactory = Callable[..., Any]
+ModelDownloader = Callable[..., str]
+DownloadProgressCallback = Callable[[int], None]
 
 
 _DLL_DIRECTORY_HANDLES: list[Any] = []
@@ -133,6 +135,65 @@ def _default_model_factory(*args: Any, **kwargs: Any) -> Any:
             "faster-whisper is unavailable. Install the application dependencies first."
         ) from exc
     return WhisperModel(*args, **kwargs)
+
+
+def _default_model_downloader(
+    model_size: str,
+    *,
+    local_files_only: bool,
+    cache_dir: str | None,
+    tqdm_class: type[Any] | None = None,
+) -> str:
+    """Resolve a cached model or download it with an optional progress class."""
+
+    try:
+        from faster_whisper import download_model  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ModelLoadError(
+            "faster-whisper is unavailable. Install the application dependencies first."
+        ) from exc
+
+    if local_files_only:
+        return str(
+            download_model(
+                model_size,
+                local_files_only=True,
+                cache_dir=cache_dir,
+            )
+        )
+
+    if tqdm_class is None:
+        return str(download_model(model_size, cache_dir=cache_dir))
+
+    # faster-whisper 1.2.1 hardcodes its silent tqdm implementation, so its
+    # public helper cannot expose first-download progress. Mirror its narrow
+    # model-file allowlist through huggingface_hub, which accepts tqdm_class.
+    try:
+        from faster_whisper.utils import _MODELS  # type: ignore[import-not-found]
+        from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ModelLoadError(
+            "faster-whisper is unavailable. Install the application dependencies first."
+        ) from exc
+
+    repo_id = _MODELS.get(model_size)
+    if repo_id is None:
+        raise ValueError(f"Invalid model size {model_size!r}")
+    return str(
+        snapshot_download(
+            repo_id,
+            local_files_only=False,
+            cache_dir=cache_dir,
+            allow_patterns=[
+                "config.json",
+                "preprocessor_config.json",
+                "model.bin",
+                "tokenizer.json",
+                "vocabulary.*",
+            ],
+            tqdm_class=tqdm_class,
+        )
+    )
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -210,6 +271,7 @@ class FasterWhisperTranscriber:
         silence_rms_threshold: float = 0.00001,
         local_files_only: bool = True,
         model_factory: ModelFactory | None = None,
+        model_downloader: ModelDownloader | None = None,
     ) -> None:
         device = device.casefold()
         if device not in {"auto", "cuda", "cpu"}:
@@ -240,6 +302,8 @@ class FasterWhisperTranscriber:
         self.silence_rms_threshold = float(silence_rms_threshold)
         self.local_files_only = bool(local_files_only)
         self._model_factory = model_factory or _default_model_factory
+        self._model_downloader = model_downloader or _default_model_downloader
+        self._prepare_download = model_factory is None or model_downloader is not None
 
         self._lock = threading.RLock()
         self._model: Any | None = None
@@ -247,6 +311,7 @@ class FasterWhisperTranscriber:
         self._active_compute_type: str | None = None
         self._last_load_seconds = 0.0
         self._inference_primed = False
+        self._download_progress_callback: DownloadProgressCallback | None = None
 
     @property
     def is_loaded(self) -> bool:
@@ -287,6 +352,47 @@ class FasterWhisperTranscriber:
             kwargs["download_root"] = self.download_root
         return self._model_factory(self.model_size, **kwargs)
 
+    def set_download_progress_callback(
+        self, callback: DownloadProgressCallback | None
+    ) -> None:
+        """Set the transient callback used while fetching an absent model."""
+
+        with self._lock:
+            self._download_progress_callback = callback
+
+    def _prepare_model_download(self) -> None:
+        if not self._prepare_download or self.local_files_only:
+            return
+        try:
+            self._model_downloader(
+                self.model_size,
+                local_files_only=True,
+                cache_dir=self.download_root,
+            )
+            return
+        except Exception:
+            pass
+
+        callback = self._download_progress_callback
+        if callback is not None:
+            callback(0)
+
+        from tqdm.auto import tqdm
+
+        class DownloadProgress(tqdm):
+            def update(self, count: int = 1) -> bool | None:
+                changed = super().update(count)
+                if self.total and callback is not None:
+                    callback(min(100, round(self.n / self.total * 100)))
+                return changed
+
+        self._model_downloader(
+            self.model_size,
+            local_files_only=False,
+            cache_dir=self.download_root,
+            tqdm_class=DownloadProgress,
+        )
+
     def load(self) -> Any:
         """Load once; auto mode tries CUDA int8_float16 then CPU int8."""
 
@@ -294,6 +400,7 @@ class FasterWhisperTranscriber:
             if self._model is not None:
                 self._last_load_seconds = 0.0
                 return self._model
+            self._prepare_model_download()
             started = time.perf_counter()
             errors: list[tuple[str, Exception]] = []
             for device, compute_type in self._attempts():

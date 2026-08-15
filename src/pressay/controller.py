@@ -33,6 +33,7 @@ _MODEL_RETIRE_SECONDS: dict[str, float | None] = {
     "balanced": 300.0,
     "eco": 0.0,
 }
+ModelReadyCallback = Callable[[str, str, str], None]
 
 
 def _setup_command(model_size: str) -> str:
@@ -181,11 +182,13 @@ class DictationController:
         status_callback: StatusCallback,
         result_callback: ResultCallback,
         notification_callback: NotificationCallback,
+        model_ready_callback: ModelReadyCallback | None = None,
     ) -> None:
         self.config = config
         self.status_callback = status_callback
         self.result_callback = result_callback
         self.notification_callback = notification_callback
+        self.model_ready_callback = model_ready_callback
         self.state = SessionState()
         self.last_transcript = ""
         self.target: Any | None = None
@@ -306,7 +309,7 @@ class DictationController:
 
     @staticmethod
     def _new_transcriber(model_size: str) -> FasterWhisperTranscriber:
-        return FasterWhisperTranscriber(model_size=model_size)
+        return FasterWhisperTranscriber(model_size=model_size, local_files_only=False)
 
     def _dispose_transcriber(self) -> None:
         with self._lock:
@@ -355,6 +358,28 @@ class DictationController:
         with self._lock:
             return self._warmup_is_current_locked(model_size, generation)
 
+    def _warmup_progress_callback(
+        self, model_size: str, generation: int
+    ) -> Callable[[int], None]:
+        last_update = time.monotonic()
+
+        def report(percent: int) -> None:
+            nonlocal last_update
+            now = time.monotonic()
+            with self._warmup_status_gate:
+                with self._lock:
+                    current = self._warmup_is_current_locked(model_size, generation)
+                    show_status = not self.state.active
+                if not current or not show_status or now - last_update < 1.0:
+                    return
+                last_update = now
+                self.status_callback(
+                    f"Скачиваю модель {model_size} — {max(0, min(100, percent))}%…",
+                    "processing",
+                )
+
+        return report
+
     def _warmup_worker(self, model_size: str, generation: int) -> None:
         with self._warmup_status_gate:
             with self._lock:
@@ -362,7 +387,7 @@ class DictationController:
                     return
                 show_status = not self.state.active
             if show_status:
-                self.status_callback("Подготавливаю локальную модель…", "processing")
+                self.status_callback(f"Готовлю модель {model_size}…", "processing")
 
         # A settings update may have invalidated this queued request before it
         # reached the executor. Do not load a model that is already obsolete.
@@ -370,7 +395,10 @@ class DictationController:
             return
         try:
             transcriber = self._ensure_transcriber(model_size)
-            transcriber.warmup()
+            set_progress_callback = getattr(transcriber, "set_download_progress_callback", None)
+            if set_progress_callback is not None:
+                set_progress_callback(self._warmup_progress_callback(model_size, generation))
+            device, compute_type = transcriber.warmup()
         except Exception as exc:
             with self._warmup_status_gate:
                 with self._lock:
@@ -397,6 +425,8 @@ class DictationController:
             with self._lock:
                 current = self._warmup_is_current_locked(model_size, generation)
                 session_active = self.state.active
+            if current and self.model_ready_callback is not None:
+                self.model_ready_callback(model_size, device, compute_type)
             if current and not session_active:
                 self.status_callback(self._ready_status_text(), "ready")
         if current:

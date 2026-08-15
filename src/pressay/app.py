@@ -470,11 +470,15 @@ def main(argv: list[str] | None = None) -> int:
     def notification_callback(title: str, message: str, warning: bool) -> None:
         dispatch_ui(tray.notify, title, message, warning=warning)
 
+    def model_ready_callback(model: str, device: str, compute_type: str) -> None:
+        dispatch_ui(window.update_active_model, model, device, compute_type)
+
     controller = DictationController(
         config,
         status_callback=status_callback,
         result_callback=result_callback,
         notification_callback=notification_callback,
+        model_ready_callback=model_ready_callback,
     )
 
     def start_or_stop(*, capture_target: bool = False) -> None:

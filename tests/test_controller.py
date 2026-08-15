@@ -752,7 +752,7 @@ def test_model_warmup_is_async_and_reports_preparing_then_ready(monkeypatch) -> 
     caller_thread_id = threading.get_ident()
     assert controller.warmup_model() is True
     assert transcriber.started.wait(timeout=2)
-    assert statuses == [("Подготавливаю локальную модель…", "processing")]
+    assert statuses == [("Готовлю модель small…", "processing")]
     assert transcriber.warmup_thread_id != caller_thread_id
 
     transcriber.release.set()
