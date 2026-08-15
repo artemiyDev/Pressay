@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -386,6 +387,40 @@ def test_controller_records_transcribes_and_keeps_last(monkeypatch) -> None:
     assert copied == []
     assert any(state == "processing" for _, state in statuses)
     assert statuses[-1] == ("Готово — текст ниже", "success")
+    controller.close()
+
+
+def test_pipeline_log_reports_full_delay_breakdown(monkeypatch, caplog) -> None:
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    caplog.set_level(logging.INFO, logger="pressay.controller")
+
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    pipeline_log = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("dictation_pipeline_completed")
+    )
+    for key in (
+        "audio_finalize_seconds=",
+        "post_release_seconds=",
+        "stream_stop_seconds=",
+        "assemble_seconds=",
+        "postprocess_seconds=",
+        "insertion_seconds=",
+    ):
+        assert key in pipeline_log
     controller.close()
 
 

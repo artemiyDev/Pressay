@@ -147,6 +147,7 @@ class _TranscriptionJob:
     display_only: bool
     released_at: float
     audio_finalize_seconds: float
+    finalize_breakdown: dict[str, float]
 
 
 class _CaptureIntent(str, Enum):
@@ -867,6 +868,9 @@ class DictationController:
                 display_only=target is None,
                 released_at=command.requested_at,
                 audio_finalize_seconds=audio_finalize_seconds,
+                finalize_breakdown=dict(
+                    getattr(recording, "finalize_breakdown", {}) or {}
+                ),
             )
         if recording.limit_reached and current and self._session_is_current(session_id):
             # Recognition proceeds on the truncated buffer below; the user
@@ -976,6 +980,7 @@ class DictationController:
                 job.audio,
                 **transcribe_options,
             )
+            postprocess_started = time.perf_counter()
             processed = process_transcript(
                 result.text,
                 remove_fillers=job.config.remove_fillers,
@@ -984,6 +989,7 @@ class DictationController:
                 voice_press_enter=job.config.voice_press_enter,
                 voice_formatting=job.config.voice_formatting,
             )
+            postprocess_seconds = time.perf_counter() - postprocess_started
             if not processed.text and not processed.press_enter:
                 raise NoSpeechDetected("Речь не обнаружена")
         except (NoSpeechDetected, TranscriptionError) as exc:
@@ -1034,6 +1040,7 @@ class DictationController:
             self.state = accepted
             self.last_transcript = processed.text
 
+        insertion_timing = [0.0]
         try:
             if not self._result_is_current(job.session_id):
                 return
@@ -1049,6 +1056,7 @@ class DictationController:
                 session_id=job.session_id,
                 cancelled=lambda: self._delivery_cancelled(job),
                 display_only=job.display_only,
+                insertion_timing=insertion_timing,
             )
         finally:
             pipeline_seconds = time.perf_counter() - job.released_at
@@ -1059,10 +1067,16 @@ class DictationController:
                     self._session_cancelled = None
             LOGGER.info(
                 "dictation_pipeline_completed session=%d audio_finalize_seconds=%.3f "
-                "post_release_seconds=%.3f",
+                "post_release_seconds=%.3f stream_stop_seconds=%.3f "
+                "assemble_seconds=%.3f postprocess_seconds=%.3f "
+                "insertion_seconds=%.3f",
                 job.session_id,
                 job.audio_finalize_seconds,
                 pipeline_seconds,
+                float(job.finalize_breakdown.get("stream_stop_seconds", 0.0)),
+                float(job.finalize_breakdown.get("assemble_seconds", 0.0)),
+                postprocess_seconds,
+                insertion_timing[0],
             )
             self._schedule_model_retirement(job.config.resource_mode)
 
@@ -1077,6 +1091,7 @@ class DictationController:
         session_id: int,
         cancelled: Callable[[], bool],
         display_only: bool,
+        insertion_timing: list[float],
     ) -> None:
         """Deliver without holding ``_lock``, checking invalidation between effects."""
 
@@ -1098,16 +1113,20 @@ class DictationController:
                 press_enter=press_enter,
                 smart_spacing=smart_spacing,
             )
-            outcome = send_text(
-                insertion_text,
-                expected_target=target,
-                press_enter=press_enter,
-                cancelled=cancelled,
-                # Automatic delivery never overwrites the user's clipboard on
-                # failure. The transcript is already retained in memory/UI;
-                # copying remains an explicit hotkey/button action.
-                fallback_to_clipboard=False,
-            )
+            insertion_started = time.perf_counter()
+            try:
+                outcome = send_text(
+                    insertion_text,
+                    expected_target=target,
+                    press_enter=press_enter,
+                    cancelled=cancelled,
+                    # Automatic delivery never overwrites the user's clipboard on
+                    # failure. The transcript is already retained in memory/UI;
+                    # copying remains an explicit hotkey/button action.
+                    fallback_to_clipboard=False,
+                )
+            finally:
+                insertion_timing[0] = time.perf_counter() - insertion_started
         except Exception as exc:
             LOGGER.warning("insertion_failed: %s", type(exc).__name__)
             if cancelled() or not self._result_is_current(session_id):

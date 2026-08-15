@@ -8,7 +8,7 @@ therefore possible on machines without PortAudio installed.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 import time
 from typing import Any
@@ -180,6 +180,7 @@ class AudioRecording:
     silent: bool
     status_messages: tuple[str, ...] = ()
     limit_reached: bool = False
+    finalize_breakdown: dict[str, float] = field(default_factory=dict)
 
     @property
     def samples(self) -> np.ndarray:
@@ -774,6 +775,7 @@ class AudioRecorder:
         int,
         str | None,
         Exception | None,
+        float,
     ]:
         with self._lock:
             if not self._recording or self._stream is None:
@@ -782,6 +784,7 @@ class AudioRecorder:
             self._finishing = True
 
         stop_error: Exception | None = None
+        stream_stop_started = time.perf_counter()
         try:
             stream.stop()
         except Exception as exc:
@@ -791,6 +794,7 @@ class AudioRecorder:
                 stream.close()
             except Exception as exc:
                 stop_error = stop_error or exc
+        stream_stop_seconds = time.perf_counter() - stream_stop_started
 
         with self._lock:
             self._recording = False
@@ -820,6 +824,7 @@ class AudioRecorder:
             retained_samples,
             stop_signal_reason,
             stop_error,
+            stream_stop_seconds,
         )
 
     def stop(self, *, validate: bool = True) -> AudioRecording:
@@ -832,6 +837,7 @@ class AudioRecorder:
             retained_samples,
             stop_signal_reason,
             stop_error,
+            stream_stop_seconds,
         ) = self._finish_stream()
         native = int(self._native_sample_rate or self.target_sample_rate)
         duration = retained_samples / native
@@ -859,6 +865,7 @@ class AudioRecorder:
             )
         if stop_error is not None:
             raise AudioDeviceError("Could not finish microphone capture") from stop_error
+        assemble_started = time.perf_counter()
         raw = (
             np.concatenate(chunks).astype(np.float32, copy=False)
             if chunks
@@ -877,9 +884,11 @@ class AudioRecorder:
             raise SilentAudioError(
                 f"Recording RMS {rms:.5f} is below {self.silence_rms_threshold:.5f}"
             )
+        resampled = resample_audio(raw, native, self.target_sample_rate)
+        assemble_seconds = time.perf_counter() - assemble_started
 
         return AudioRecording(
-            audio=resample_audio(raw, native, self.target_sample_rate),
+            audio=resampled,
             sample_rate=self.target_sample_rate,
             source_sample_rate=native,
             duration_seconds=duration,
@@ -888,6 +897,10 @@ class AudioRecorder:
             silent=silent,
             status_messages=statuses,
             limit_reached=limit_reached,
+            finalize_breakdown={
+                "stream_stop_seconds": stream_stop_seconds,
+                "assemble_seconds": assemble_seconds,
+            },
         )
 
     def cancel(self) -> bool:
@@ -897,7 +910,7 @@ class AudioRecorder:
             if not self._recording or self._stream is None:
                 return False
         try:
-            *_, stop_error = self._finish_stream()
+            *_, stop_error, _stream_stop_seconds = self._finish_stream()
             if stop_error is not None:
                 raise AudioDeviceError("Could not finish microphone capture") from stop_error
         finally:

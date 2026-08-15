@@ -381,6 +381,21 @@ def test_current_rms_tracks_the_latest_chunk_and_resets(monkeypatch: pytest.Monk
     assert recorder.current_rms == 0.0
 
 
+def test_stop_reports_finalize_phase_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeSoundDevice([np.ones(4_800, dtype=np.float32) * 0.1])
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    recorder.start()
+    recording = recorder.stop()
+
+    assert set(recording.finalize_breakdown) == {
+        "stream_stop_seconds",
+        "assemble_seconds",
+    }
+    assert all(seconds >= 0.0 for seconds in recording.finalize_breakdown.values())
+
+
 def test_stop_rejects_short_and_silent_recordings(monkeypatch: pytest.MonkeyPatch) -> None:
     short = FakeSoundDevice([np.ones(100, dtype=np.float32) * 0.1])
     install_fake(monkeypatch, short)
