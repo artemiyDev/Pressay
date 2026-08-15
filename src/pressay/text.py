@@ -40,6 +40,11 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SPACE_BEFORE_PUNCTUATION_RE = re.compile(r"\s+([,.;:!?%\]\)}»”’])")
 _SPACE_AFTER_OPENING_RE = re.compile(r"([\[({«“‘])\s+")
 _TRAILING_COMMAND_PUNCTUATION_RE = re.compile(r"[\s.,;:!?…]+$")
+_VOICE_FORMATTING_COMMAND_RE = re.compile(
+    r"(?<!\w)(?P<new_line>с новой строки)(?!\w)[.,;:!?…]*"
+    r"|(?<!\w)(?P<paragraph>абзац)(?!\w)[.,;:!?…]*",
+    flags=re.IGNORECASE,
+)
 _INVISIBLE_ARTIFACTS = str.maketrans("", "", "\ufeff\u200b\u2060")
 
 
@@ -212,6 +217,23 @@ def is_press_enter_command(text: str, *, enabled: bool = False) -> bool:
     return snippet_key(text) in PRESS_ENTER_PHRASES
 
 
+def apply_voice_formatting(text: str) -> str:
+    """Replace opted-in voice formatting commands inside one utterance.
+
+    Commands are matched as complete words after the same Unicode and spacing
+    normalization used by replacements.  Attached terminal punctuation is part
+    of the command rather than dictated output.
+    """
+
+    normalized = normalize_text(text)
+
+    def replace(match: re.Match[str]) -> str:
+        return "\n" if match.lastgroup == "new_line" else "\n\n"
+
+    formatted = _VOICE_FORMATTING_COMMAND_RE.sub(replace, normalized)
+    return re.sub(r" *\n *", "\n", formatted)
+
+
 def process_transcript(
     text: str,
     *,
@@ -219,6 +241,7 @@ def process_transcript(
     replacements: Mapping[str, str] | None = None,
     snippets: Mapping[str, str] | None = None,
     voice_press_enter: bool = False,
+    voice_formatting: bool = False,
 ) -> ProcessedText:
     """Run the deterministic post-processing pipeline for one transcript."""
 
@@ -233,5 +256,14 @@ def process_transcript(
     if did_expand:
         return ProcessedText(text=expanded, snippet_expanded=True)
 
-    replaced = apply_replacements(expanded, replacements or {})
+    if not voice_formatting:
+        replaced = apply_replacements(expanded, replacements or {})
+        return ProcessedText(text=replaced)
+
+    formatted = apply_voice_formatting(expanded)
+    # Formatting runs before replacements, so a user-defined replacement value
+    # remains literal even when it contains a command word.
+    replaced = "\n".join(
+        apply_replacements(line, replacements or {}) for line in formatted.split("\n")
+    )
     return ProcessedText(text=replaced)

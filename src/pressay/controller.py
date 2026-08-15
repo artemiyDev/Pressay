@@ -982,6 +982,7 @@ class DictationController:
                 replacements=job.config.replacements,
                 snippets=job.config.snippets,
                 voice_press_enter=job.config.voice_press_enter,
+                voice_formatting=job.config.voice_formatting,
             )
             if not processed.text and not processed.press_enter:
                 raise NoSpeechDetected("Речь не обнаружена")

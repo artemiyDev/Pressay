@@ -491,10 +491,15 @@ class SettingsWindow(QMainWindow):
         self.remove_fillers_checkbox.setChecked(bool(settings.get("remove_fillers", False)))
         self.press_enter_checkbox = QCheckBox('Разрешить голосовую команду «нажми Enter»')
         self.press_enter_checkbox.setChecked(bool(settings.get("press_enter", False)))
+        self.voice_formatting_checkbox = QCheckBox(
+            'Голосовые команды форматирования: «с новой строки», «абзац»'
+        )
+        self.voice_formatting_checkbox.setChecked(bool(settings.get("voice_formatting", False)))
         layout.addWidget(self.auto_insert_checkbox)
         layout.addWidget(self.smart_spacing_checkbox)
         layout.addWidget(self.remove_fillers_checkbox)
         layout.addWidget(self.press_enter_checkbox)
+        layout.addWidget(self.voice_formatting_checkbox)
 
         hotkeys_defaults = hotkey_bindings.HotkeyBindings().to_mapping()
         hotkeys_settings = settings.get("hotkeys", hotkeys_defaults)
@@ -643,6 +648,7 @@ class SettingsWindow(QMainWindow):
             "smart_spacing": self.smart_spacing_checkbox.isChecked(),
             "remove_fillers": self.remove_fillers_checkbox.isChecked(),
             "press_enter": self.press_enter_checkbox.isChecked(),
+            "voice_formatting": self.voice_formatting_checkbox.isChecked(),
             "replacements": parse_replacements(self.dictionary_edit.toPlainText()),
             "hotkeys": self._current_hotkeys(),
         }

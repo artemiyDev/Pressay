@@ -11,6 +11,7 @@ English are the only supported languages.
 - configurable push-to-talk and hands-free global hotkeys, with shipped defaults and a conflict warning for keyboard layouts;
 - local faster-whisper recognition;
 - personal vocabulary and deterministic term replacements;
+- optional voice commands when enabled: “press Enter”, Russian “с новой строки” (“new line”) and “абзац” (“paragraph”);
 - focused editable-control verification before every insertion batch;
 - only two recent transcripts retained in application memory;
 - explicit copy, with no hidden clipboard overwrite after insertion failures;

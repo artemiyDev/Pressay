@@ -281,6 +281,7 @@ def _load_config() -> _ConfigLoadResult:
             smart_spacing=False,
             remove_fillers=False,
             voice_press_enter=False,
+            voice_formatting=False,
             snippets={},
             replacements={},
         )
@@ -331,6 +332,7 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "smart_spacing": config.smart_spacing,
         "remove_fillers": config.remove_fillers,
         "press_enter": config.voice_press_enter,
+        "voice_formatting": config.voice_formatting,
         "replacements": dict(config.replacements),
         "hotkeys": config.hotkeys.to_mapping(),
     }
@@ -524,6 +526,7 @@ def main(argv: list[str] | None = None) -> int:
             smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
             remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
             voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
+            voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
             resource_mode=str(values.get("resource_mode", config.resource_mode)),
             snippets=dict(config.snippets),
             replacements=dict(values.get("replacements", config.replacements)),

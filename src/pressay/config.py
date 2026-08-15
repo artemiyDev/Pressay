@@ -124,6 +124,7 @@ class AppConfig:
     smart_spacing: bool = True
     remove_fillers: bool = False
     voice_press_enter: bool = False
+    voice_formatting: bool = False
     resource_mode: str = "instant"
     snippets: dict[str, str] = field(default_factory=dict)
     replacements: dict[str, str] = field(default_factory=dict)
@@ -176,6 +177,10 @@ class AppConfig:
             voice_press_enter=_bool(
                 raw.get("voice_press_enter", defaults.voice_press_enter),
                 "voice_press_enter",
+            ),
+            voice_formatting=_bool(
+                raw.get("voice_formatting", defaults.voice_formatting),
+                "voice_formatting",
             ),
             resource_mode=resource_mode,
             snippets=_string_map(
