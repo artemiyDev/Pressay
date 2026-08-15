@@ -367,6 +367,20 @@ def test_prepare_warmup_and_capture_at_native_rate(monkeypatch: pytest.MonkeyPat
     assert recorder.stop_signal_status_messages == ()
 
 
+def test_current_rms_tracks_the_latest_chunk_and_resets(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeSoundDevice()
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    assert recorder.current_rms == 0.0
+    recorder.start()
+    recorder._audio_callback(np.full((48, 1), 0.25, dtype=np.float32), 48, {}, "")
+
+    assert recorder.current_rms == pytest.approx(0.25)
+    recorder.stop(validate=False)
+    assert recorder.current_rms == 0.0
+
+
 def test_stop_rejects_short_and_silent_recordings(monkeypatch: pytest.MonkeyPatch) -> None:
     short = FakeSoundDevice([np.ones(100, dtype=np.float32) * 0.1])
     install_fake(monkeypatch, short)

@@ -271,6 +271,13 @@ class DictationController:
                 _CaptureIntent.STOPPING,
             }
 
+    def current_recording_rms(self) -> float:
+        """Return the current active recorder level without blocking UI work."""
+
+        with self._lock:
+            recorder = self._recorder
+        return float(getattr(recorder, "current_rms", 0.0)) if recorder is not None else 0.0
+
     def _microphone_device(self) -> int | str | None:
         return normalize_device_selector(self.config.microphone)
 

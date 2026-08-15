@@ -19,6 +19,7 @@ import numpy as np
 
 
 TARGET_SAMPLE_RATE = 16_000
+SILENCE_RMS_THRESHOLD = 0.0003
 MICROPHONE_SELECTOR_PREFIX = "pressay:microphone:v1?"
 LEGACY_MICROPHONE_SELECTOR_PREFIX = "whisperflow:microphone:v1?"
 _UNRESOLVED_DEVICE = object()
@@ -287,7 +288,7 @@ class AudioRecorder:
         # microphone arrays can expose much quieter mono PCM through
         # PortAudio than through Windows' native capture path; the ASR VAD is
         # the authoritative speech detector after this inexpensive guard.
-        silence_rms_threshold: float = 0.0003,
+        silence_rms_threshold: float = SILENCE_RMS_THRESHOLD,
         blocksize: int = 0,
         latency: str | float | None = "low",
         # Push-to-talk callers may prefer the legacy behaviour of discarding
@@ -326,6 +327,7 @@ class AudioRecorder:
         self._max_retained_samples: int | None = None
         self._duration_limit_reached = False
         self._duration_limit_event = threading.Event()
+        self._current_rms = 0.0
         self._stop_signal_event = threading.Event()
         self._stop_signal_reason: str | None = None
         self._finishing = False
@@ -505,6 +507,12 @@ class AudioRecorder:
         return self._native_sample_rate
 
     @property
+    def current_rms(self) -> float:
+        """Return the most recent capture-buffer RMS, or zero when idle."""
+
+        return self._current_rms
+
+    @property
     def duration_limit_reached(self) -> bool:
         """Whether the active capture has reached its one-shot duration limit."""
 
@@ -647,9 +655,11 @@ class AudioRecorder:
                 self._set_stop_signal_locked("portaudio_status")
         try:
             chunk = _mono_float32(indata)
+            rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
             with self._lock:
                 if not self._recording or self._duration_limit_reached:
                     return
+                self._current_rms = rms
                 if chunk.size:
                     maximum = self._max_retained_samples
                     assert maximum is not None
@@ -698,6 +708,7 @@ class AudioRecorder:
     def _reset_capture_locked(self) -> None:
         self._chunks.clear()
         self._status_messages.clear()
+        self._current_rms = 0.0
         self._retained_samples = 0
         self._max_retained_samples = None
         self._duration_limit_reached = False
@@ -791,6 +802,7 @@ class AudioRecorder:
             stop_signal_reason = self._stop_signal_reason
             self._chunks = []
             self._status_messages.clear()
+            self._current_rms = 0.0
             self._retained_samples = 0
             self._max_retained_samples = None
             self._duration_limit_reached = False

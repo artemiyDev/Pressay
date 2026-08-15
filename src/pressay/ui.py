@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import hotkey_bindings
+from .audio import SILENCE_RMS_THRESHOLD
 from .platform_support import platform_label
 from .text import replacement_key
 
@@ -63,6 +65,9 @@ STATE_COLORS_DARK = {
     "warning": "#f59e0b",
     "error": "#f87171",
 }
+RECORDING_LEVEL_SILENCE_RMS = SILENCE_RMS_THRESHOLD
+RECORDING_LEVEL_ACTIVE_COLOR = "#4ade80"
+RECORDING_LEVEL_QUIET_COLOR = "#64748b"
 ASSET_DIRECTORY = Path(__file__).with_name("assets")
 APP_ICON_PATH = ASSET_DIRECTORY / "app-icon.svg"
 
@@ -229,10 +234,19 @@ def make_icon(color: str | None = None, size: int = 64) -> QIcon:
     return QIcon(pixmap)
 
 
+def recording_level_fraction(rms: float) -> float:
+    """Map microphone RMS to a stable, perceptible overlay width."""
+
+    if not math.isfinite(rms) or rms <= 0.0:
+        return 0.0
+    decibels = 20.0 * math.log10(rms)
+    return max(0.0, min(1.0, (decibels + 65.0) / 50.0))
+
+
 class StatusOverlay(QWidget):
     """A bottom-centre overlay that never steals keyboard focus."""
 
-    def __init__(self) -> None:
+    def __init__(self, level_provider: Callable[[], float] | None = None) -> None:
         super().__init__(None)
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -246,15 +260,29 @@ class StatusOverlay(QWidget):
 
         self._frame = QFrame(self)
         self._frame.setObjectName("overlayFrame")
-        frame_layout = QHBoxLayout(self._frame)
+        frame_layout = QVBoxLayout(self._frame)
         frame_layout.setContentsMargins(16, 9, 16, 9)
-        frame_layout.setSpacing(9)
+        frame_layout.setSpacing(6)
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(9)
         self._dot = QLabel("●")
         self._dot.setFont(QFont("Segoe UI", 13))
         self._label = QLabel("Готов")
         self._label.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
-        frame_layout.addWidget(self._dot)
-        frame_layout.addWidget(self._label)
+        content_layout.addWidget(self._dot)
+        content_layout.addWidget(self._label)
+        frame_layout.addLayout(content_layout)
+        self._level_track = QFrame()
+        self._level_track.setFixedHeight(5)
+        level_layout = QHBoxLayout(self._level_track)
+        level_layout.setContentsMargins(0, 0, 0, 0)
+        level_layout.setSpacing(0)
+        self._level_fill = QFrame()
+        self._level_fill.setFixedHeight(5)
+        level_layout.addWidget(self._level_fill)
+        level_layout.addStretch()
+        self._level_track.hide()
+        frame_layout.addWidget(self._level_track)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -262,6 +290,11 @@ class StatusOverlay(QWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
+        self._level_provider = level_provider
+        self._level_fraction = 0.0
+        self._level_timer = QTimer(self)
+        self._level_timer.setInterval(50)
+        self._level_timer.timeout.connect(self._refresh_level)
         # The overlay plate is always dark, in either system theme, so it uses
         # the accents tuned for dark backgrounds rather than the window ones.
         self._apply_color(STATE_COLORS_DARK["ready"])
@@ -277,10 +310,41 @@ class StatusOverlay(QWidget):
         )
         self._dot.setStyleSheet(f"color: {color};")
 
+    def _set_level(self, rms: float) -> None:
+        self._level_fraction = recording_level_fraction(rms)
+        width = int(self._level_track.contentsRect().width() * self._level_fraction)
+        if self._level_fraction > 0.0:
+            width = max(1, width)
+        self._level_fill.setFixedWidth(width)
+        color = (
+            RECORDING_LEVEL_ACTIVE_COLOR
+            if rms >= RECORDING_LEVEL_SILENCE_RMS
+            else RECORDING_LEVEL_QUIET_COLOR
+        )
+        self._level_fill.setStyleSheet(
+            f"background: {color}; border-radius: 2px;"
+        )
+
+    def _refresh_level(self) -> None:
+        if not self._level_track.isVisible():
+            return
+        try:
+            rms = float(self._level_provider()) if self._level_provider is not None else 0.0
+        except (TypeError, ValueError):
+            rms = 0.0
+        self._set_level(rms)
+
+    def hideEvent(self, event: Any) -> None:
+        self._level_timer.stop()
+        super().hideEvent(event)
+
     def show_status(self, text: str, state: str, *, auto_hide_ms: int = 0) -> None:
         self._hide_timer.stop()
+        self._level_timer.stop()
         self._label.setText(text)
         self._apply_color(STATE_COLORS_DARK.get(state, STATE_COLORS_DARK["idle"]))
+        recording = state == "recording"
+        self._level_track.setVisible(recording)
         self.adjustSize()
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -293,6 +357,9 @@ class StatusOverlay(QWidget):
             )
         self.show()
         self.raise_()
+        if recording:
+            self._refresh_level()
+            self._level_timer.start()
         if auto_hide_ms:
             self._hide_timer.start(auto_hide_ms)
 

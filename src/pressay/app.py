@@ -446,7 +446,6 @@ def main(argv: list[str] | None = None) -> int:
     config = config_load.config
     signals = UiSignals()
     window = SettingsWindow(signals, _settings_dict(config), _microphones())
-    overlay = StatusOverlay()
     tray = TrayController(signals, window)
     app.aboutToQuit.connect(window.prepare_to_quit)
 
@@ -480,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:
         notification_callback=notification_callback,
         model_ready_callback=model_ready_callback,
     )
+    overlay = StatusOverlay(level_provider=controller.current_recording_rms)
 
     def start_or_stop(*, capture_target: bool = False) -> None:
         if controller.is_recording:

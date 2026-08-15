@@ -62,6 +62,23 @@ class FakeRecorder:
         return was
 
 
+def test_current_recording_rms_reads_only_the_active_recorder() -> None:
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    try:
+        assert controller.current_recording_rms() == 0.0
+        controller._recorder = SimpleNamespace(current_rms=0.025)
+        assert controller.current_recording_rms() == pytest.approx(0.025)
+        controller._recorder = None
+        assert controller.current_recording_rms() == 0.0
+    finally:
+        controller.close()
+
+
 class BlockingLimitRecorder(FakeRecorder):
     """Reaches the duration limit but blocks stop() until the test releases it.
 
