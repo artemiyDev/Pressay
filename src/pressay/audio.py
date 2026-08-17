@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import logging
 import threading
 import time
 from typing import Any
@@ -18,6 +19,7 @@ from urllib.parse import parse_qs, urlencode
 import numpy as np
 
 
+LOGGER = logging.getLogger(__name__)
 TARGET_SAMPLE_RATE = 16_000
 SILENCE_RMS_THRESHOLD = 0.0003
 MICROPHONE_SELECTOR_PREFIX = "pressay:microphone:v1?"
@@ -187,6 +189,18 @@ class AudioRecording:
         """Alias useful to callers that name PCM arrays ``samples``."""
 
         return self.audio
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalizedCapture:
+    """Capture state detached before its PortAudio stream is closed."""
+
+    stream: Any
+    chunks: list[np.ndarray]
+    statuses: tuple[str, ...]
+    limit_reached: bool
+    retained_samples: int
+    stop_signal_reason: str | None
 
 
 def _import_sounddevice() -> Any:
@@ -642,12 +656,21 @@ class AudioRecorder:
         _frames: int,
         _time_info: Any,
         status: Any,
+        *,
+        generation: int | None = None,
     ) -> None:
         # PortAudio invokes this on a real-time thread: only copy and append.
         # Once the duration signal is set, return before converting/copying any
         # further driver buffers.
         with self._lock:
-            if not self._recording or self._duration_limit_reached:
+            if (
+                not self._recording
+                or self._duration_limit_reached
+                or (
+                    generation is not None
+                    and self._active_stream_generation != generation
+                )
+            ):
                 return
             if status:
                 # Record PortAudio's integrity warning even if conversion of
@@ -658,7 +681,14 @@ class AudioRecorder:
             chunk = _mono_float32(indata)
             rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
             with self._lock:
-                if not self._recording or self._duration_limit_reached:
+                if (
+                    not self._recording
+                    or self._duration_limit_reached
+                    or (
+                        generation is not None
+                        and self._active_stream_generation != generation
+                    )
+                ):
                     return
                 self._current_rms = rms
                 if chunk.size:
@@ -737,7 +767,13 @@ class AudioRecorder:
             stream = sd.InputStream(
                 **self._stream_kwargs(
                     rate,
-                    self._audio_callback,
+                    lambda indata, frames, time_info, status: self._audio_callback(
+                        indata,
+                        frames,
+                        time_info,
+                        status,
+                        generation=generation,
+                    ),
                     sd,
                     finished_callback=lambda: self._stream_finished_callback(generation),
                 )
@@ -766,37 +802,14 @@ class AudioRecorder:
                     pass
             raise AudioDeviceError("Could not start microphone capture") from exc
 
-    def _finish_stream(
-        self,
-    ) -> tuple[
-        list[np.ndarray],
-        tuple[str, ...],
-        bool,
-        int,
-        str | None,
-        Exception | None,
-        float,
-    ]:
+    def _detach_stream_for_async_close(self) -> _FinalizedCapture:
+        """Freeze capture state and release the stream for background closing."""
+
         with self._lock:
             if not self._recording or self._stream is None:
                 raise AudioCaptureError("No recording is active")
             stream = self._stream
             self._finishing = True
-
-        stop_error: Exception | None = None
-        stream_stop_started = time.perf_counter()
-        try:
-            stream.stop()
-        except Exception as exc:
-            stop_error = exc
-        finally:
-            try:
-                stream.close()
-            except Exception as exc:
-                stop_error = stop_error or exc
-        stream_stop_seconds = time.perf_counter() - stream_stop_started
-
-        with self._lock:
             self._recording = False
             self._stream = None
             chunks = self._chunks
@@ -805,40 +818,68 @@ class AudioRecorder:
             retained_samples = self._retained_samples
             stop_signal_reason = self._stop_signal_reason
             self._chunks = []
-            self._status_messages.clear()
-            self._current_rms = 0.0
-            self._retained_samples = 0
-            self._max_retained_samples = None
-            self._duration_limit_reached = False
-            self._duration_limit_event.clear()
-            self._stop_signal_reason = None
-            self._stop_signal_event.clear()
-            self._finishing = False
-            self._unexpected_stream_finished = False
-            self._active_stream_generation = None
+            self._reset_capture_locked()
 
-        return (
-            chunks,
-            statuses,
-            limit_reached,
-            retained_samples,
-            stop_signal_reason,
-            stop_error,
-            stream_stop_seconds,
+        return _FinalizedCapture(
+            stream=stream,
+            chunks=chunks,
+            statuses=statuses,
+            limit_reached=limit_reached,
+            retained_samples=retained_samples,
+            stop_signal_reason=stop_signal_reason,
         )
+
+    def _close_stream_async(self, stream: Any) -> None:
+        """Close a detached PortAudio stream without delaying recognition."""
+
+        def close_stream() -> None:
+            started = time.perf_counter()
+            error: Exception | None = None
+            try:
+                stream.stop()
+            except Exception as exc:
+                error = exc
+            try:
+                stream.close()
+            except Exception as exc:
+                error = error or exc
+            elapsed = time.perf_counter() - started
+            if error is None:
+                LOGGER.debug("stream_closed_async seconds=%.3f ok=%s", elapsed, True)
+            else:
+                LOGGER.warning(
+                    "stream_closed_async seconds=%.3f ok=%s error=%s",
+                    elapsed,
+                    False,
+                    type(error).__name__,
+                )
+
+        try:
+            threading.Thread(
+                target=close_stream,
+                name="pressay-stream-close",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            LOGGER.warning(
+                "stream_closed_async seconds=%.3f ok=%s error=%s",
+                0.0,
+                False,
+                type(exc).__name__,
+            )
 
     def stop(self, *, validate: bool = True) -> AudioRecording:
         """Stop, resample to the target rate and return capture metadata."""
 
-        (
-            chunks,
-            statuses,
-            limit_reached,
-            retained_samples,
-            stop_signal_reason,
-            stop_error,
-            stream_stop_seconds,
-        ) = self._finish_stream()
+        capture = self._detach_stream_for_async_close()
+        stream_stop_started = time.perf_counter()
+        self._close_stream_async(capture.stream)
+        stream_stop_seconds = time.perf_counter() - stream_stop_started
+        chunks = capture.chunks
+        statuses = capture.statuses
+        limit_reached = capture.limit_reached
+        retained_samples = capture.retained_samples
+        stop_signal_reason = capture.stop_signal_reason
         native = int(self._native_sample_rate or self.target_sample_rate)
         duration = retained_samples / native
         if validate and stop_signal_reason is not None:
@@ -863,8 +904,6 @@ class AudioRecorder:
                 source_sample_rate=native,
                 status_messages=statuses,
             )
-        if stop_error is not None:
-            raise AudioDeviceError("Could not finish microphone capture") from stop_error
         assemble_started = time.perf_counter()
         raw = (
             np.concatenate(chunks).astype(np.float32, copy=False)
@@ -906,16 +945,11 @@ class AudioRecorder:
     def cancel(self) -> bool:
         """Discard an active recording. Returns whether one was cancelled."""
 
-        with self._lock:
-            if not self._recording or self._stream is None:
-                return False
         try:
-            *_, stop_error, _stream_stop_seconds = self._finish_stream()
-            if stop_error is not None:
-                raise AudioDeviceError("Could not finish microphone capture") from stop_error
-        finally:
-            with self._lock:
-                self._reset_capture_locked()
+            capture = self._detach_stream_for_async_close()
+        except AudioCaptureError:
+            return False
+        self._close_stream_async(capture.stream)
         return True
 
     def close(self) -> None:

@@ -718,3 +718,178 @@ def test_cancel_clears_stream_health_signal_and_snapshot(
 def test_duration_limit_must_be_positive_and_finite(maximum: float) -> None:
     with pytest.raises(ValueError, match="max_duration_seconds"):
         AudioRecorder(max_duration_seconds=maximum)
+
+
+def test_stop_returns_before_blocking_stream_close_and_logs_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    import threading
+
+    class BlockingStream(FakeStream):
+        def __init__(self, owner: FakeSoundDevice, **kwargs: object) -> None:
+            super().__init__(owner, **kwargs)
+            self.allow_stop = threading.Event()
+            self.stop_entered = threading.Event()
+            self.close_completed = threading.Event()
+            self.stop_calls = 0
+            self.close_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            self.stopped = True
+            self.stop_entered.set()
+            assert self.allow_stop.wait(timeout=2)
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+            self.close_completed.set()
+
+    fake = FakeSoundDevice([np.ones(4_800, dtype=np.float32) * 0.1])
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(
+        fake,
+        "InputStream",
+        lambda **kwargs: BlockingStream(fake, **kwargs),
+    )
+    caplog.set_level(logging.DEBUG, logger="pressay.audio")
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    recorder.start()
+    stream = fake.streams[-1]
+    assert isinstance(stream, BlockingStream)
+    try:
+        recording = recorder.stop()
+        assert recording.audio.size == 1_600
+        assert stream.stop_entered.wait(timeout=1)
+        assert stream.close_calls == 0
+    finally:
+        stream.allow_stop.set()
+
+    assert stream.close_completed.wait(timeout=1)
+    assert stream.stop_calls == 1
+    assert stream.close_calls == 1
+    assert any(
+        "stream_closed_async seconds=" in record.message and "ok=True" in record.message
+        for record in caplog.records
+    )
+
+
+def test_callback_after_stop_does_not_change_finalized_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice()
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    recorder.start()
+    stream = fake.streams[-1]
+    stream.callback(np.full((48, 1), 0.1, dtype=np.float32), 48, {}, "")
+    recording = recorder.stop(validate=False)
+    finalized = recording.audio.copy()
+
+    stream.callback(np.full((480, 1), 0.9, dtype=np.float32), 480, {}, "")
+
+    np.testing.assert_array_equal(recording.audio, finalized)
+    assert recorder.retained_samples == 0
+
+
+def test_start_succeeds_while_previous_stream_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    class BlockingStream(FakeStream):
+        def __init__(self, owner: FakeSoundDevice, **kwargs: object) -> None:
+            super().__init__(owner, **kwargs)
+            self.allow_stop = threading.Event()
+            self.stop_entered = threading.Event()
+            self.close_completed = threading.Event()
+
+        def stop(self) -> None:
+            self.stopped = True
+            self.stop_entered.set()
+            assert self.allow_stop.wait(timeout=2)
+
+        def close(self) -> None:
+            self.closed = True
+            self.close_completed.set()
+
+    fake = FakeSoundDevice()
+    install_fake(monkeypatch, fake)
+    opened = 0
+
+    def input_stream(**kwargs: object) -> FakeStream:
+        nonlocal opened
+        opened += 1
+        if opened == 1:
+            return BlockingStream(fake, **kwargs)
+        return FakeStream(fake, **kwargs)
+
+    monkeypatch.setattr(fake, "InputStream", input_stream)
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    recorder.start()
+    old_stream = fake.streams[-1]
+    assert isinstance(old_stream, BlockingStream)
+    recorder.stop(validate=False)
+    assert old_stream.stop_entered.wait(timeout=1)
+
+    assert recorder.start() == 48_000
+    assert recorder.is_recording is True
+    assert fake.streams[-1] is not old_stream
+    old_stream.callback(np.full((480, 1), 0.9, dtype=np.float32), 480, {}, "")
+    assert recorder.retained_samples == 0
+    assert recorder.cancel() is True
+
+    old_stream.allow_stop.set()
+    assert old_stream.close_completed.wait(timeout=1)
+
+
+def test_async_stream_close_failure_is_logged_without_affecting_recording(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    import threading
+
+    class FailingStream(FakeStream):
+        def __init__(self, owner: FakeSoundDevice, **kwargs: object) -> None:
+            super().__init__(owner, **kwargs)
+            self.closed_event = threading.Event()
+            self.close_calls = 0
+
+        def stop(self) -> None:
+            raise RuntimeError("driver already closed")
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+            self.closed_event.set()
+
+    fake = FakeSoundDevice([np.ones(4_800, dtype=np.float32) * 0.1])
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(
+        fake,
+        "InputStream",
+        lambda **kwargs: FailingStream(fake, **kwargs),
+    )
+    caplog.set_level(logging.WARNING, logger="pressay.audio")
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    recorder.start()
+    stream = fake.streams[-1]
+    assert isinstance(stream, FailingStream)
+    recording = recorder.stop()
+
+    assert recording.audio.size == 1_600
+    assert stream.closed_event.wait(timeout=1)
+    assert stream.close_calls == 1
+    assert any(
+        record.levelno == logging.WARNING
+        and "stream_closed_async seconds=" in record.message
+        and "ok=False" in record.message
+        for record in caplog.records
+    )
