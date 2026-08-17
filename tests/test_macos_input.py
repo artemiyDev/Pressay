@@ -102,13 +102,28 @@ def test_noneditable_and_held_modifiers_never_inject() -> None:
 
 
 def test_describe_focus_has_same_shape_as_windows_input() -> None:
-    assert describe_focus(None) == {"focus_kind": "none", "control_type": None}
+    expected_none = {
+        "focus_kind": "none",
+        "control_type": None,
+        "enabled": None,
+        "keyboard_focusable": None,
+        "value_writable": None,
+        "text_editable": None,
+    }
+    assert describe_focus(None) == expected_none
 
     no_control = ForegroundTarget(pid=42, focused_control=None, editable=False)
-    assert describe_focus(no_control) == {"focus_kind": "none", "control_type": None}
+    assert describe_focus(no_control) == expected_none
 
     focused = target()
-    assert describe_focus(focused) == {"focus_kind": "ax", "control_type": None}
+    assert describe_focus(focused) == {
+        "focus_kind": "ax",
+        "control_type": None,
+        "enabled": None,
+        "keyboard_focusable": None,
+        "value_writable": None,
+        "text_editable": None,
+    }
 
 
 def test_explicit_paste_is_direct_and_copy_is_explicit() -> None:

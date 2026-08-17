@@ -58,7 +58,10 @@ def _insertion_status_text(reason: str, bindings: Any | None = None) -> str:
     }:
         return "Не вставлено: сменилось активное окно"
     if reason == "focused_control_is_not_editable":
-        return "Не вставлено: курсор не в поле ввода"
+        return (
+            "Поле не распознано — текст в истории "
+            "(настройка «Вставлять только в…»)"
+        )
     if reason == "physical_modifiers_not_released":
         return f"Не вставлено: отпустите {hotkey_hint('hold', bindings)}"
     if reason in {
@@ -1119,6 +1122,7 @@ class DictationController:
                     insertion_text,
                     expected_target=target,
                     press_enter=press_enter,
+                    strict_editable_check=self.config.strict_editable_check,
                     cancelled=cancelled,
                     # Automatic delivery never overwrites the user's clipboard on
                     # failure. The transcript is already retained in memory/UI;
@@ -1184,6 +1188,7 @@ class DictationController:
         try:
             outcome = input_adapter().paste_last(
                 text,
+                strict_editable_check=self.config.strict_editable_check,
                 cancelled=lambda: not self._last_transcript_is_current(text),
             )
         except Exception as exc:

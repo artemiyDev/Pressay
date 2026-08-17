@@ -333,6 +333,7 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "remove_fillers": config.remove_fillers,
         "press_enter": config.voice_press_enter,
         "voice_formatting": config.voice_formatting,
+        "strict_editable_check": config.strict_editable_check,
         "replacements": dict(config.replacements),
         "hotkeys": config.hotkeys.to_mapping(),
     }
@@ -389,7 +390,7 @@ def _build_microphone_test_handler(
     return test_microphone
 
 
-def _snapshot_target() -> Any | None:
+def _snapshot_target(*, strict_editable_check: bool = False) -> Any | None:
     try:
         adapter = input_adapter()
         target = adapter.snapshot_foreground_target()
@@ -399,17 +400,29 @@ def _snapshot_target() -> Any | None:
         focus_info = (
             describe_focus(target)
             if callable(describe_focus)
-            else {"focus_kind": "none", "control_type": None}
+            else {
+                "focus_kind": "none",
+                "control_type": None,
+                "enabled": None,
+                "keyboard_focusable": None,
+                "value_writable": None,
+                "text_editable": None,
+            }
         )
         LOGGER.info(
             "recording_target_captured valid=%s editable=%s hwnd=%s pid=%s "
-            "focus_kind=%s control_type=%s",
+            "focus_kind=%s control_type=%s enabled=%s focusable=%s "
+            "value_writable=%s text_editable=%s",
             bool(getattr(target, "is_valid", False)),
-            adapter.target_looks_editable(target),
+            adapter.target_looks_editable(target, strict=strict_editable_check),
             int(getattr(target, "hwnd", 0) or 0),
             int(getattr(target, "pid", 0) or 0),
             focus_info.get("focus_kind", "none"),
             focus_info.get("control_type"),
+            focus_info.get("enabled"),
+            focus_info.get("keyboard_focusable"),
+            focus_info.get("value_writable"),
+            focus_info.get("text_editable"),
         )
         return target
     except Exception as exc:
@@ -488,7 +501,13 @@ def main(argv: list[str] | None = None) -> int:
             controller.request_stop_recording()
         else:
             controller.request_start_recording(
-                target=_snapshot_target() if capture_target else None
+                target=(
+                    _snapshot_target(
+                        strict_editable_check=config.strict_editable_check
+                    )
+                    if capture_target
+                    else None
+                )
             )
 
     # paste_last/copy_last touch Win32 clipboard/COM with retries that can take
@@ -527,6 +546,9 @@ def main(argv: list[str] | None = None) -> int:
             remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
             voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
             voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
+            strict_editable_check=bool(
+                values.get("strict_editable_check", config.strict_editable_check)
+            ),
             resource_mode=str(values.get("resource_mode", config.resource_mode)),
             snippets=dict(config.snippets),
             replacements=dict(values.get("replacements", config.replacements)),
@@ -582,7 +604,11 @@ def main(argv: list[str] | None = None) -> int:
 
             def handle() -> None:
                 if action == HotkeyAction.START:
-                    controller.request_start_recording(target=_snapshot_target())
+                    controller.request_start_recording(
+                        target=_snapshot_target(
+                            strict_editable_check=config.strict_editable_check
+                        )
+                    )
                 elif action == HotkeyAction.STOP:
                     controller.request_stop_recording()
                 elif action == HotkeyAction.TOGGLE:

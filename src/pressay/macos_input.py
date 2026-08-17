@@ -98,7 +98,8 @@ def targets_match(expected: ForegroundTarget, current: ForegroundTarget) -> bool
     )
 
 
-def target_looks_editable(target: ForegroundTarget) -> bool:
+def target_looks_editable(target: ForegroundTarget, *, strict: bool = False) -> bool:
+    del strict
     return target.is_valid and target.editable
 
 
@@ -111,7 +112,14 @@ def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
 
     fingerprint = getattr(target, "focused_control", None) if target is not None else None
     focus_kind = fingerprint[0] if fingerprint else "none"
-    return {"focus_kind": focus_kind, "control_type": None}
+    return {
+        "focus_kind": focus_kind,
+        "control_type": None,
+        "enabled": None,
+        "keyboard_focusable": None,
+        "value_writable": None,
+        "text_editable": None,
+    }
 
 
 def _load_frameworks() -> SimpleNamespace:
@@ -284,11 +292,12 @@ def send_text(
     press_enter: bool = False,
     cancelled: Callable[[], bool] | None = None,
     fallback_to_clipboard: bool = False,
+    strict_editable_check: bool = False,
     backend: InputBackend | None = None,
 ) -> InputOutcome:
     """Insert Unicode only while the same writable AX element keeps focus."""
 
-    del fallback_to_clipboard  # Automatic macOS delivery never mutates pasteboard.
+    del fallback_to_clipboard, strict_editable_check
     adapter = _backend(backend)
     if _cancelled(cancelled):
         return InputOutcome(InputStatus.CANCELLED, False, reason="cancelled")
@@ -383,6 +392,7 @@ def paste_last(
     text: str,
     *,
     cancelled: Callable[[], bool] | None = None,
+    strict_editable_check: bool = False,
     backend: InputBackend | None = None,
 ) -> InputOutcome:
     adapter = _backend(backend)
@@ -391,6 +401,7 @@ def paste_last(
         text,
         expected_target=target,
         cancelled=cancelled,
+        strict_editable_check=strict_editable_check,
         backend=adapter,
     )
 

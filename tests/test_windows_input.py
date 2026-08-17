@@ -573,8 +573,16 @@ def test_parse_focus_fingerprint_decodes_win32_focus_format() -> None:
 def test_describe_focus_reports_none_for_missing_fingerprint() -> None:
     target = ForegroundTarget(hwnd=100, pid=200, focused_control=None)
 
-    assert describe_focus(target) == {"focus_kind": "none", "control_type": None}
-    assert describe_focus(None) == {"focus_kind": "none", "control_type": None}
+    expected = {
+        "focus_kind": "none",
+        "control_type": None,
+        "enabled": None,
+        "keyboard_focusable": None,
+        "value_writable": None,
+        "text_editable": None,
+    }
+    assert describe_focus(target) == expected
+    assert describe_focus(None) == expected
 
 
 def test_describe_focus_reports_uia_control_type() -> None:
@@ -584,7 +592,14 @@ def test_describe_focus_reports_uia_control_type() -> None:
         focused_control=_uia_fingerprint(control_type=50030),
     )
 
-    assert describe_focus(target) == {"focus_kind": "uia", "control_type": 50030}
+    assert describe_focus(target) == {
+        "focus_kind": "uia",
+        "control_type": 50030,
+        "enabled": True,
+        "keyboard_focusable": True,
+        "value_writable": True,
+        "text_editable": False,
+    }
 
 
 def test_describe_focus_reports_win32_focus_without_control_type() -> None:
@@ -594,7 +609,14 @@ def test_describe_focus_reports_win32_focus_without_control_type() -> None:
         focused_control=("win32_focus", 200, 222, "Edit"),
     )
 
-    assert describe_focus(target) == {"focus_kind": "win32_focus", "control_type": None}
+    assert describe_focus(target) == {
+        "focus_kind": "win32_focus",
+        "control_type": None,
+        "enabled": None,
+        "keyboard_focusable": None,
+        "value_writable": None,
+        "text_editable": None,
+    }
 
 
 def test_describe_focus_keeps_reporting_the_unavailable_sentinel_tag() -> None:
@@ -602,7 +624,14 @@ def test_describe_focus_keeps_reporting_the_unavailable_sentinel_tag() -> None:
     # surfacing "focus_unavailable" in the log exactly as before this refactor.
     target = ForegroundTarget(hwnd=100, pid=200, focused_control=_FOCUS_UNAVAILABLE)
 
-    assert describe_focus(target) == {"focus_kind": "focus_unavailable", "control_type": None}
+    assert describe_focus(target) == {
+        "focus_kind": "focus_unavailable",
+        "control_type": None,
+        "enabled": None,
+        "keyboard_focusable": None,
+        "value_writable": None,
+        "text_editable": None,
+    }
 
 
 def test_press_enter_only_sends_enter_to_same_target() -> None:

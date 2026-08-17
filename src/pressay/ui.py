@@ -495,11 +495,27 @@ class SettingsWindow(QMainWindow):
             'Голосовые команды форматирования: «с новой строки», «абзац»'
         )
         self.voice_formatting_checkbox.setChecked(bool(settings.get("voice_formatting", False)))
+        self.strict_editable_check_checkbox = QCheckBox(
+            "Вставлять только в надёжно распознанные поля ввода"
+        )
+        self.strict_editable_check_checkbox.setChecked(
+            bool(settings.get("strict_editable_check", False))
+        )
         layout.addWidget(self.auto_insert_checkbox)
         layout.addWidget(self.smart_spacing_checkbox)
         layout.addWidget(self.remove_fillers_checkbox)
         layout.addWidget(self.press_enter_checkbox)
         layout.addWidget(self.voice_formatting_checkbox)
+        layout.addWidget(self.strict_editable_check_checkbox)
+
+        strict_editable_check_hint = QLabel(
+            "При включении Pressay не будет вставлять текст в окна, чей фокус не "
+            "распознан как текстовое поле (например, некоторые браузерные и "
+            "Electron-приложения)."
+        )
+        strict_editable_check_hint.setWordWrap(True)
+        self._hint_labels.append(strict_editable_check_hint)
+        layout.addWidget(strict_editable_check_hint)
 
         hotkeys_defaults = hotkey_bindings.HotkeyBindings().to_mapping()
         hotkeys_settings = settings.get("hotkeys", hotkeys_defaults)
@@ -649,6 +665,7 @@ class SettingsWindow(QMainWindow):
             "remove_fillers": self.remove_fillers_checkbox.isChecked(),
             "press_enter": self.press_enter_checkbox.isChecked(),
             "voice_formatting": self.voice_formatting_checkbox.isChecked(),
+            "strict_editable_check": self.strict_editable_check_checkbox.isChecked(),
             "replacements": parse_replacements(self.dictionary_edit.toPlainText()),
             "hotkeys": self._current_hotkeys(),
         }

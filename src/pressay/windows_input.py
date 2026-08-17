@@ -436,23 +436,26 @@ def parse_focus_fingerprint(
     return None
 
 
-def target_looks_editable(target: ForegroundTarget) -> bool:
-    """Allow only controls with positive evidence that they accept text."""
+def target_looks_editable(target: ForegroundTarget, *, strict: bool = False) -> bool:
+    """Decide whether a captured focus target is safe for text insertion."""
 
     parsed = parse_focus_fingerprint(target.focused_control)
     if parsed is None:
         return False
     if parsed.kind == "win32_focus":
         return True
-    # UIA Edit, Document and Custom.  Control type alone is insufficient:
-    # read-only edits/documents and arbitrary focusable custom widgets remain
-    # blocked unless they expose a writable ValuePattern or TextEditPattern.
-    return (
+    if not parsed.enabled:
+        return False
+    # Toggle controls can report a writable value for their state, never text.
+    if parsed.text_editable and parsed.control_type not in {50002, 50013}:
+        return True
+    if (
         parsed.control_type in {50004, 50030, 50025}
-        and bool(parsed.enabled)
-        and bool(parsed.keyboard_focusable)
-        and (bool(parsed.value_writable) or bool(parsed.text_editable))
-    )
+        and parsed.keyboard_focusable
+        and (parsed.value_writable or parsed.text_editable)
+    ):
+        return True
+    return parsed.control_type == 50033 and parsed.keyboard_focusable and not strict
 
 
 def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
@@ -466,8 +469,16 @@ def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
     fingerprint = getattr(target, "focused_control", None) if target is not None else None
     focus_kind = fingerprint[0] if fingerprint else "none"
     parsed = parse_focus_fingerprint(fingerprint)
-    control_type = parsed.control_type if parsed is not None else None
-    return {"focus_kind": focus_kind, "control_type": control_type}
+    return {
+        "focus_kind": focus_kind,
+        "control_type": parsed.control_type if parsed is not None else None,
+        "enabled": parsed.enabled if parsed is not None else None,
+        "keyboard_focusable": (
+            parsed.keyboard_focusable if parsed is not None else None
+        ),
+        "value_writable": parsed.value_writable if parsed is not None else None,
+        "text_editable": parsed.text_editable if parsed is not None else None,
+    }
 
 
 def utf16_code_units(text: str) -> tuple[int, ...]:
@@ -1513,6 +1524,7 @@ def send_text(
     clipboard_settle_s: float = 0.08,
     fallback_to_clipboard: bool = True,
     press_enter: bool = False,
+    strict_editable_check: bool = False,
     sleeper: Callable[[float], None] = time.sleep,
     cancelled: Callable[[], bool] | None = None,
 ) -> InputOutcome:
@@ -1541,7 +1553,7 @@ def send_text(
             clipboard=clipboard,
             fallback_to_clipboard=fallback_to_clipboard,
         )
-    if not target_looks_editable(expected_target):
+    if not target_looks_editable(expected_target, strict=strict_editable_check):
         return _failure(
             InputStatus.TARGET_MISMATCH,
             "focused_control_is_not_editable",
@@ -1903,6 +1915,7 @@ def paste_last(
     clipboard: Optional[ClipboardBackend] = None,
     modifier_timeout_s: float = 0.8,
     clipboard_settle_s: float = 0.08,
+    strict_editable_check: bool = False,
     sleeper: Callable[[float], None] = time.sleep,
     cancelled: Callable[[], bool] | None = None,
 ) -> InputOutcome:
@@ -1937,7 +1950,9 @@ def paste_last(
     # In particular, the explicit unavailable sentinel intentionally never
     # matches itself; letting that comparison run first would incorrectly take
     # the clipboard-copy fallback for a known Button/read-only control.
-    if expected_target is not None and not target_looks_editable(expected_target):
+    if expected_target is not None and not target_looks_editable(
+        expected_target, strict=strict_editable_check
+    ):
         return InputOutcome(
             status=InputStatus.TARGET_MISMATCH,
             success=False,
@@ -1977,7 +1992,7 @@ def paste_last(
             target=expected_target,
             current_target=current,
         )
-    if not target_looks_editable(guarded_target):
+    if not target_looks_editable(guarded_target, strict=strict_editable_check):
         return InputOutcome(
             status=InputStatus.TARGET_MISMATCH,
             success=False,

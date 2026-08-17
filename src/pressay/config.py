@@ -125,6 +125,7 @@ class AppConfig:
     remove_fillers: bool = False
     voice_press_enter: bool = False
     voice_formatting: bool = False
+    strict_editable_check: bool = False
     resource_mode: str = "instant"
     snippets: dict[str, str] = field(default_factory=dict)
     replacements: dict[str, str] = field(default_factory=dict)
@@ -181,6 +182,10 @@ class AppConfig:
             voice_formatting=_bool(
                 raw.get("voice_formatting", defaults.voice_formatting),
                 "voice_formatting",
+            ),
+            strict_editable_check=_bool(
+                raw.get("strict_editable_check", defaults.strict_editable_check),
+                "strict_editable_check",
             ),
             resource_mode=resource_mode,
             snippets=_string_map(
