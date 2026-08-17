@@ -63,6 +63,21 @@ class FakeRecorder:
         return was
 
 
+class DurationRecorder(FakeRecorder):
+    def __init__(self, duration_seconds: float) -> None:
+        super().__init__()
+        self.duration_seconds = duration_seconds
+
+    def stop(self) -> SimpleNamespace:
+        self.is_recording = False
+        return SimpleNamespace(
+            audio=np.ones(round(self.duration_seconds * 16_000), dtype=np.float32) * 0.1,
+            duration_seconds=self.duration_seconds,
+            limit_reached=False,
+            finalize_breakdown={},
+        )
+
+
 def test_current_recording_rms_reads_only_the_active_recorder() -> None:
     controller = DictationController(
         AppConfig(),
@@ -387,6 +402,60 @@ def test_controller_records_transcribes_and_keeps_last(monkeypatch) -> None:
     assert copied == []
     assert any(state == "processing" for _, state in statuses)
     assert statuses[-1] == ("Готово — текст ниже", "success")
+    controller.close()
+
+
+@pytest.mark.parametrize(
+    ("duration_seconds", "expected_vad_used"),
+    [(0.5, False), (15.0, False), (15.001, True)],
+)
+def test_recording_duration_controls_vad_filter(
+    duration_seconds: float, expected_vad_used: bool
+) -> None:
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = DurationRecorder(duration_seconds)
+    transcriber = FakeTranscriber(controller.config.model)
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = transcriber  # type: ignore[assignment]
+
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert transcriber.options == [
+        {"language": "auto", "vad_filter": expected_vad_used}
+    ]
+    controller.close()
+
+
+def test_transcription_log_records_vad_usage(caplog) -> None:
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = DurationRecorder(0.5)
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    caplog.set_level(logging.INFO, logger="pressay.controller")
+
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert any(
+        record.message.startswith("transcription_completed")
+        and "vad_used=False" in record.message
+        for record in caplog.records
+    )
     controller.close()
 
 

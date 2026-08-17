@@ -28,6 +28,7 @@ from .platform_support import hotkey_hint, input_adapter, is_macos
 
 LOGGER = logging.getLogger(__name__)
 _SETUP_MODELS = frozenset({"small", "medium", "turbo", "large-v3"})
+_SHORT_RECORDING_VAD_THRESHOLD_SECONDS = 15.0
 _MODEL_RETIRE_SECONDS: dict[str, float | None] = {
     "instant": None,
     "balanced": 300.0,
@@ -151,6 +152,7 @@ class _TranscriptionJob:
     released_at: float
     audio_finalize_seconds: float
     finalize_breakdown: dict[str, float]
+    vad_used: bool | None
 
 
 class _CaptureIntent(str, Enum):
@@ -859,6 +861,7 @@ class DictationController:
             self._recorder = None
             self.target = None
             self.state = self.state.begin_transcription(session_id)
+            recording_duration = getattr(recording, "duration_seconds", None)
             job = _TranscriptionJob(
                 session_id=session_id,
                 audio=recording.audio,
@@ -873,6 +876,11 @@ class DictationController:
                 audio_finalize_seconds=audio_finalize_seconds,
                 finalize_breakdown=dict(
                     getattr(recording, "finalize_breakdown", {}) or {}
+                ),
+                vad_used=(
+                    float(recording_duration) > _SHORT_RECORDING_VAD_THRESHOLD_SECONDS
+                    if recording_duration is not None
+                    else None
                 ),
             )
         if recording.limit_reached and current and self._session_is_current(session_id):
@@ -979,6 +987,8 @@ class DictationController:
             prompt = _initial_prompt(job.config.replacements)
             if prompt is not None:
                 transcribe_options["initial_prompt"] = prompt
+            if job.vad_used is not None:
+                transcribe_options["vad_filter"] = job.vad_used
             result = self._ensure_transcriber(job.config.model).transcribe(
                 job.audio,
                 **transcribe_options,
@@ -1022,12 +1032,13 @@ class DictationController:
         timings = getattr(result, "timings", None)
         LOGGER.info(
             "transcription_completed language=%s device=%s compute=%s "
-            "audio_seconds=%.3f load_seconds=%.3f inference_seconds=%.3f "
+            "audio_seconds=%.3f vad_used=%s load_seconds=%.3f inference_seconds=%.3f "
             "total_seconds=%.3f characters=%d",
             getattr(result, "language", "unknown"),
             getattr(result, "device", "unknown"),
             getattr(result, "compute_type", "unknown"),
             float(getattr(result, "audio_duration_seconds", 0.0) or 0.0),
+            job.vad_used is not False,
             float(getattr(timings, "model_load_seconds", 0.0) or 0.0),
             float(getattr(timings, "inference_seconds", 0.0) or 0.0),
             float(getattr(timings, "total_seconds", 0.0) or 0.0),
