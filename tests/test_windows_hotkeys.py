@@ -46,6 +46,16 @@ def test_ctrl_win_hold_starts_after_delay_and_stops_on_release() -> None:
     assert machine.process(key(VK_LWIN, False, 1.2)) == (HotkeyAction.HOLD_STOP,)
 
 
+def test_hold_candidate_and_abandoned_are_dispatched_without_changing_legacy_actions() -> None:
+    machine = HotkeyStateMachine(hold_delay_s=0.1)
+
+    assert machine.process(key(VK_LCONTROL, True, 1.0)) == ()
+    assert machine.process(key(VK_LWIN, True, 1.01)) == ()
+    assert machine.take_auxiliary_actions() == (HotkeyAction.HOLD_CANDIDATE,)
+    assert machine.process(key(VK_LWIN, False, 1.02)) == ()
+    assert machine.take_auxiliary_actions() == (HotkeyAction.HOLD_ABANDONED,)
+
+
 def test_modifier_release_after_deadline_cannot_start_a_stale_hold() -> None:
     machine = HotkeyStateMachine(hold_delay_s=0.1)
 

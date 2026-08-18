@@ -29,6 +29,8 @@ from .platform_support import hotkey_hint, input_adapter, is_macos
 LOGGER = logging.getLogger(__name__)
 _SETUP_MODELS = frozenset({"small", "medium", "turbo", "large-v3"})
 _SHORT_RECORDING_VAD_THRESHOLD_SECONDS = 15.0
+_PREPARE_CAPTURE_TIMEOUT_SECONDS = 1.5
+_PREPARE_CAPTURE_BUFFER_SECONDS = 2.0
 _MODEL_RETIRE_SECONDS: dict[str, float | None] = {
     "instant": None,
     "balanced": 300.0,
@@ -152,6 +154,7 @@ class _TranscriptionJob:
     released_at: float
     audio_finalize_seconds: float
     finalize_breakdown: dict[str, float]
+    prearmed: bool
     vad_used: bool | None
 
 
@@ -159,6 +162,7 @@ class _CaptureIntent(str, Enum):
     """Controller-owned intent, independent of a native stream's timing."""
 
     IDLE = "idle"
+    PREPARING = "preparing"
     STARTING = "starting"
     RECORDING = "recording"
     STOPPING = "stopping"
@@ -219,6 +223,8 @@ class DictationController:
         self._residency_timer: threading.Timer | None = None
         self._capture_generation = 0
         self._capture_intent = _CaptureIntent.IDLE
+        self._prepared_timeout: threading.Timer | None = None
+        self._recording_prearmed = False
         self._audio_commands: queue.Queue[_AudioCommand] = queue.Queue()
         self._audio_thread = threading.Thread(
             target=self._audio_worker,
@@ -472,12 +478,81 @@ class DictationController:
         self._audio_commands.put_nowait(command)
         return command
 
+    def _cancel_prepared_timeout_locked(self) -> None:
+        if self._prepared_timeout is not None:
+            self._prepared_timeout.cancel()
+            self._prepared_timeout = None
+
+    def prepare_capture(self) -> bool:
+        """Open a bounded, silent prearmed capture without changing UI state."""
+
+        with self._lock:
+            if (
+                self._closed
+                or self.state.active
+                or self._capture_intent is not _CaptureIntent.IDLE
+            ):
+                return False
+            self._capture_generation += 1
+            generation = self._capture_generation
+            self._capture_intent = _CaptureIntent.PREPARING
+            self._recording_prearmed = False
+            self._queue_audio(_AudioCommand(action="prepare", generation=generation))
+            return True
+
+    def abandon_prepared_capture(self) -> bool:
+        """Discard a prearmed microphone stream without visible lifecycle effects."""
+
+        with self._lock:
+            if self._capture_intent is not _CaptureIntent.PREPARING:
+                return False
+            recorder = self._recorder
+            self._capture_generation += 1
+            self._capture_intent = _CaptureIntent.IDLE
+            self._recorder = None
+            self._recording_prearmed = False
+            self._cancel_prepared_timeout_locked()
+            if recorder is not None:
+                self._queue_audio(
+                    _AudioCommand(
+                        action="cancel",
+                        generation=self._capture_generation,
+                        recorder=recorder,
+                    )
+                )
+        LOGGER.debug("prepared_capture_abandoned")
+        return True
+
+    def _expire_prepared_capture(self, generation: int, recorder: Any) -> None:
+        with self._lock:
+            if (
+                self._closed
+                or self._capture_generation != generation
+                or self._capture_intent is not _CaptureIntent.PREPARING
+                or self._recorder is not recorder
+            ):
+                return
+            self._capture_generation += 1
+            self._capture_intent = _CaptureIntent.IDLE
+            self._recorder = None
+            self._recording_prearmed = False
+            self._prepared_timeout = None
+            self._queue_audio(
+                _AudioCommand(
+                    action="cancel",
+                    generation=self._capture_generation,
+                    recorder=recorder,
+                )
+            )
+        LOGGER.debug("prepared_capture_timed_out")
+
     def _request_start_recording(self, *, target: Any | None) -> _AudioCommand | None:
         with self._warmup_status_gate:
             with self._lock:
                 if (
                     self._closed
-                    or self._capture_intent is not _CaptureIntent.IDLE
+                    or self._capture_intent
+                    not in {_CaptureIntent.IDLE, _CaptureIntent.PREPARING}
                     or self.state.active
                 ):
                     return None
@@ -489,10 +564,15 @@ class DictationController:
                 self._session_cancelled = threading.Event()
                 self._cancel_model_retirement_locked()
                 self.target = target
-                self._recorder = None
-                self._capture_generation += 1
+                prearmed = self._capture_intent is _CaptureIntent.PREPARING
+                if not prearmed:
+                    self._recorder = None
+                    self._capture_generation += 1
                 generation = self._capture_generation
                 self._capture_intent = _CaptureIntent.STARTING
+                self._recording_prearmed = prearmed
+                if prearmed:
+                    self._cancel_prepared_timeout_locked()
                 command = _AudioCommand(
                     action="start",
                     generation=generation,
@@ -596,6 +676,7 @@ class DictationController:
                 recorder = self._recorder
                 self._recorder = None
                 self._capture_intent = _CaptureIntent.IDLE
+                self._recording_prearmed = False
                 self.target = None
                 if self.state.active:
                     self.state = self.state.cancel(session_id).reset()
@@ -640,6 +721,8 @@ class DictationController:
             try:
                 if command.action == "start":
                     command.result = self._audio_start(command)
+                elif command.action == "prepare":
+                    command.result = self._audio_prepare(command)
                 elif command.action == "stop":
                     command.result = self._audio_stop(command)
                 elif command.action == "cancel":
@@ -661,6 +744,72 @@ class DictationController:
                     self._audio_close_complete.set()
                     self._maybe_signal_close_complete()
 
+    def _audio_prepare(self, command: _AudioCommand) -> bool:
+        with self._lock:
+            if (
+                self._closed
+                or self._capture_generation != command.generation
+                or self._capture_intent
+                not in {_CaptureIntent.PREPARING, _CaptureIntent.STARTING}
+            ):
+                return False
+
+        recorder: Any | None = None
+        try:
+            recorder = self._new_recorder()
+            with self._lock:
+                if (
+                    self._closed
+                    or self._capture_generation != command.generation
+                    or self._capture_intent
+                    not in {_CaptureIntent.PREPARING, _CaptureIntent.STARTING}
+                ):
+                    return False
+                self._recorder = recorder
+            recorder.prepare_capture(_PREPARE_CAPTURE_BUFFER_SECONDS)
+        except Exception as exc:
+            if recorder is not None:
+                self._audio_cancel(recorder)
+            with self._lock:
+                current = (
+                    not self._closed
+                    and self._capture_generation == command.generation
+                    and self._capture_intent
+                    in {_CaptureIntent.PREPARING, _CaptureIntent.STARTING}
+                    and self._recorder is recorder
+                )
+                if current:
+                    self._recorder = None
+                    self._recording_prearmed = False
+                    if self._capture_intent is _CaptureIntent.PREPARING:
+                        self._capture_intent = _CaptureIntent.IDLE
+            LOGGER.debug("prepared_capture_failed: %s", type(exc).__name__)
+            return False
+
+        with self._lock:
+            current = (
+                not self._closed
+                and self._capture_generation == command.generation
+                and self._recorder is recorder
+                and self._capture_intent
+                in {_CaptureIntent.PREPARING, _CaptureIntent.STARTING}
+            )
+            still_preparing = current and self._capture_intent is _CaptureIntent.PREPARING
+            if still_preparing:
+                timeout = threading.Timer(
+                    _PREPARE_CAPTURE_TIMEOUT_SECONDS,
+                    self._expire_prepared_capture,
+                    args=(command.generation, recorder),
+                )
+                timeout.daemon = True
+                self._prepared_timeout = timeout
+        if not current:
+            self._audio_cancel(recorder)
+            return False
+        if still_preparing:
+            timeout.start()
+        return True
+
     def _audio_start(self, command: _AudioCommand) -> bool:
         session_id = command.session_id
         assert session_id is not None
@@ -669,15 +818,26 @@ class DictationController:
                 return False
 
         recorder: Any | None = None
+        prearmed = False
         try:
-            # Construction is also off the caller thread because third-party
-            # recorder fakes/backends are free to probe native state here.
-            recorder = self._new_recorder()
             with self._lock:
                 if not self._capture_is_current_locked(command.generation, session_id):
                     return False
-                self._recorder = recorder
-            recorder.start()
+                recorder = self._recorder
+                prearmed = self._recording_prearmed and recorder is not None
+            if recorder is None:
+                # Construction is also off the caller thread because third-party
+                # recorder fakes/backends are free to probe native state here.
+                recorder = self._new_recorder()
+                with self._lock:
+                    if not self._capture_is_current_locked(command.generation, session_id):
+                        return False
+                    self._recorder = recorder
+            if prearmed:
+                if not recorder.activate_prepared_capture():
+                    raise AudioCaptureError("Prepared microphone capture is unavailable")
+            else:
+                recorder.start()
         except Exception as exc:
             if recorder is not None:
                 self._audio_cancel(recorder)
@@ -693,6 +853,7 @@ class DictationController:
                     self.state = self.state.fail(session_id, str(exc) or "Ошибка микрофона").reset()
                     self._capture_intent = _CaptureIntent.IDLE
                     self._recorder = None
+                    self._recording_prearmed = False
                     self.target = None
             if current and self._session_is_current(session_id):
                 self.status_callback("Ошибка микрофона", "error")
@@ -813,6 +974,7 @@ class DictationController:
             recorder = self._recorder
             cancelled = self._session_cancelled
             target = self.target
+            prearmed = self._recording_prearmed
             assert cancelled is not None
 
         finalize_started = time.perf_counter()
@@ -839,6 +1001,7 @@ class DictationController:
                         ).reset()
                     self._capture_intent = _CaptureIntent.IDLE
                     self._recorder = None
+                    self._recording_prearmed = False
                     self.target = None
             if current and self._session_is_current(session_id):
                 self.status_callback(text, status)
@@ -859,6 +1022,7 @@ class DictationController:
                 return False
             self._capture_intent = _CaptureIntent.IDLE
             self._recorder = None
+            self._recording_prearmed = False
             self.target = None
             self.state = self.state.begin_transcription(session_id)
             recording_duration = getattr(recording, "duration_seconds", None)
@@ -877,6 +1041,7 @@ class DictationController:
                 finalize_breakdown=dict(
                     getattr(recording, "finalize_breakdown", {}) or {}
                 ),
+                prearmed=prearmed,
                 vad_used=(
                     float(recording_duration) > _SHORT_RECORDING_VAD_THRESHOLD_SECONDS
                     if recording_duration is not None
@@ -1082,13 +1247,16 @@ class DictationController:
             LOGGER.info(
                 "dictation_pipeline_completed session=%d audio_finalize_seconds=%.3f "
                 "post_release_seconds=%.3f stream_stop_seconds=%.3f "
-                "assemble_seconds=%.3f postprocess_seconds=%.3f "
+                "assemble_seconds=%.3f first_frame_latency_seconds=%.3f prearmed=%s "
+                "postprocess_seconds=%.3f "
                 "insertion_seconds=%.3f",
                 job.session_id,
                 job.audio_finalize_seconds,
                 pipeline_seconds,
                 float(job.finalize_breakdown.get("stream_stop_seconds", 0.0)),
                 float(job.finalize_breakdown.get("assemble_seconds", 0.0)),
+                float(job.finalize_breakdown.get("first_frame_latency_seconds", 0.0)),
+                job.prearmed,
                 postprocess_seconds,
                 insertion_timing[0],
             )
@@ -1277,6 +1445,7 @@ class DictationController:
                 self._model_generation += 1
                 self._preload_enabled = False
                 self._cancel_model_retirement_locked()
+                self._cancel_prepared_timeout_locked()
                 if self._session_cancelled is not None:
                     self._session_cancelled.set()
                 recorder = self._recorder
@@ -1287,6 +1456,7 @@ class DictationController:
                 self.last_transcript = ""
                 self.target = None
                 self._recorder = None
+                self._recording_prearmed = False
                 # This cleanup runs after an active worker (and after any
                 # already queued model retirement), so close() stays
                 # non-blocking without racing native inference resources.

@@ -607,7 +607,11 @@ def main(argv: list[str] | None = None) -> int:
                 return
 
             def handle() -> None:
-                if action == HotkeyAction.START:
+                if action == getattr(HotkeyAction, "HOLD_CANDIDATE", None):
+                    controller.prepare_capture()
+                elif action == getattr(HotkeyAction, "HOLD_ABANDONED", None):
+                    controller.abandon_prepared_capture()
+                elif action == HotkeyAction.START:
                     controller.request_start_recording(
                         target=_snapshot_target(
                             strict_editable_check=config.strict_editable_check

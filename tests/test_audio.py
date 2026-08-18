@@ -392,8 +392,57 @@ def test_stop_reports_finalize_phase_timings(monkeypatch: pytest.MonkeyPatch) ->
     assert set(recording.finalize_breakdown) == {
         "stream_stop_seconds",
         "assemble_seconds",
+        "first_frame_latency_seconds",
     }
     assert all(seconds >= 0.0 for seconds in recording.finalize_breakdown.values())
+
+
+def test_prearmed_capture_keeps_prefix_and_bounds_its_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice()
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(
+        native_sample_rate=4,
+        target_sample_rate=4,
+        min_duration_seconds=0,
+        silence_rms_threshold=0,
+        max_duration_seconds=10,
+    )
+
+    recorder.prepare_capture(buffer_seconds=0.5)
+    recorder._audio_callback(np.array([[0.1]], dtype=np.float32), 1, {}, "")
+    recorder._audio_callback(np.array([[0.2]], dtype=np.float32), 1, {}, "")
+    recorder._audio_callback(np.array([[0.3]], dtype=np.float32), 1, {}, "")
+
+    assert recorder.retained_samples == 2
+    assert recorder.max_retained_samples == 2
+    assert recorder.activate_prepared_capture() is True
+    recorder._audio_callback(np.array([[0.4]], dtype=np.float32), 1, {}, "")
+    recording = recorder.stop()
+
+    assert recording.audio.tolist() == pytest.approx([0.2, 0.3, 0.4])
+    assert recording.finalize_breakdown["first_frame_latency_seconds"] >= 0.0
+
+
+def test_cancel_prearmed_capture_discards_the_bounded_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice()
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(
+        native_sample_rate=4,
+        target_sample_rate=4,
+        min_duration_seconds=0,
+        silence_rms_threshold=0,
+    )
+
+    recorder.prepare_capture(buffer_seconds=0.5)
+    recorder._audio_callback(np.array([[0.1]], dtype=np.float32), 1, {}, "")
+
+    assert recorder.cancel() is True
+    assert recorder.is_recording is False
+    assert recorder.retained_samples == 0
 
 
 def test_stop_rejects_short_and_silent_recordings(monkeypatch: pytest.MonkeyPatch) -> None:

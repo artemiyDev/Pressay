@@ -201,6 +201,7 @@ class _FinalizedCapture:
     limit_reached: bool
     retained_samples: int
     stop_signal_reason: str | None
+    first_frame_latency_seconds: float
 
 
 def _import_sounddevice() -> Any:
@@ -350,6 +351,9 @@ class AudioRecorder:
         self._stream_generation = 0
         self._active_stream_generation: int | None = None
         self._resolved_device: object | int | None = _UNRESOLVED_DEVICE
+        self._prearmed = False
+        self._first_frame_origin: float | None = None
+        self._first_frame_at: float | None = None
 
     @staticmethod
     def _default_input_index(sd: Any) -> int:
@@ -692,6 +696,11 @@ class AudioRecorder:
                     return
                 self._current_rms = rms
                 if chunk.size:
+                    if self._first_frame_at is None:
+                        self._first_frame_at = time.perf_counter()
+                    if self._prearmed:
+                        self._append_prearmed_chunk_locked(chunk)
+                        return
                     maximum = self._max_retained_samples
                     assert maximum is not None
                     remaining = max(0, maximum - self._retained_samples)
@@ -715,6 +724,29 @@ class AudioRecorder:
                         f"callback_error: {type(exc).__name__}"
                     )
                     self._set_stop_signal_locked("callback_error")
+
+    def _append_prearmed_chunk_locked(self, chunk: np.ndarray) -> None:
+        """Retain only the newest prefix-buffer samples without views of old PCM."""
+
+        maximum = self._max_retained_samples
+        assert maximum is not None
+        if chunk.size >= maximum:
+            self._chunks = [chunk[-maximum:].copy()]
+            self._retained_samples = maximum
+            return
+        self._chunks.append(chunk)
+        self._retained_samples += int(chunk.size)
+        excess = self._retained_samples - maximum
+        while excess > 0:
+            oldest = self._chunks[0]
+            if oldest.size <= excess:
+                self._chunks.pop(0)
+                self._retained_samples -= int(oldest.size)
+                excess -= int(oldest.size)
+            else:
+                self._chunks[0] = oldest[excess:].copy()
+                self._retained_samples -= excess
+                excess = 0
 
     def _set_stop_signal_locked(self, reason: str) -> None:
         if self._stop_signal_reason is None:
@@ -749,6 +781,9 @@ class AudioRecorder:
         self._finishing = False
         self._unexpected_stream_finished = False
         self._active_stream_generation = None
+        self._prearmed = False
+        self._first_frame_origin = None
+        self._first_frame_at = None
 
     def start(self) -> int:
         """Begin a fresh recording and return the native capture rate."""
@@ -757,6 +792,7 @@ class AudioRecorder:
             if self._recording:
                 raise AudioCaptureError("Recording is already active")
 
+        first_frame_origin = time.perf_counter()
         sd = _import_sounddevice()
         rate = self.prepare()
         stream: Any | None = None
@@ -787,6 +823,7 @@ class AudioRecorder:
                 self._stream = stream
                 self._active_stream_generation = generation
                 self._recording = True
+                self._first_frame_origin = first_frame_origin
             stream.start()
             return rate
         except Exception as exc:
@@ -801,6 +838,78 @@ class AudioRecorder:
                 except Exception:
                     pass
             raise AudioDeviceError("Could not start microphone capture") from exc
+
+    def prepare_capture(self, buffer_seconds: float = 2.0) -> int:
+        """Open the microphone into a bounded in-memory ring before a gesture resolves.
+
+        Prearmed PCM is never persisted or logged.  It is discarded by
+        :meth:`cancel` unless :meth:`activate_prepared_capture` adopts it as the
+        prefix of a real recording.
+        """
+
+        if buffer_seconds <= 0 or not np.isfinite(buffer_seconds):
+            raise ValueError("buffer_seconds must be positive and finite")
+        with self._lock:
+            if self._recording:
+                raise AudioCaptureError("Recording is already active")
+
+        first_frame_origin = time.perf_counter()
+        sd = _import_sounddevice()
+        rate = self.prepare()
+        stream: Any | None = None
+        with self._lock:
+            self._stream_generation += 1
+            generation = self._stream_generation
+        try:
+            stream = sd.InputStream(
+                **self._stream_kwargs(
+                    rate,
+                    lambda indata, frames, time_info, status: self._audio_callback(
+                        indata,
+                        frames,
+                        time_info,
+                        status,
+                        generation=generation,
+                    ),
+                    sd,
+                    finished_callback=lambda: self._stream_finished_callback(generation),
+                )
+            )
+            with self._lock:
+                self._reset_capture_locked()
+                self._max_retained_samples = max(1, int(rate * buffer_seconds))
+                self._stream = stream
+                self._active_stream_generation = generation
+                self._recording = True
+                self._prearmed = True
+                self._first_frame_origin = first_frame_origin
+            stream.start()
+            return rate
+        except Exception as exc:
+            with self._lock:
+                self._finishing = True
+                self._stream = None
+                self._recording = False
+                self._reset_capture_locked()
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            raise AudioDeviceError("Could not prepare microphone capture") from exc
+
+    def activate_prepared_capture(self) -> bool:
+        """Turn a prearmed stream into a recording while retaining its prefix."""
+
+        with self._lock:
+            if not self._recording or self._stream is None or not self._prearmed:
+                return False
+            self._prearmed = False
+            self._max_retained_samples = max(
+                self._retained_samples,
+                max(1, int((self._native_sample_rate or self.target_sample_rate) * self.max_duration_seconds)),
+            )
+            return True
 
     def _detach_stream_for_async_close(self) -> _FinalizedCapture:
         """Freeze capture state and release the stream for background closing."""
@@ -817,6 +926,12 @@ class AudioRecorder:
             limit_reached = self._duration_limit_reached
             retained_samples = self._retained_samples
             stop_signal_reason = self._stop_signal_reason
+            if self._first_frame_origin is None or self._first_frame_at is None:
+                first_frame_latency_seconds = 0.0
+            else:
+                first_frame_latency_seconds = max(
+                    0.0, self._first_frame_at - self._first_frame_origin
+                )
             self._chunks = []
             self._reset_capture_locked()
 
@@ -827,6 +942,7 @@ class AudioRecorder:
             limit_reached=limit_reached,
             retained_samples=retained_samples,
             stop_signal_reason=stop_signal_reason,
+            first_frame_latency_seconds=first_frame_latency_seconds,
         )
 
     def _close_stream_async(self, stream: Any) -> None:
@@ -939,6 +1055,7 @@ class AudioRecorder:
             finalize_breakdown={
                 "stream_stop_seconds": stream_stop_seconds,
                 "assemble_seconds": assemble_seconds,
+                "first_frame_latency_seconds": capture.first_frame_latency_seconds,
             },
         )
 

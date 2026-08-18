@@ -53,6 +53,8 @@ class HotkeyAction(str, Enum):
 
     HOLD_START = "hold_start"
     HOLD_STOP = "hold_stop"
+    HOLD_CANDIDATE = "hold_candidate"
+    HOLD_ABANDONED = "hold_abandoned"
     # Compatibility names used by the application controller.  Enum aliases
     # keep one canonical wire value while making the intent concise there.
     START = "hold_start"
@@ -250,6 +252,7 @@ class HotkeyStateMachine:
         self._hold_pending_since: Optional[float] = None
         self._hold_active = False
         self._suppress_hold_until_release = False
+        self._auxiliary_actions: list[HotkeyAction] = []
 
     @property
     def pressed_keys(self) -> frozenset[int]:
@@ -276,6 +279,18 @@ class HotkeyStateMachine:
         if chord is None or vk_code != chord.vk_code:
             return False
         return all(self._any_pressed(keys) for keys in chord.modifier_key_sets)
+
+    def _emit_auxiliary(self, action: HotkeyAction) -> None:
+        """Queue lifecycle-only actions without widening the legacy process tuple."""
+
+        self._auxiliary_actions.append(action)
+
+    def take_auxiliary_actions(self) -> tuple[HotkeyAction, ...]:
+        """Return candidate lifecycle actions for the hook dispatcher."""
+
+        actions = tuple(self._auxiliary_actions)
+        self._auxiliary_actions.clear()
+        return actions
 
     def process(self, event: KeyEvent) -> tuple[HotkeyAction, ...]:
         """Process one event, ignoring injected and auto-repeat events."""
@@ -304,6 +319,8 @@ class HotkeyStateMachine:
             if event.vk_code == VK_ESCAPE:
                 # Cancel owns the current recording lifecycle.  Suppression
                 # prevents a later modifier release from also issuing STOP.
+                if self._hold_pending_since is not None:
+                    self._emit_auxiliary(HotkeyAction.HOLD_ABANDONED)
                 self._hold_pending_since = None
                 self._hold_active = False
                 self._suppress_hold_until_release = is_hold_chord
@@ -346,12 +363,15 @@ class HotkeyStateMachine:
                 actions.append(HotkeyAction.TOGGLE)
             elif push_to_talk:
                 self._hold_pending_since = event.timestamp
+                self._emit_auxiliary(HotkeyAction.HOLD_CANDIDATE)
                 if self.hold_delay_s == 0:
                     self._hold_pending_since = None
                     self._hold_active = True
                     actions.append(HotkeyAction.HOLD_START)
 
         if was_hold_chord and not is_hold_chord:
+            if self._hold_pending_since is not None:
+                self._emit_auxiliary(HotkeyAction.HOLD_ABANDONED)
             self._hold_pending_since = None
             if self._hold_active:
                 self._hold_active = False
@@ -391,7 +411,14 @@ class HotkeyStateMachine:
     def shutdown(self) -> tuple[HotkeyAction, ...]:
         """Reset all state, stopping an active push-to-talk operation."""
 
-        actions = (HotkeyAction.HOLD_STOP,) if self._hold_active else ()
+        self._auxiliary_actions.clear()
+        if self._hold_active:
+            actions = (HotkeyAction.HOLD_STOP,)
+        elif self._hold_pending_since is not None:
+            self._emit_auxiliary(HotkeyAction.HOLD_ABANDONED)
+            actions = ()
+        else:
+            actions = ()
         self._pressed.clear()
         self._hold_pending_since = None
         self._hold_active = False
@@ -868,7 +895,10 @@ class WindowsHotkeyService:
                 if item is _STOP:
                     break
                 if item is _RESET_MACHINE:
-                    for action in self._machine.shutdown():
+                    for action in (
+                        *self._machine.shutdown(),
+                        *self._machine.take_auxiliary_actions(),
+                    ):
                         self._emit(action)
                     self._publish_pressed_snapshot()
                     continue
@@ -878,10 +908,13 @@ class WindowsHotkeyService:
                     else self._machine.flush_due()
                 )
                 self._publish_pressed_snapshot()
-                for action in actions:
+                for action in (*self._machine.take_auxiliary_actions(), *actions):
                     self._emit(action)
         finally:
-            for action in self._machine.shutdown():
+            for action in (
+                *self._machine.shutdown(),
+                *self._machine.take_auxiliary_actions(),
+            ):
                 self._emit(action)
             self._publish_pressed_snapshot()
 

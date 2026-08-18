@@ -63,6 +63,40 @@ class FakeRecorder:
         return was
 
 
+class PrearmedRecorder(FakeRecorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepared = threading.Event()
+        self.activated = threading.Event()
+        self.cancelled = threading.Event()
+
+    def prepare_capture(self, _buffer_seconds: float) -> int:
+        self.is_recording = True
+        self.prepared.set()
+        return 16_000
+
+    def activate_prepared_capture(self) -> bool:
+        self.activated.set()
+        return True
+
+    def cancel(self) -> bool:
+        self.cancelled.set()
+        return super().cancel()
+
+    def stop(self) -> SimpleNamespace:
+        self.is_recording = False
+        return SimpleNamespace(
+            audio=np.ones(8_000, dtype=np.float32) * 0.1,
+            duration_seconds=0.5,
+            limit_reached=False,
+            finalize_breakdown={
+                "stream_stop_seconds": 0.0,
+                "assemble_seconds": 0.0,
+                "first_frame_latency_seconds": 0.01,
+            },
+        )
+
+
 class DurationRecorder(FakeRecorder):
     def __init__(self, duration_seconds: float) -> None:
         super().__init__()
@@ -490,6 +524,59 @@ def test_pipeline_log_reports_full_delay_breakdown(monkeypatch, caplog) -> None:
         "insertion_seconds=",
     ):
         assert key in pipeline_log
+    controller.close()
+
+
+def test_prepared_capture_is_reused_and_reported_in_pipeline_log(caplog) -> None:
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = PrearmedRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    caplog.set_level(logging.INFO, logger="pressay.controller")
+
+    assert controller.prepare_capture() is True
+    assert controller.start_recording(target="window") is True
+    assert recorder.prepared.is_set()
+    assert recorder.activated.is_set()
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    pipeline_log = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("dictation_pipeline_completed")
+    )
+    assert "first_frame_latency_seconds=0.010" in pipeline_log
+    assert "prearmed=True" in pipeline_log
+    controller.close()
+
+
+def test_abandoned_prepared_capture_closes_then_allows_a_new_prepare_cycle() -> None:
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    first = PrearmedRecorder()
+    second = PrearmedRecorder()
+    recorders = iter((first, second))
+    controller._new_recorder = lambda: next(recorders)  # type: ignore[method-assign]
+
+    assert controller.prepare_capture() is True
+    assert first.prepared.wait(timeout=2)
+    assert controller.abandon_prepared_capture() is True
+    assert first.cancelled.wait(timeout=2)
+    assert controller.prepare_capture() is True
+    assert second.prepared.wait(timeout=2)
+    assert controller.abandon_prepared_capture() is True
+    assert second.cancelled.wait(timeout=2)
     controller.close()
 
 
