@@ -580,6 +580,8 @@ def test_describe_focus_reports_none_for_missing_fingerprint() -> None:
         "keyboard_focusable": None,
         "value_writable": None,
         "text_editable": None,
+        "caret_active": None,
+        "win32_caret": None,
     }
     assert describe_focus(target) == expected
     assert describe_focus(None) == expected
@@ -599,6 +601,8 @@ def test_describe_focus_reports_uia_control_type() -> None:
         "keyboard_focusable": True,
         "value_writable": True,
         "text_editable": False,
+        "caret_active": False,
+        "win32_caret": False,
     }
 
 
@@ -616,6 +620,8 @@ def test_describe_focus_reports_win32_focus_without_control_type() -> None:
         "keyboard_focusable": None,
         "value_writable": None,
         "text_editable": None,
+        "caret_active": False,
+        "win32_caret": False,
     }
 
 
@@ -631,7 +637,77 @@ def test_describe_focus_keeps_reporting_the_unavailable_sentinel_tag() -> None:
         "keyboard_focusable": None,
         "value_writable": None,
         "text_editable": None,
+        "caret_active": None,
+        "win32_caret": None,
     }
+
+
+@pytest.mark.parametrize("control_type", (50033, 50026))
+@pytest.mark.parametrize("strict", (False, True))
+def test_active_uia_caret_allows_non_toggle_controls_in_both_modes(
+    control_type: int, strict: bool
+) -> None:
+    target = ForegroundTarget(
+        hwnd=100,
+        pid=200,
+        focused_control=(
+            "uia", 200, 1, 2, "field", "Custom", control_type,
+            True, False, False, False, True, False,
+        ),
+    )
+
+    assert target_looks_editable(target, strict=strict) is True
+
+
+@pytest.mark.parametrize("control_type", (50002, 50013))
+def test_active_uia_caret_does_not_allow_toggle_controls(control_type: int) -> None:
+    target = ForegroundTarget(
+        hwnd=100,
+        pid=200,
+        focused_control=(
+            "uia", 200, 1, 2, "field", "Toggle", control_type,
+            True, True, True, True, True, False,
+        ),
+    )
+
+    assert target_looks_editable(target) is False
+    assert target_looks_editable(target, strict=True) is False
+
+
+@pytest.mark.parametrize("strict", (False, True))
+def test_win32_caret_allows_text_in_both_modes(strict: bool) -> None:
+    target = ForegroundTarget(
+        hwnd=100,
+        pid=200,
+        focused_control=("win32_focus", 200, 222, "Custom", False, True),
+    )
+
+    assert target_looks_editable(target, strict=strict) is True
+
+
+def test_parse_old_fingerprints_default_new_caret_evidence_to_false() -> None:
+    uia = parse_focus_fingerprint(_uia_fingerprint())
+    win32 = parse_focus_fingerprint(("win32_focus", 200, 222, "Edit"))
+
+    assert uia is not None and (uia.caret_active, uia.win32_caret) == (False, False)
+    assert win32 is not None and (win32.caret_active, win32.win32_caret) == (False, False)
+
+
+def test_uia_fingerprint_records_active_textpattern2_caret() -> None:
+    class Control(_FakeUIAControl):
+        @staticmethod
+        def GetPattern(pattern_id: int) -> object | None:
+            if pattern_id == 10024:
+                return SimpleNamespace(GetCaretRange=lambda: (True, object()))
+            return _FakeUIAControl.GetPattern(pattern_id)
+
+    class Automation(_FakeUIAutomation):
+        def GetFocusedControl(self) -> Control:
+            return Control()
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(Automation(), 200)
+
+    assert fingerprint[-2:] == (True, False)
 
 
 def test_press_enter_only_sends_enter_to_same_target() -> None:

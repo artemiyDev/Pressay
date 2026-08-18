@@ -116,6 +116,8 @@ def test_describe_focus_exposes_uia_evidence_and_macos_uses_none() -> None:
         "keyboard_focusable": False,
         "value_writable": True,
         "text_editable": False,
+        "caret_active": False,
+        "win32_caret": False,
     }
     assert describe_macos_focus(None) == {
         "focus_kind": "none",
@@ -124,6 +126,8 @@ def test_describe_focus_exposes_uia_evidence_and_macos_uses_none() -> None:
         "keyboard_focusable": None,
         "value_writable": None,
         "text_editable": None,
+        "caret_active": None,
+        "win32_caret": None,
     }
 
 

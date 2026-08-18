@@ -321,6 +321,14 @@ class _UIAFingerprintWorker:
         # TextPattern is also exposed by read-only documents. TextEditPattern
         # is the positive UIA capability for an interactive rich-text editor.
         text_editable = pattern(int(pattern_ids.TextEditPattern)) is not None
+        caret_active = False
+        text_pattern2 = pattern(10024)  # UIA_TextPattern2Id
+        if text_pattern2 is not None:
+            try:
+                caret_range = text_pattern2.GetCaretRange()  # type: ignore[attr-defined]
+                caret_active = bool(caret_range[0])
+            except Exception:
+                pass
         return (
             "uia",
             process_id,
@@ -332,6 +340,8 @@ class _UIAFingerprintWorker:
             keyboard_focusable,
             value_writable,
             text_editable,
+            caret_active,
+            False,
         )
 
     def _run(self) -> None:
@@ -388,8 +398,8 @@ class FocusFingerprint:
     """Named view over the opaque tuple written by the two focus probes.
 
     Fields not present in a given ``kind``'s tuple format stay ``None``
-    rather than a guessed default, so callers can tell "not evidenced" apart
-    from "evidenced false".
+    rather than a guessed default, except caret evidence added after the
+    original tuple formats, which defaults to ``False`` for compatibility.
     """
 
     kind: str  # "uia" or "win32_focus"
@@ -400,6 +410,8 @@ class FocusFingerprint:
     value_writable: bool | None = None
     text_editable: bool | None = None
     class_name: str | None = None
+    caret_active: bool = False
+    win32_caret: bool = False
 
 
 def parse_focus_fingerprint(
@@ -421,17 +433,22 @@ def parse_focus_fingerprint(
             kind="win32_focus",
             process_id=int(fingerprint[1]) if len(fingerprint) > 1 else 0,
             class_name=str(fingerprint[3]) if len(fingerprint) > 3 else None,
+            caret_active=bool(fingerprint[4]) if len(fingerprint) > 4 else False,
+            win32_caret=bool(fingerprint[5]) if len(fingerprint) > 5 else False,
         )
     if kind == "uia" and len(fingerprint) >= 10:
+        evidence_offset = 2 if len(fingerprint) >= 12 else 0
         return FocusFingerprint(
             kind="uia",
             process_id=int(fingerprint[1]),
-            control_type=int(fingerprint[-5]),
-            enabled=bool(fingerprint[-4]),
-            keyboard_focusable=bool(fingerprint[-3]),
-            value_writable=bool(fingerprint[-2]),
-            text_editable=bool(fingerprint[-1]),
-            class_name=str(fingerprint[-6]),
+            control_type=int(fingerprint[-5 - evidence_offset]),
+            enabled=bool(fingerprint[-4 - evidence_offset]),
+            keyboard_focusable=bool(fingerprint[-3 - evidence_offset]),
+            value_writable=bool(fingerprint[-2 - evidence_offset]),
+            text_editable=bool(fingerprint[-1 - evidence_offset]),
+            class_name=str(fingerprint[-6 - evidence_offset]),
+            caret_active=bool(fingerprint[-2]) if evidence_offset else False,
+            win32_caret=bool(fingerprint[-1]) if evidence_offset else False,
         )
     return None
 
@@ -447,7 +464,11 @@ def target_looks_editable(target: ForegroundTarget, *, strict: bool = False) -> 
     if not parsed.enabled:
         return False
     # Toggle controls can report a writable value for their state, never text.
-    if parsed.text_editable and parsed.control_type not in {50002, 50013}:
+    if parsed.control_type in {50002, 50013}:
+        return False
+    if parsed.caret_active or parsed.win32_caret:
+        return True
+    if parsed.text_editable:
         return True
     if (
         parsed.control_type in {50004, 50030, 50025}
@@ -478,6 +499,8 @@ def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
         ),
         "value_writable": parsed.value_writable if parsed is not None else None,
         "text_editable": parsed.text_editable if parsed is not None else None,
+        "caret_active": parsed.caret_active if parsed is not None else None,
+        "win32_caret": parsed.win32_caret if parsed is not None else None,
     }
 
 
@@ -1066,6 +1089,7 @@ def _native_focused_control_fingerprint(
     info.cbSize = api.ctypes.sizeof(api.GUITHREADINFO)
     if not api.user32.GetGUIThreadInfo(foreground_thread_id, api.ctypes.byref(info)):
         return None
+    win32_caret = bool(info.hwndCaret)
     focus_hwnd = int(info.hwndFocus or 0)
     if not focus_hwnd or focus_hwnd == foreground_hwnd:
         return None
@@ -1097,12 +1121,13 @@ def _native_focused_control_fingerprint(
         style = int(api.user32.GetWindowLongW(info.hwndFocus, -16)) & 0xFFFFFFFF
         if style & 0x0800:
             return _FOCUS_UNAVAILABLE
-        return (
+        fingerprint: tuple[object, ...] = (
             "win32_focus",
             process_id,
             focus_hwnd,
             class_name,
         )
+        return (*fingerprint, False, True) if win32_caret else fingerprint
 
     known_non_text = (
         normalized_class.startswith("button")
@@ -1119,6 +1144,18 @@ def _native_focused_control_fingerprint(
     # Unknown child HWND classes may be custom text surfaces. UIA provides the
     # capability evidence needed to decide safely.
     return None
+
+
+def _win32_caret_present(
+    api: SimpleNamespace, *, foreground_thread_id: int
+) -> bool:
+    if foreground_thread_id <= 0:
+        return False
+    info = api.GUITHREADINFO()
+    info.cbSize = api.ctypes.sizeof(api.GUITHREADINFO)
+    if not api.user32.GetGUIThreadInfo(foreground_thread_id, api.ctypes.byref(info)):
+        return False
+    return bool(info.hwndCaret)
 
 
 class Win32InputBackend:
@@ -1146,11 +1183,16 @@ class Win32InputBackend:
             foreground_thread_id=foreground_thread_id,
             process_id=int(process_id.value),
         )
-        focused_control = (
-            native_focus
-            if native_focus is not None
-            else _uia_focused_control_fingerprint(int(process_id.value))
-        )
+        if native_focus is None:
+            uia_focus = _uia_focused_control_fingerprint(int(process_id.value))
+            if uia_focus and uia_focus[0] == "uia" and len(uia_focus) >= 12:
+                focused_control = (*uia_focus[:-1], _win32_caret_present(
+                    api, foreground_thread_id=foreground_thread_id
+                ))
+            else:
+                focused_control = uia_focus
+        else:
+            focused_control = native_focus
         return ForegroundTarget(
             hwnd=hwnd,
             pid=int(process_id.value),

@@ -407,12 +407,14 @@ def _snapshot_target(*, strict_editable_check: bool = False) -> Any | None:
                 "keyboard_focusable": None,
                 "value_writable": None,
                 "text_editable": None,
+                "caret_active": None,
+                "win32_caret": None,
             }
         )
         LOGGER.info(
             "recording_target_captured valid=%s editable=%s hwnd=%s pid=%s "
             "focus_kind=%s control_type=%s enabled=%s focusable=%s "
-            "value_writable=%s text_editable=%s",
+            "value_writable=%s text_editable=%s caret=%s win32_caret=%s",
             bool(getattr(target, "is_valid", False)),
             adapter.target_looks_editable(target, strict=strict_editable_check),
             int(getattr(target, "hwnd", 0) or 0),
@@ -423,6 +425,8 @@ def _snapshot_target(*, strict_editable_check: bool = False) -> Any | None:
             focus_info.get("keyboard_focusable"),
             focus_info.get("value_writable"),
             focus_info.get("text_editable"),
+            focus_info.get("caret_active"),
+            focus_info.get("win32_caret"),
         )
         return target
     except Exception as exc:

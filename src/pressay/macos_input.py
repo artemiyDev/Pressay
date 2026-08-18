@@ -119,6 +119,8 @@ def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
         "keyboard_focusable": None,
         "value_writable": None,
         "text_editable": None,
+        "caret_active": None,
+        "win32_caret": None,
     }
 
 
