@@ -18,6 +18,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from . import hotkey_bindings
+from . import __version__
 from .audio import AudioCaptureError, AudioRecorder, normalize_device_selector
 from .config import AppConfig, ConfigError
 from .controller import DictationController
@@ -700,7 +701,14 @@ def main(argv: list[str] | None = None) -> int:
         window.update_status("Ошибка config.json — автовставка отключена", "error")
         tray.update_state("Ошибка config.json — автовставка отключена", "error")
         tray.notify("Pressay", config_load.warning, warning=True)
-    LOGGER.info("application_started")
+    # Record which source tree is actually running: several shortcuts have
+    # pointed at stale copies of the project, and a stale copy is otherwise
+    # indistinguishable in the log from the current one.
+    LOGGER.info(
+        "application_started version=%s package=%s",
+        __version__,
+        Path(__file__).resolve().parent,
+    )
     exit_code = int(app.exec())
     LOGGER.info("application_exited code=%d", exit_code)
     return exit_code
