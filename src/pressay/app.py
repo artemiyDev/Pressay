@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 from dataclasses import dataclass
 import logging
@@ -22,6 +22,7 @@ from . import __version__
 from .audio import AudioCaptureError, AudioRecorder, normalize_device_selector
 from .config import AppConfig, ConfigError
 from .controller import DictationController
+from .hotkey_coordinator import _WindowsHotkeyCoordinator
 from .ui import MicrophoneChoice, SettingsWindow, StatusOverlay, TrayController, UiSignals
 from .platform_support import input_adapter, is_macos, is_windows, user_data_directory
 
@@ -136,6 +137,38 @@ class _InputActionWorker:
         self._executor.shutdown(wait=False)
 
 
+def _save_settings_transaction(
+    updated: AppConfig,
+    coordinator: _WindowsHotkeyCoordinator | None,
+    *,
+    previous_hotkeys: Any,
+    before_hotkey_change: Callable[[], Any],
+    on_applied: Callable[[AppConfig], None],
+    on_failed: Callable[[BaseException], None],
+) -> Future[bool] | None:
+    """Persist only through the serialized runtime-hotkey commit path."""
+
+    if coordinator is not None:
+        return coordinator.request_change(
+            updated.hotkeys,
+            before_replace=(
+                before_hotkey_change
+                if updated.hotkeys != previous_hotkeys
+                else None
+            ),
+            persist=updated.save,
+            on_applied=lambda: on_applied(updated),
+            on_failed=on_failed,
+        )
+    try:
+        updated.save()
+    except ConfigError as exc:
+        on_failed(exc)
+        return None
+    on_applied(updated)
+    return None
+
+
 def _configure_logging() -> None:
     base = user_data_directory()
     try:
@@ -227,13 +260,20 @@ def _start_native_shutdown(
             controller_call_done.set()
 
     def stop_hotkeys() -> None:
+        stopped_cleanly = hotkey_service is None
         try:
             if hotkey_service is not None:
-                hotkey_service.stop()
+                stopped_cleanly = hotkey_service.stop() is not False
+                if not stopped_cleanly:
+                    LOGGER.error("hotkey_stop_incomplete")
         except Exception:
             LOGGER.exception("hotkey_stop_failed")
         finally:
-            hotkey_done.set()
+            # An explicit False means the service retained live native threads
+            # for background cleanup.  Do not declare shutdown complete: the
+            # process watchdog remains the final bound for an orphaned hook.
+            if stopped_cleanly:
+                hotkey_done.set()
 
     controller_thread = threading.Thread(
         target=close_controller,
@@ -531,13 +571,23 @@ def main(argv: list[str] | None = None) -> int:
     signals.paste_last_requested.connect(lambda: input_worker.submit(controller.paste_last))
     signals.copy_last_requested.connect(lambda: input_worker.submit(controller.copy_last))
 
-    # Filled in once the hotkey service exists; empty when it failed to start.
-    hotkey_restart: dict[str, Any] = {}
+    hotkey_coordinator: _WindowsHotkeyCoordinator | None = None
 
-    def save_settings(values: dict[str, Any]) -> None:
+    def apply_saved_settings(updated: AppConfig) -> None:
         nonlocal config
         previous_resource_mode = config.resource_mode
-        previous_hotkeys = config.hotkeys
+        config = updated
+        controller.update_config(config)
+        if previous_resource_mode == "eco" and config.resource_mode != "eco":
+            controller.warmup_model()
+        window.update_status("Настройки сохранены", "success")
+
+    def report_settings_failure(error: BaseException) -> None:
+        message = f"Не удалось применить настройки: {error}"
+        window.update_status(message, "error")
+        tray.notify("Pressay", message, warning=True)
+
+    def save_settings(values: dict[str, Any]) -> None:
         microphone = values.get("microphone")
         try:
             hotkeys = hotkey_bindings.from_mapping(
@@ -567,21 +617,16 @@ def main(argv: list[str] | None = None) -> int:
             replacements=dict(values.get("replacements", config.replacements)),
             hotkeys=hotkeys,
         )
-        try:
-            updated.save()
-        except ConfigError as exc:
-            # Keep the previous config in memory: a failed write must not leave
-            # the running app on settings that were never persisted.
-            tray.notify("Pressay", str(exc), warning=True)
-            return
-        config = updated
-        controller.update_config(config)
-        if previous_resource_mode == "eco" and config.resource_mode != "eco":
-            controller.warmup_model()
-        restart_hotkeys = hotkey_restart.get("restart")
-        if hotkeys != previous_hotkeys and restart_hotkeys is not None:
-            restart_hotkeys(hotkeys)
-        window.update_status("Настройки сохранены", "success")
+        if hotkey_coordinator is not None:
+            window.update_status("Применяю настройки…", "processing")
+        _save_settings_transaction(
+            updated,
+            hotkey_coordinator,
+            previous_hotkeys=config.hotkeys,
+            before_hotkey_change=controller.request_cancel,
+            on_applied=apply_saved_settings,
+            on_failed=report_settings_failure,
+        )
 
     signals.save_requested.connect(save_settings)
 
@@ -604,7 +649,10 @@ def main(argv: list[str] | None = None) -> int:
 
             hotkey_type = WindowsHotkeyService
 
-        def hotkey_callback(action: Any) -> bool | None:
+        def hotkey_callback(
+            action: Any,
+            still_current: Callable[[], bool] = lambda: True,
+        ) -> bool | None:
             # Quartz must decide whether to suppress Esc before its event-tap
             # callback returns. Other actions keep their existing async path.
             if is_macos() and action == HotkeyAction.CANCEL:
@@ -620,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
                 return
 
             def handle() -> None:
+                if not still_current():
+                    return
                 if action == getattr(HotkeyAction, "HOLD_CANDIDATE", None):
                     controller.prepare_capture()
                 elif action == getattr(HotkeyAction, "HOLD_ABANDONED", None):
@@ -639,44 +689,20 @@ def main(argv: list[str] | None = None) -> int:
 
             dispatch_ui(handle)
 
-        # macOS chords are still fixed, so only the Windows service is
-        # configurable; passing bindings it does not accept would break it.
-        hotkey_kwargs = {} if is_macos() else {"bindings": config.hotkeys}
-        hotkey_service = hotkey_type(hotkey_callback, **hotkey_kwargs)
-        hotkey_service.start()
-
-        if not is_macos():
-
-            def restart_hotkeys(bindings: Any) -> None:
-                """Swap the keyboard hook for one bound to the new chords.
-
-                Runs off the Qt thread: stopping the service joins the hook,
-                dispatcher and watchdog threads, which must not freeze the
-                settings window.
-                """
-
-                def swap() -> None:
-                    nonlocal hotkey_service
-                    try:
-                        if hotkey_service is not None:
-                            hotkey_service.stop()
-                        service = hotkey_type(hotkey_callback, bindings=bindings)
-                        service.start()
-                        hotkey_service = service
-                    except Exception as exc:
-                        LOGGER.exception("hotkey_restart_failed")
-                        notification_callback(
-                            "Pressay",
-                            f"Не удалось применить новые клавиши: {exc}. "
-                            "Перезапустите Pressay.",
-                            True,
-                        )
-
-                threading.Thread(
-                    target=swap, name="pressay-hotkey-swap", daemon=True
-                ).start()
-
-            hotkey_restart["restart"] = restart_hotkeys
+        if is_macos():
+            hotkey_service = hotkey_type(hotkey_callback)
+            hotkey_service.start()
+        else:
+            hotkey_coordinator = _WindowsHotkeyCoordinator(
+                hotkey_type,
+                hotkey_callback,
+                dispatch_ui,
+                config.hotkeys,
+            )
+            hotkey_coordinator.start()
+            # Native shutdown owns the stable coordinator so an in-flight
+            # candidate cannot appear after a captured service was stopped.
+            hotkey_service = hotkey_coordinator
     except Exception as exc:
         LOGGER.exception("hotkey_service_failed")
         tray.notify("Pressay", f"Глобальные клавиши недоступны: {exc}", warning=True)

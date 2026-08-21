@@ -646,6 +646,7 @@ class WindowsHotkeyService:
             for action, action_callback in callbacks.items():
                 self._callbacks[HotkeyAction(action)].append(action_callback)
         self._callback_lock = threading.RLock()
+        self._callbacks_enabled = True
         self._machine = HotkeyStateMachine(
             hold_delay_s=hold_delay_s, bindings=self.bindings
         )
@@ -661,6 +662,9 @@ class WindowsHotkeyService:
         self._hook_proc: object | None = None
         self._startup_error: Optional[BaseException] = None
         self._lifecycle_lock = threading.RLock()
+        self._stopped = threading.Event()
+        self._stopped.set()
+        self._cleanup_thread: Optional[threading.Thread] = None
         # Snapshot of watched modifiers the state machine currently believes
         # are pressed, paired with when that set last changed.  Only the
         # dispatcher thread writes it (by reassigning the tuple, which is
@@ -692,16 +696,45 @@ class WindowsHotkeyService:
             if callback in callbacks:
                 callbacks.remove(callback)
 
+    def retire_callbacks(self) -> None:
+        """Prevent new callback dispatch while admitted callbacks finish."""
+
+        with self._callback_lock:
+            self._callbacks_enabled = False
+
+    def wait_stopped(self, timeout_s: float | None = None) -> bool:
+        """Wait for deferred native-thread cleanup without dropping ownership."""
+
+        return self._stopped.wait(timeout_s)
+
     def start(self, timeout_s: float = 3.0) -> None:
         """Start dispatcher and hook threads, or raise a descriptive error."""
 
         with self._lifecycle_lock:
             if self.is_running:
                 return
+            owned_threads = (
+                self._hook_thread,
+                self._dispatch_thread,
+                self._watchdog_thread,
+            )
+            cleanup_alive = (
+                self._cleanup_thread is not None
+                and self._cleanup_thread.is_alive()
+            )
+            if cleanup_alive or any(
+                thread is not None and thread.is_alive() for thread in owned_threads
+            ):
+                raise WindowsHotkeyError(
+                    "Previous keyboard hook threads are still stopping"
+                )
             if not windows_hotkeys_available():
                 raise WindowsHotkeyUnavailable(
                     "Pressay global hotkeys require Windows"
                 )
+            with self._callback_lock:
+                self._callbacks_enabled = True
+            self._stopped.clear()
             self._ready.clear()
             self._stop_requested.clear()
             self._startup_error = None
@@ -739,6 +772,9 @@ class WindowsHotkeyService:
         if not self._ready.wait(timeout_s):
             self.stop()
             raise WindowsHotkeyError("Timed out while installing the keyboard hook")
+        if self._stop_requested.is_set():
+            self.stop()
+            raise WindowsHotkeyError("Keyboard hook stopped during startup")
         if self._startup_error is not None:
             error = self._startup_error
             self.stop()
@@ -746,40 +782,95 @@ class WindowsHotkeyService:
                 raise error
             raise WindowsHotkeyError("Could not install the keyboard hook") from error
 
-    def stop(self, timeout_s: float = 3.0) -> None:
-        """Stop the Win32 message loop and drain the dispatcher safely."""
+    def _post_quit_locked(self) -> None:
+        api = self._api
+        thread_id = self._hook_thread_id
+        if api is not None and thread_id is not None:
+            # The hook thread creates its queue with PeekMessage before it
+            # announces readiness, so PostThreadMessage is reliable here.
+            api.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
 
+    def _owned_threads_locked(self) -> tuple[threading.Thread, ...]:
+        return tuple(
+            thread
+            for thread in (
+                self._watchdog_thread,
+                self._hook_thread,
+                self._dispatch_thread,
+            )
+            if thread is not None
+        )
+
+    def _finalize_stopped_locked(self) -> bool:
+        if any(thread.is_alive() for thread in self._owned_threads_locked()):
+            return False
+        self._hook_thread = None
+        self._dispatch_thread = None
+        self._watchdog_thread = None
+        self._watchdog = None
+        self._hook_thread_id = None
+        self._hook_handle = None
+        self._hook_proc = None
+        self._api = None
+        self._stopped.set()
+        return True
+
+    def _cleanup_until_stopped(self) -> None:
+        """Keep ownership while a timed-out native thread finishes stopping."""
+
+        current = threading.current_thread()
+        while True:
+            with self._lifecycle_lock:
+                self._post_quit_locked()
+                threads = self._owned_threads_locked()
+            for thread in threads:
+                if thread is not current:
+                    thread.join(0.1)
+            with self._lifecycle_lock:
+                if not any(thread.is_alive() for thread in self._owned_threads_locked()):
+                    if self._cleanup_thread is current:
+                        self._cleanup_thread = None
+                if self._finalize_stopped_locked():
+                    return
+
+    def _ensure_cleanup_thread_locked(self) -> None:
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            return
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_until_stopped,
+            name="PressayHotkeyCleanup",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
+
+    def stop(self, timeout_s: float = 3.0) -> bool:
+        """Request shutdown under one deadline, retaining any live threads.
+
+        A False result means cleanup continues on ``PressayHotkeyCleanup``;
+        callers must not start a replacement hook until ``wait_stopped()`` is
+        true.
+        """
+
+        self.retire_callbacks()
+        deadline = time.monotonic() + max(0.0, timeout_s)
         with self._lifecycle_lock:
             self._stop_requested.set()
             self._watchdog_stop.set()
-            api = self._api
-            thread_id = self._hook_thread_id
-            if api is not None and thread_id is not None:
-                # The hook thread creates its queue with PeekMessage before it
-                # announces readiness, so PostThreadMessage is reliable here.
-                api.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
-            hook_thread = self._hook_thread
-            dispatch_thread = self._dispatch_thread
-            watchdog_thread = self._watchdog_thread
+            self._post_quit_locked()
+            self._events.put(_STOP)
+            threads = self._owned_threads_locked()
 
         current = threading.current_thread()
-        if watchdog_thread is not None and watchdog_thread is not current:
-            watchdog_thread.join(timeout_s)
-        if hook_thread is not None and hook_thread is not current:
-            hook_thread.join(timeout_s)
-        self._events.put(_STOP)
-        if dispatch_thread is not None and dispatch_thread is not current:
-            dispatch_thread.join(timeout_s)
+        for thread in threads:
+            if thread is current:
+                continue
+            thread.join(max(0.0, deadline - time.monotonic()))
 
         with self._lifecycle_lock:
-            self._hook_thread = None
-            self._dispatch_thread = None
-            self._watchdog_thread = None
-            self._watchdog = None
-            self._hook_thread_id = None
-            self._hook_handle = None
-            self._hook_proc = None
-            self._api = None
+            if self._finalize_stopped_locked():
+                return True
+            self._ensure_cleanup_thread_locked()
+            return False
 
     def __enter__(self) -> "WindowsHotkeyService":
         self.start()
@@ -868,6 +959,8 @@ class WindowsHotkeyService:
 
     def _emit(self, action: HotkeyAction) -> None:
         with self._callback_lock:
+            if not self._callbacks_enabled:
+                return
             general = self._callback
             specific = tuple(self._callbacks[action])
         try:
@@ -879,7 +972,9 @@ class WindowsHotkeyService:
             try:
                 callback()
             except Exception:
-                LOG.exception("Pressay hotkey callback failed for %s", action.value)
+                LOG.exception(
+                    "Pressay hotkey callback failed for %s", action.value
+                )
 
     def _dispatch_loop(self) -> None:
         try:

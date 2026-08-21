@@ -7,6 +7,8 @@ import time
 from types import SimpleNamespace
 from typing import Callable
 
+import pytest
+
 from pressay.windows_hotkeys import (
     HotkeyAction,
     HotkeyStateMachine,
@@ -19,6 +21,7 @@ from pressay.windows_hotkeys import (
     VK_SPACE,
     VK_X,
     VK_Z,
+    WindowsHotkeyError,
     WindowsHotkeyService,
     _HookKeySuppressor,
     _HookWatchdog,
@@ -406,6 +409,95 @@ def test_stop_before_start_is_a_safe_no_op_for_the_watchdog() -> None:
 
     assert service._watchdog is None
     assert service._watchdog_thread is None
+
+
+def test_stop_timeout_retains_live_thread_until_background_cleanup() -> None:
+    service = WindowsHotkeyService()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_hook() -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+
+    hook_thread = threading.Thread(target=blocking_hook, daemon=True)
+    service._hook_thread = hook_thread
+    service._stopped.clear()
+    hook_thread.start()
+    assert entered.wait(timeout=1)
+
+    started_at = time.monotonic()
+    assert service.stop(timeout_s=0.02) is False
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.15
+    assert service._hook_thread is hook_thread
+    assert service._cleanup_thread is not None
+    assert service.wait_stopped(timeout_s=0) is False
+
+    release.set()
+    assert service.wait_stopped(timeout_s=1)
+    assert service._hook_thread is None
+    assert service._cleanup_thread is None
+
+
+def test_start_refuses_while_cleanup_thread_can_still_touch_runtime_refs() -> None:
+    service = WindowsHotkeyService()
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+
+    def blocked_cleanup() -> None:
+        cleanup_entered.set()
+        assert release_cleanup.wait(timeout=2)
+
+    cleanup_thread = threading.Thread(target=blocked_cleanup, daemon=True)
+    service._cleanup_thread = cleanup_thread
+    cleanup_thread.start()
+    assert cleanup_entered.wait(timeout=1)
+    try:
+        with pytest.raises(WindowsHotkeyError, match="still stopping"):
+            service.start()
+        assert service._hook_thread is None
+        assert service._dispatch_thread is None
+        assert service._watchdog_thread is None
+    finally:
+        release_cleanup.set()
+        cleanup_thread.join(timeout=1)
+        service._cleanup_thread = None
+
+
+def test_retire_callbacks_is_bounded_and_blocks_late_dispatch() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    received: list[HotkeyAction] = []
+
+    def callback(action: HotkeyAction) -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+        received.append(action)
+
+    service = WindowsHotkeyService(callback=callback)
+    emitting = threading.Thread(
+        target=lambda: service._emit(HotkeyAction.CANCEL), daemon=True
+    )
+    emitting.start()
+    assert entered.wait(timeout=1)
+
+    retired = threading.Event()
+
+    def retire() -> None:
+        service.retire_callbacks()
+        retired.set()
+
+    retiring = threading.Thread(target=retire, daemon=True)
+    retiring.start()
+    assert retired.wait(timeout=0.1)
+    release.set()
+    emitting.join(timeout=1)
+    retiring.join(timeout=1)
+
+    service._emit(HotkeyAction.TOGGLE)
+    assert received == [HotkeyAction.CANCEL]
 
 
 def test_watchdog_wiring_is_inert_before_the_hook_thread_is_ready() -> None:

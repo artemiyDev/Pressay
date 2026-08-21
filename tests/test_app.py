@@ -17,12 +17,14 @@ from pressay.app import (
     _microphones,
     _overlay_auto_hide_ms,
     _settings_dict,
+    _save_settings_transaction,
     _start_native_shutdown,
     _test_microphone_device,
 )
 from pressay.controller import DictationController
 from pressay.audio import AudioDevice
 from pressay.config import AppConfig
+from pressay.hotkey_bindings import HotkeyBindings
 from pressay.ui import (
     MicrophoneChoice,
     SettingsWindow,
@@ -259,6 +261,27 @@ def test_shutdown_deadline_covers_blocking_recorder_cancel() -> None:
     assert complete.is_set()
 
 
+def test_native_shutdown_does_not_complete_while_hotkey_cleanup_is_live() -> None:
+    controller = SimpleNamespace(
+        close=lambda: None,
+        wait_closed=lambda: True,
+    )
+    hotkeys = SimpleNamespace(stop=lambda: False)
+    exits: list[int] = []
+
+    complete, watchdog, coordinator = _start_native_shutdown(
+        controller,
+        hotkeys,
+        timeout_seconds=0.03,
+        hard_exit=exits.append,
+    )
+
+    watchdog.join(timeout=1)
+    assert exits == [0]
+    assert complete.is_set() is False
+    assert coordinator.is_alive()
+
+
 def test_microphone_device_normalizes_digit_strings_only() -> None:
     assert _test_microphone_device(None) is None
     assert _test_microphone_device("7") == 7
@@ -490,3 +513,53 @@ def test_input_action_worker_survives_action_exception() -> None:
 
     assert done.wait(timeout=1)
     worker.shutdown()
+
+
+def test_settings_transaction_cancels_capture_before_deferring_changed_hotkeys(
+    monkeypatch,
+) -> None:
+    previous = HotkeyBindings()
+    updated = AppConfig(
+        hotkeys=HotkeyBindings(hold_modifiers=("ctrl", "shift"))
+    )
+    order: list[str] = []
+
+    class FakeCoordinator:
+        def request_change(
+            self,
+            bindings,
+            *,
+            before_replace,
+            persist,
+            on_applied,
+            on_failed,
+        ):
+            assert bindings == updated.hotkeys
+            order.append("request")
+            self.before_replace = before_replace
+            self.persist = persist
+            self.on_applied = on_applied
+            self.on_failed = on_failed
+            return SimpleNamespace()
+
+    coordinator = FakeCoordinator()
+    monkeypatch.setattr(
+        AppConfig,
+        "save",
+        lambda self: order.append("persist"),
+    )
+
+    _save_settings_transaction(
+        updated,
+        coordinator,  # type: ignore[arg-type]
+        previous_hotkeys=previous,
+        before_hotkey_change=lambda: order.append("cancel"),
+        on_applied=lambda config: order.append(f"apply:{config.hotkeys.hold_label()}"),
+        on_failed=lambda error: pytest.fail(str(error)),
+    )
+
+    assert order == ["request"]
+    coordinator.before_replace()
+    coordinator.persist()
+    coordinator.on_applied()
+    assert order == ["request", "cancel", "persist", "apply:Ctrl+Shift"]
