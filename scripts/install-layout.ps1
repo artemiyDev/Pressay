@@ -2,7 +2,48 @@ Set-StrictMode -Version Latest
 
 $script:PressayPayloadManifestName = ".pressay-manifest.json"
 $script:PressayPayloadVersionName = ".pressay-version"
+$script:PressayRuntimeContractName = ".pressay-runtime.json"
 $script:PressayInstalledLauncherName = "Pressay.ps1"
+$script:PressayInstalledUninstallerName = "Uninstall-Pressay.ps1"
+
+function Get-PressayWindowsRuntimeDependencySpecs {
+    [CmdletBinding()]
+    param()
+
+    return [string[]]@(
+        "faster-whisper>=1.2.1,<2",
+        "numpy>=1.26,<3",
+        "PySide6>=6.8,<7",
+        "pywin32>=306",
+        "sounddevice>=0.5.1,<1",
+        "nvidia-cublas-cu12>=12,<13",
+        "nvidia-cudnn-cu12>=9,<10",
+        "uiautomation>=2.0,<3",
+        "pytest>=8.3,<10",
+        "pytest-cov>=6,<8"
+    )
+}
+
+function Get-PressayWindowsRuntimeContractHash {
+    [CmdletBinding()]
+    param()
+
+    $canonical = @(
+        "pressay-windows-runtime-v1",
+        "python=cp311-win_amd64"
+    ) + @(Get-PressayWindowsRuntimeDependencySpecs)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(
+        (($canonical -join "`n") + "`n")
+    )
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($bytes)
+        return [System.BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
 
 function Get-PressayInstallLayout {
     [CmdletBinding()]
@@ -36,8 +77,13 @@ function Get-PressayInstallLayout {
         LocalAppData = $localRoot
         Root = $root
         VersionsRoot = [System.IO.Path]::GetFullPath((Join-Path $root "app"))
+        RuntimeVersionsRoot = [System.IO.Path]::GetFullPath((Join-Path $root "runtime"))
         CurrentFile = [System.IO.Path]::GetFullPath((Join-Path $root "current"))
         LauncherPath = [System.IO.Path]::GetFullPath((Join-Path $root $script:PressayInstalledLauncherName))
+        UninstallerPath = [System.IO.Path]::GetFullPath((Join-Path $root $script:PressayInstalledUninstallerName))
+        LegacyRuntimeRoot = [System.IO.Path]::GetFullPath((Join-Path $root "venv"))
+        # Compatibility alias for older local tooling. Installation code must
+        # use RuntimeVersionsRoot for all new releases.
         RuntimeRoot = [System.IO.Path]::GetFullPath((Join-Path $root "venv"))
         IconPath = [System.IO.Path]::GetFullPath((Join-Path $root "pressay.ico"))
     }
@@ -54,6 +100,73 @@ function Assert-PressayVersion {
         throw "Unsafe Pressay version identifier: $Version"
     }
     return $Version
+}
+
+function New-PressayRuntimeContract {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    return [ordered]@{
+        schema = 1
+        version = $safeVersion
+        dependency_contract_sha256 = Get-PressayWindowsRuntimeContractHash
+        python_tag = "cp311-win_amd64"
+    }
+}
+
+function ConvertTo-PressayRuntimeContractJson {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    return ((New-PressayRuntimeContract -Version $Version) | ConvertTo-Json -Compress) + [Environment]::NewLine
+}
+
+function Read-PressayRuntimeContract {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version,
+
+        [switch]$AllowAnyContractHash
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    $resolved = Assert-PressayPathIsNotReparsePoint -Path $Path
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Pressay runtime contract is missing: $resolved"
+    }
+    try {
+        $contract = [System.IO.File]::ReadAllText($resolved) | ConvertFrom-Json
+    }
+    catch {
+        throw "Pressay runtime contract is unreadable: $resolved"
+    }
+    if (
+        [int]$contract.schema -ne 1 -or
+        [string]$contract.version -cne $safeVersion -or
+        [string]$contract.dependency_contract_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$contract.python_tag -cne "cp311-win_amd64"
+    ) {
+        throw "Pressay runtime contract does not match release $safeVersion."
+    }
+    if (
+        -not $AllowAnyContractHash -and
+        [string]$contract.dependency_contract_sha256 -cne
+            (Get-PressayWindowsRuntimeContractHash)
+    ) {
+        throw "Pressay dependency contract does not match release $safeVersion."
+    }
+    return $contract
 }
 
 function Get-PressayProjectVersion {
@@ -209,8 +322,11 @@ function Assert-PressayInstallLayoutSafety {
     foreach ($path in @(
         $Layout.Root,
         $Layout.VersionsRoot,
+        $Layout.RuntimeVersionsRoot,
         $Layout.CurrentFile,
         $Layout.LauncherPath,
+        $Layout.UninstallerPath,
+        $Layout.LegacyRuntimeRoot,
         $Layout.RuntimeRoot,
         $Layout.IconPath
     )) {
@@ -384,7 +500,11 @@ function Assert-PressayPayload {
         [string]$PayloadRoot,
 
         [Parameter(Mandatory = $true)]
-        [string]$Version
+        [string]$Version,
+
+        [switch]$AllowLegacyRuntimeContract,
+
+        [switch]$AllowAnyRuntimeContractHash
     )
 
     $safeVersion = Assert-PressayVersion -Version $Version
@@ -401,6 +521,9 @@ function Assert-PressayPayload {
         $script:PressayPayloadVersionName,
         $script:PressayPayloadManifestName
     )
+    if (-not $AllowLegacyRuntimeContract) {
+        $required += $script:PressayRuntimeContractName
+    }
     foreach ($relative in $required) {
         $requiredPath = Join-Path $root $relative
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -413,6 +536,16 @@ function Assert-PressayPayload {
     ).Trim()
     if ($marker -cne $safeVersion) {
         throw "Pressay payload version marker does not match $safeVersion."
+    }
+    $runtimeContractPath = Join-Path $root $script:PressayRuntimeContractName
+    if (Test-Path -LiteralPath $runtimeContractPath -PathType Leaf) {
+        Read-PressayRuntimeContract `
+            -Path $runtimeContractPath `
+            -Version $safeVersion `
+            -AllowAnyContractHash:$AllowAnyRuntimeContractHash | Out-Null
+    }
+    elseif (-not $AllowLegacyRuntimeContract) {
+        throw "Pressay payload runtime contract is missing: $runtimeContractPath"
     }
 
     $manifestPath = Join-Path $root $script:PressayPayloadManifestName
@@ -551,6 +684,11 @@ function New-PressayPayloadStage {
             $safeVersion + [Environment]::NewLine,
             $encoding
         )
+        [System.IO.File]::WriteAllText(
+            (Join-Path $safeStage $script:PressayRuntimeContractName),
+            (ConvertTo-PressayRuntimeContractJson -Version $safeVersion),
+            $encoding
+        )
         Write-PressayPayloadManifest -PayloadRoot $safeStage -Version $safeVersion | Out-Null
         Assert-PressayPayload -PayloadRoot $safeStage -Version $safeVersion | Out-Null
         return $safeStage
@@ -642,6 +780,244 @@ function Install-PressayPayload {
                 -Confirm:$false
         }
     }
+}
+
+function Get-PressayRuntimeVersionRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    return Assert-PressayDirectChild `
+        -Path (Join-Path $Layout.RuntimeVersionsRoot $safeVersion) `
+        -Parent $Layout.RuntimeVersionsRoot
+}
+
+function Test-PressayVersionIsCurrent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    if (-not (Test-Path -LiteralPath $Layout.CurrentFile -PathType Leaf)) {
+        return $false
+    }
+    Assert-PressayPathIsNotReparsePoint -Path $Layout.CurrentFile | Out-Null
+    try {
+        $current = Assert-PressayVersion -Version ([System.IO.File]::ReadAllText($Layout.CurrentFile).Trim())
+    }
+    catch {
+        throw "Pressay current-version pointer is invalid; refusing runtime maintenance."
+    }
+    return $current -ceq $safeVersion
+}
+
+function Assert-PressayRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version,
+
+        [switch]$InspectTree,
+
+        [switch]$AllowAnyContractHash
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    $runtimeVersionRoot = Get-PressayRuntimeVersionRoot -Layout $Layout -Version $safeVersion
+    Assert-PressayPathIsNotReparsePoint -Path $runtimeVersionRoot | Out-Null
+    if (-not (Test-Path -LiteralPath $runtimeVersionRoot -PathType Container)) {
+        throw "Pressay runtime is missing for release ${safeVersion}: $runtimeVersionRoot"
+    }
+    Read-PressayRuntimeContract `
+        -Path (Join-Path $runtimeVersionRoot $script:PressayRuntimeContractName) `
+        -Version $safeVersion `
+        -AllowAnyContractHash:$AllowAnyContractHash | Out-Null
+
+    $venvRoot = Join-Path $runtimeVersionRoot "venv"
+    $venvPython = Join-Path $venvRoot "Scripts\python.exe"
+    $venvPythonw = Join-Path $venvRoot "Scripts\pythonw.exe"
+    foreach ($path in @($venvRoot, $venvPython, $venvPythonw)) {
+        Assert-PressayPathIsNotReparsePoint -Path $path | Out-Null
+    }
+    if (
+        -not (Test-Path -LiteralPath $venvRoot -PathType Container) -or
+        -not (Test-Path -LiteralPath $venvPython -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $venvPythonw -PathType Leaf)
+    ) {
+        throw "Pressay runtime is incomplete for release ${safeVersion}: $runtimeVersionRoot"
+    }
+    if ($InspectTree) {
+        Get-PressaySafeTreeFiles -Root $runtimeVersionRoot | Out-Null
+    }
+    return $venvRoot
+}
+
+function Initialize-PressayRuntimeBuild {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    Assert-PressayInstallLayoutSafety -Layout $Layout | Out-Null
+    $runtimeVersionRoot = Get-PressayRuntimeVersionRoot -Layout $Layout -Version $safeVersion
+    $readyMarker = Join-Path $runtimeVersionRoot $script:PressayRuntimeContractName
+
+    if (Test-Path -LiteralPath $runtimeVersionRoot) {
+        Assert-PressayPathIsNotReparsePoint -Path $runtimeVersionRoot | Out-Null
+        if (Test-Path -LiteralPath $readyMarker -PathType Leaf) {
+            $venvRoot = Assert-PressayRuntime `
+                -Layout $Layout `
+                -Version $safeVersion `
+                -InspectTree
+            return [pscustomobject]@{
+                RuntimeVersionRoot = $runtimeVersionRoot
+                VenvRoot = $venvRoot
+                Reused = $true
+            }
+        }
+        if (Test-PressayVersionIsCurrent -Layout $Layout -Version $safeVersion) {
+            throw "Pressay refuses to rebuild the active runtime for release $safeVersion."
+        }
+        Get-PressaySafeTreeFiles -Root $runtimeVersionRoot | Out-Null
+        Remove-Item -LiteralPath $runtimeVersionRoot -Recurse -Force
+    }
+
+    New-Item -ItemType Directory -Path $Layout.RuntimeVersionsRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $runtimeVersionRoot | Out-Null
+    return [pscustomobject]@{
+        RuntimeVersionRoot = $runtimeVersionRoot
+        VenvRoot = Join-Path $runtimeVersionRoot "venv"
+        Reused = $false
+    }
+}
+
+function Complete-PressayRuntimeBuild {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    $runtimeVersionRoot = Get-PressayRuntimeVersionRoot -Layout $Layout -Version $safeVersion
+    $venvRoot = Join-Path $runtimeVersionRoot "venv"
+    foreach ($relative in @("Scripts\python.exe", "Scripts\pythonw.exe")) {
+        $required = Join-Path $venvRoot $relative
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            throw "Pressay runtime validation did not produce $relative."
+        }
+        Assert-PressayPathIsNotReparsePoint -Path $required | Out-Null
+    }
+    Get-PressaySafeTreeFiles -Root $runtimeVersionRoot | Out-Null
+    Set-PressayFileAtomically `
+        -Path (Join-Path $runtimeVersionRoot $script:PressayRuntimeContractName) `
+        -Content (ConvertTo-PressayRuntimeContractJson -Version $safeVersion) | Out-Null
+    return Assert-PressayRuntime -Layout $Layout -Version $safeVersion
+}
+
+function Remove-PressayIncompleteRuntimeBuild {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    $runtimeVersionRoot = Get-PressayRuntimeVersionRoot -Layout $Layout -Version $safeVersion
+    if (-not (Test-Path -LiteralPath $runtimeVersionRoot)) {
+        return
+    }
+    if (Test-PressayVersionIsCurrent -Layout $Layout -Version $safeVersion) {
+        throw "Pressay refuses to remove the active runtime for release $safeVersion."
+    }
+    $readyMarker = Join-Path $runtimeVersionRoot $script:PressayRuntimeContractName
+    if (Test-Path -LiteralPath $readyMarker -PathType Leaf) {
+        return
+    }
+    Get-PressaySafeTreeFiles -Root $runtimeVersionRoot | Out-Null
+    Remove-Item -LiteralPath $runtimeVersionRoot -Recurse -Force
+}
+
+function Get-PressayActiveRuntimeRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout
+    )
+
+    if (-not (Test-Path -LiteralPath $Layout.CurrentFile -PathType Leaf)) {
+        $legacyPython = Join-Path $Layout.LegacyRuntimeRoot "Scripts\python.exe"
+        if (Test-Path -LiteralPath $legacyPython -PathType Leaf) {
+            Assert-PressayPathIsNotReparsePoint -Path $legacyPython | Out-Null
+            return $Layout.LegacyRuntimeRoot
+        }
+        throw "Pressay has no active installed runtime."
+    }
+
+    $version = Get-PressayCurrentVersion -Layout $Layout
+    $payloadRoot = Assert-PressayDirectChild `
+        -Path (Join-Path $Layout.VersionsRoot $version) `
+        -Parent $Layout.VersionsRoot
+    Assert-PressayPayload `
+        -PayloadRoot $payloadRoot `
+        -Version $version `
+        -AllowLegacyRuntimeContract `
+        -AllowAnyRuntimeContractHash | Out-Null
+    $payloadContract = Join-Path $payloadRoot $script:PressayRuntimeContractName
+    if (Test-Path -LiteralPath $payloadContract -PathType Leaf) {
+        $payloadRuntimeContract = Read-PressayRuntimeContract `
+            -Path $payloadContract `
+            -Version $version `
+            -AllowAnyContractHash
+        $venvRoot = Assert-PressayRuntime `
+            -Layout $Layout `
+            -Version $version `
+            -AllowAnyContractHash
+        $runtimeVersionRoot = Get-PressayRuntimeVersionRoot -Layout $Layout -Version $version
+        $runtimeContract = Read-PressayRuntimeContract `
+            -Path (Join-Path $runtimeVersionRoot $script:PressayRuntimeContractName) `
+            -Version $version `
+            -AllowAnyContractHash
+        if (
+            [string]$payloadRuntimeContract.dependency_contract_sha256 -cne
+                [string]$runtimeContract.dependency_contract_sha256
+        ) {
+            throw "Pressay payload and active runtime contracts do not match release $version."
+        }
+        return $venvRoot
+    }
+
+    $legacyPython = Join-Path $Layout.LegacyRuntimeRoot "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $legacyPython -PathType Leaf)) {
+        throw "Pressay legacy runtime is missing for release $version."
+    }
+    Assert-PressayPathIsNotReparsePoint -Path $legacyPython | Out-Null
+    return $Layout.LegacyRuntimeRoot
 }
 
 function Set-PressayFileAtomically {
@@ -746,7 +1122,31 @@ function Publish-PressayInstalledLauncher {
     return Set-PressayFileAtomically -Path $Layout.LauncherPath -Content $content
 }
 
-function Set-PressayCurrentVersion {
+function Publish-PressayInstalledUninstaller {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$UninstallerSource,
+
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout
+    )
+
+    $source = [System.IO.Path]::GetFullPath($UninstallerSource)
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Pressay uninstaller source is missing: $source"
+    }
+    $content = [System.IO.File]::ReadAllText($source)
+    if ($content -notmatch 'Pressay installed uninstaller') {
+        throw "Pressay uninstaller source does not contain the installed-uninstaller contract."
+    }
+    if ($content -match 'shortcut-utils\.ps1|install-layout\.ps1') {
+        throw "Pressay installed uninstaller must be self-contained."
+    }
+    return Set-PressayFileAtomically -Path $Layout.UninstallerPath -Content $content
+}
+
+function Assert-PressayActivationCandidate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -761,6 +1161,38 @@ function Set-PressayCurrentVersion {
         -Path (Join-Path $Layout.VersionsRoot $safeVersion) `
         -Parent $Layout.VersionsRoot
     Assert-PressayPayload -PayloadRoot $versionRoot -Version $safeVersion | Out-Null
+    $payloadContract = Read-PressayRuntimeContract `
+        -Path (Join-Path $versionRoot $script:PressayRuntimeContractName) `
+        -Version $safeVersion
+    $venvRoot = Assert-PressayRuntime -Layout $Layout -Version $safeVersion
+    $runtimeVersionRoot = Get-PressayRuntimeVersionRoot -Layout $Layout -Version $safeVersion
+    $runtimeContract = Read-PressayRuntimeContract `
+        -Path (Join-Path $runtimeVersionRoot $script:PressayRuntimeContractName) `
+        -Version $safeVersion
+    if (
+        [string]$payloadContract.dependency_contract_sha256 -cne
+            [string]$runtimeContract.dependency_contract_sha256
+    ) {
+        throw "Pressay payload and runtime contracts do not match release $safeVersion."
+    }
+    return [pscustomobject]@{
+        PayloadRoot = $versionRoot
+        RuntimeRoot = $venvRoot
+    }
+}
+
+function Set-PressayCurrentVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $safeVersion = Assert-PressayVersion -Version $Version
+    Assert-PressayActivationCandidate -Layout $Layout -Version $safeVersion | Out-Null
     Set-PressayFileAtomically `
         -Path $Layout.CurrentFile `
         -Content ($safeVersion + [Environment]::NewLine) | Out-Null
@@ -791,17 +1223,20 @@ function Complete-PressayActivation {
         [string]$Version,
 
         [Parameter(Mandatory = $true)]
-        [string]$LauncherSource
+        [string]$LauncherSource,
+
+        [Parameter(Mandatory = $true)]
+        [string]$UninstallerSource
     )
 
     $safeVersion = Assert-PressayVersion -Version $Version
-    $versionRoot = Assert-PressayDirectChild `
-        -Path (Join-Path $Layout.VersionsRoot $safeVersion) `
-        -Parent $Layout.VersionsRoot
-    Assert-PressayPayload -PayloadRoot $versionRoot -Version $safeVersion | Out-Null
+    $candidate = Assert-PressayActivationCandidate -Layout $Layout -Version $safeVersion
     Publish-PressayInstalledLauncher `
         -LauncherSource $LauncherSource `
         -Layout $Layout | Out-Null
+    Publish-PressayInstalledUninstaller `
+        -UninstallerSource $UninstallerSource `
+        -Layout $Layout | Out-Null
     Set-PressayCurrentVersion -Layout $Layout -Version $safeVersion | Out-Null
-    return $versionRoot
+    return $candidate.PayloadRoot
 }

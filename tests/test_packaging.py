@@ -105,35 +105,29 @@ def _assert_same_specs(
 
 
 def _extract_setup_ps1_pip_specs() -> list[str]:
-    """Pull the quoted package specifiers out of the `pip install` call.
+    """Pull Windows runtime specs from the installer contract function.
 
-    Deliberately not a PowerShell interpreter: this looks for the
-    line-continuation block between the backtick-continued `-m pip install`
-    line and the following `$LASTEXITCODE` check, and reads the quoted
-    strings inside it. If `setup.ps1` is restructured enough that this block
-    can no longer be found, the test fails loudly instead of silently
-    checking nothing.
+    `setup.ps1` consumes this function directly, so the contract has one
+    source of truth while this test still checks it against pyproject.toml.
     """
 
-    text = (SCRIPTS / "setup.ps1").read_text(encoding="utf-8")
+    text = (SCRIPTS / "install-layout.ps1").read_text(encoding="utf-8")
     match = re.search(
-        r"-m pip install\s*`\r?\n"
-        r"((?:.*?\r?\n)*?)"
-        r"\s*if \(\$LASTEXITCODE -ne 0\) \{ throw \"Failed to install Pressay dependencies\.\" \}",
+        r"function Get-PressayWindowsRuntimeDependencySpecs\s*\{"
+        r"(.*?)"
+        r"return \[string\[\]\]@\((.*?)\)\s*\}",
         text,
+        flags=re.DOTALL,
     )
     if match is None:
         pytest.fail(
-            "Could not locate the dependency `pip install` block in "
-            "scripts/setup.ps1. The script format changed; update the regex "
-            "in _extract_setup_ps1_pip_specs() instead of letting this check "
-            "silently pass."
+            "Could not locate Get-PressayWindowsRuntimeDependencySpecs in "
+            "scripts/install-layout.ps1."
         )
-    specs = re.findall(r'"([^"]+)"', match.group(1))
+    specs = re.findall(r'"([^"]+)"', match.group(2))
     if not specs:
         pytest.fail(
-            "No quoted package specifiers were found inside the "
-            "scripts/setup.ps1 `pip install` block; the parser needs updating."
+            "No package specifiers were found in the Windows runtime contract."
         )
     return specs
 

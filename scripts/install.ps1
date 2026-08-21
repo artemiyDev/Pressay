@@ -32,9 +32,10 @@ Write-Host "Preparing Pressay..."
 $layout = Get-PressayInstallLayout
 if (
     -not (Test-Path -LiteralPath $layout.LauncherPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $layout.UninstallerPath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $layout.CurrentFile -PathType Leaf)
 ) {
-    throw "Pressay setup completed without an active installed launcher."
+    throw "Pressay setup completed without a complete installed lifecycle."
 }
 $spec = Get-PressayLauncherSpec
 $programsDirectory = [Environment]::GetFolderPath("Programs")

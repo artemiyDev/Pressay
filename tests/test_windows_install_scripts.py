@@ -71,6 +71,7 @@ def _isolated_run_script(
     tmp_path: Path,
     *,
     use_current_python: bool = True,
+    versioned_runtime: bool = False,
 ) -> tuple[Path, dict[str, str]]:
     local_appdata = tmp_path / "owner's isolated local appdata"
     install_root = local_appdata / "Pressay"
@@ -102,6 +103,23 @@ def _isolated_run_script(
         encoding="utf-8",
     )
     payload_root = install_root / "app" / version
+    if versioned_runtime:
+        contract = {
+            "schema": 1,
+            "version": version,
+            "dependency_contract_sha256": "a" * 64,
+            "python_tag": "cp311-win_amd64",
+        }
+        (payload_root / ".pressay-runtime.json").write_text(
+            json.dumps(contract),
+            encoding="utf-8",
+        )
+        runtime_root = install_root / "runtime" / version
+        runtime_root.mkdir(parents=True)
+        (runtime_root / ".pressay-runtime.json").write_text(
+            json.dumps(contract),
+            encoding="utf-8",
+        )
     manifest_files = []
     for path in sorted(path for path in payload_root.rglob("*") if path.is_file()):
         manifest_files.append(
@@ -191,11 +209,23 @@ def test_setup_passes_icon_paths_as_arguments_and_validates_runtime() -> None:
     assert "import ctranslate2, faster_whisper" in setup
     assert "if ($runtimeCreated)" in setup
     assert setup.index("& $venvPython -m pip check") < setup.index(
+        "Complete-PressayRuntimeBuild"
+    )
+    assert setup.index("Complete-PressayRuntimeBuild") < setup.index(
         "Complete-PressayActivation"
     )
     assert setup.index("$versionRoot = Install-PressayPayload") < setup.index(
-        "$venvRoot = $layout.RuntimeRoot"
+        "$runtimeBuild = Initialize-PressayRuntimeBuild"
     )
+    assert "$venvRoot = $layout.RuntimeRoot" not in setup
+    assert "-UninstallerSource" in setup
+
+
+def test_local_maintenance_scripts_resolve_the_active_runtime() -> None:
+    for name in ("doctor.ps1", "test.ps1", "smoke-app.ps1", "e2e-input.ps1"):
+        text = (SCRIPTS / name).read_text(encoding="utf-8")
+        assert "Get-PressayActiveRuntimeRoot" in text, name
+        assert "Pressay\\venv\\Scripts\\python.exe" not in text, name
 
 
 @pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
@@ -209,6 +239,32 @@ def test_run_script_preserves_foreground_native_exit_code(tmp_path: Path) -> Non
     assert first.returncode == 23, first.stdout + first.stderr
     assert second.returncode == 23, second.stdout + second.stderr
     assert not any((Path(env["LOCALAPPDATA"]) / "Pressay" / "app").rglob("__pycache__"))
+
+
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
+def test_run_script_uses_matching_versioned_runtime(tmp_path: Path) -> None:
+    run_script, env = _isolated_run_script(tmp_path, versioned_runtime=True)
+    env["PRESSAY_TEST_EXIT_CODE"] = "17"
+
+    result = _run_powershell_file(run_script, env=env)
+
+    assert result.returncode == 17, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
+def test_marked_payload_never_falls_back_to_legacy_runtime(tmp_path: Path) -> None:
+    run_script, env = _isolated_run_script(tmp_path, versioned_runtime=True)
+    install_root = Path(env["LOCALAPPDATA"]) / "Pressay"
+    shutil.rmtree(install_root / "runtime")
+    legacy_scripts = install_root / "venv" / "Scripts"
+    legacy_scripts.mkdir(parents=True)
+    (legacy_scripts / "python.exe").write_bytes(b"legacy")
+    (legacy_scripts / "pythonw.exe").write_bytes(b"legacy")
+
+    result = _run_powershell_file(run_script, env=env)
+
+    assert result.returncode != 0
+    assert "runtime contract is missing" in result.stderr
 
 
 @pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
@@ -269,56 +325,20 @@ def test_destructive_uninstall_refuses_before_shortcuts_but_shortcut_only_is_all
     uninstall_source = uninstall_source.replace(
         "Local\\Pressay.Desktop.Singleton",
         mutex_name,
+    ).replace(
+        "Local\\Pressay.Desktop.Installer",
+        installer_mutex_name,
     )
     uninstall_script = scripts / "uninstall.ps1"
     uninstall_script.write_text(uninstall_source, encoding="utf-8")
-    marker = tmp_path / "shortcut calls.txt"
-    helper = scripts / "shortcut-utils.ps1"
-    helper.write_text(
-        "function Get-PressayInstallLayout {\n"
-        "  $root = Join-Path $env:LOCALAPPDATA 'Pressay'\n"
-        "  [pscustomobject]@{\n"
-        "    Root = $root\n"
-        "    VersionsRoot = Join-Path $root 'app'\n"
-        "    CurrentFile = Join-Path $root 'current'\n"
-        "    LauncherPath = Join-Path $root 'Pressay.ps1'\n"
-        "    RuntimeRoot = Join-Path $root 'venv'\n"
-        "    IconPath = Join-Path $root 'pressay.ico'\n"
-        "  }\n"
-        "}\n"
-        "function Assert-PressayPathIsNotReparsePoint {\n"
-        "  param([string]$Path)\n"
-        "  return [System.IO.Path]::GetFullPath($Path)\n"
-        "}\n"
-        "function Get-PressaySafeTreeFiles { param([string]$Root) return @() }\n"
-        "function Enter-PressayInstallerGuard {\n"
-        "  $created = $false\n"
-        f"  $guard = New-Object System.Threading.Mutex($false, '{installer_mutex_name}', [ref]$created)\n"
-        "  if (-not $created) { $guard.Dispose(); throw 'installer busy' }\n"
-        "  return $guard\n"
-        "}\n"
-        "function Enter-PressayAppMaintenanceGuard {\n"
-        "  $created = $false\n"
-        f"  $guard = New-Object System.Threading.Mutex($false, '{mutex_name}', [ref]$created)\n"
-        "  if (-not $created) { $guard.Dispose(); throw 'app busy' }\n"
-        "  return $guard\n"
-        "}\n"
-        "function Exit-PressayGuard { param($Guard) if ($null -ne $Guard) { $Guard.Dispose() } }\n"
-        "function Get-PressayLauncherSpec {\n"
-        "  [pscustomobject]@{ TargetPath = 'powershell.exe' }\n"
-        "}\n"
-        "function Remove-PressayShortcut {\n"
-        "  [CmdletBinding(SupportsShouldProcess = $true)]\n"
-        "  param([string]$ShortcutPath, [psobject]$Spec)\n"
-        "  Add-Content -LiteralPath $env:PRESSAY_TEST_SHORTCUT_MARKER -Value $ShortcutPath\n"
-        "}\n",
-        encoding="utf-8",
-    )
     env = os.environ.copy()
     local_appdata = tmp_path / "isolated local appdata"
     app_root = local_appdata / "Pressay"
+    shortcut_directory = tmp_path / "empty shortcut directory"
+    shortcut_directory.mkdir()
     preserved = [
         app_root / "app" / "1.0.0" / "src" / "pressay" / "__main__.py",
+        app_root / "runtime" / "1.0.0" / "venv" / "Scripts" / "python.exe",
         app_root / "venv" / "Scripts" / "python.exe",
         app_root / "config.json",
         app_root / "pressay.log",
@@ -328,22 +348,18 @@ def test_destructive_uninstall_refuses_before_shortcuts_but_shortcut_only_is_all
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("preserve", encoding="utf-8")
     env["LOCALAPPDATA"] = str(local_appdata)
-    env["PRESSAY_TEST_SHORTCUT_MARKER"] = str(marker)
 
     command = (
         "$created = $false; $mutex = $null; "
         f"$mutex = New-Object System.Threading.Mutex($true, '{mutex_name}', [ref]$created); "
-        "$refused = $false; "
-        f"try {{ & {_ps_quote(uninstall_script)} -RemoveRuntime }} catch {{ $refused = $true }}; "
+        "$refused = $false; $message = ''; "
+        f"try {{ & {_ps_quote(uninstall_script)} -RemoveRuntime -ShortcutDirectories {_ps_quote(shortcut_directory)} }} catch {{ $refused = $true; $message = $_.Exception.Message }}; "
         "if (-not $refused) { exit 91 }; "
-        f"if (Test-Path -LiteralPath {_ps_quote(marker)}) {{ exit 92 }}; "
-        f"& {_ps_quote(uninstall_script)}; "
-        "$shortcutCalls = @(Get-Content -LiteralPath $env:PRESSAY_TEST_SHORTCUT_MARKER); "
-        "if ($shortcutCalls.Count -ne 3) { exit 93 }; "
+        "if ($message -notmatch 'Exit it from the tray menu') { exit 92 }; "
+        f"& {_ps_quote(uninstall_script)} -ShortcutDirectories {_ps_quote(shortcut_directory)}; "
         "if ($created) { $mutex.ReleaseMutex() }; $mutex.Dispose(); exit 0"
     )
     result = _run_powershell(command, env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert len(marker.read_text(encoding="utf-8").splitlines()) == 3
     assert all(path.exists() for path in preserved)

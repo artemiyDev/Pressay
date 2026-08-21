@@ -101,6 +101,36 @@ function Get-PressayLauncherFileSha256 {
     }
 }
 
+function Read-PressayLauncherRuntimeContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $resolved = Assert-PressayLauncherPathIsNotReparsePoint -Path $Path
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Pressay runtime contract is missing: $resolved"
+    }
+    try {
+        $contract = [System.IO.File]::ReadAllText($resolved) | ConvertFrom-Json
+    }
+    catch {
+        throw "Pressay runtime contract is unreadable: $resolved"
+    }
+    if (
+        [int]$contract.schema -ne 1 -or
+        [string]$contract.version -cne $Version -or
+        [string]$contract.dependency_contract_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$contract.python_tag -cne "cp311-win_amd64"
+    ) {
+        throw "Pressay runtime contract is invalid for release $Version."
+    }
+    return $contract
+}
+
 function Assert-PressayLauncherPayloadManifest {
     param(
         [Parameter(Mandatory = $true)]
@@ -180,7 +210,7 @@ Assert-PressayLauncherPathIsNotReparsePoint -Path $installRoot | Out-Null
 
 $currentFile = Join-Path $installRoot "current"
 if (-not (Test-Path -LiteralPath $currentFile -PathType Leaf)) {
-    throw "Pressay is not installed. Run .\scripts\install.ps1 first."
+    throw "Pressay is not installed. Reinstall Pressay before launching it."
 }
 Assert-PressayLauncherPathIsNotReparsePoint -Path $currentFile | Out-Null
 $version = [System.IO.File]::ReadAllText($currentFile).Trim()
@@ -207,10 +237,44 @@ if (
 }
 Assert-PressayLauncherPayloadManifest -PayloadRoot $payloadRoot -Version $version
 
-$runtimeRoot = Assert-PressayLauncherPathIsNotReparsePoint -Path (Join-Path $installRoot "venv")
+$payloadContractPath = Join-Path $payloadRoot ".pressay-runtime.json"
+if (Test-Path -LiteralPath $payloadContractPath -PathType Leaf) {
+    $payloadContract = Read-PressayLauncherRuntimeContract `
+        -Path $payloadContractPath `
+        -Version $version
+    $runtimeVersionsRoot = Assert-PressayLauncherPathIsNotReparsePoint `
+        -Path (Join-Path $installRoot "runtime")
+    $runtimeVersionRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $runtimeVersionsRoot $version)
+    )
+    $runtimeParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $runtimeVersionRoot))
+    if (-not [string]::Equals(
+        $runtimeParent,
+        $runtimeVersionsRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Pressay current-version pointer escaped the runtime directory."
+    }
+    $runtimeVersionRoot = Assert-PressayLauncherPathIsNotReparsePoint -Path $runtimeVersionRoot
+    $runtimeContract = Read-PressayLauncherRuntimeContract `
+        -Path (Join-Path $runtimeVersionRoot ".pressay-runtime.json") `
+        -Version $version
+    if (
+        [string]$runtimeContract.dependency_contract_sha256 -cne
+            [string]$payloadContract.dependency_contract_sha256
+    ) {
+        throw "Pressay payload and runtime contracts do not match release $version."
+    }
+    $runtimeRoot = Join-Path $runtimeVersionRoot "venv"
+}
+else {
+    # Only payloads installed before versioned runtimes may use the shared venv.
+    $runtimeRoot = Join-Path $installRoot "venv"
+}
+$runtimeRoot = Assert-PressayLauncherPathIsNotReparsePoint -Path $runtimeRoot
 $venvPython = Join-Path $runtimeRoot "Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    throw "Pressay runtime is missing. Run .\scripts\install.ps1 first."
+    throw "Pressay runtime is missing. Reinstall Pressay before launching it."
 }
 Assert-PressayLauncherPathIsNotReparsePoint -Path $venvPython | Out-Null
 

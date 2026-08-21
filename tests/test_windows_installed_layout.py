@@ -93,6 +93,7 @@ def test_payload_install_is_versioned_idempotent_and_immutable(tmp_path: Path) -
     assert payload["Conflict"] is True
     assert payload["Staging"] == 0
     assert (expected_root / ".pressay-manifest.json").is_file()
+    assert (expected_root / ".pressay-runtime.json").is_file()
     assert (expected_root / "src" / "pressay" / "__main__.py").is_file()
     assert not (expected_root / "src" / "pressay" / "__pycache__").exists()
     assert not (expected_root / "src" / "pressay" / "recording.wav").exists()
@@ -123,14 +124,22 @@ def test_failed_activation_keeps_current_and_reinstall_preserves_shared_data(
     command = (
         "$ErrorActionPreference = 'Stop'; "
         f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        "function New-TestRuntime($layout, $version) { "
+        "$build = Initialize-PressayRuntimeBuild -Layout $layout -Version $version; "
+        "$scripts = Join-Path $build.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $scripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version $version | Out-Null }; "
         f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
         f"Install-PressayPayload -ProjectRoot {_ps_quote(old_project)} -Layout $layout -Version '1.0.0' | Out-Null; "
-        f"Complete-PressayActivation -Layout $layout -Version '1.0.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} | Out-Null; "
+        "New-TestRuntime $layout '1.0.0'; "
+        f"Complete-PressayActivation -Layout $layout -Version '1.0.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
         f"Install-PressayPayload -ProjectRoot {_ps_quote(new_project)} -Layout $layout -Version '1.1.0' | Out-Null; "
+        "New-TestRuntime $layout '1.1.0'; "
         "$failed = $false; "
-        f"try {{ Complete-PressayActivation -Layout $layout -Version '1.1.0' -LauncherSource {_ps_quote(tmp_path / 'missing-launcher.ps1')} | Out-Null }} catch {{ $failed = $true }}; "
+        f"try {{ Complete-PressayActivation -Layout $layout -Version '1.1.0' -LauncherSource {_ps_quote(tmp_path / 'missing-launcher.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null }} catch {{ $failed = $true }}; "
         "$afterFailure = Get-PressayCurrentVersion -Layout $layout; "
-        f"Complete-PressayActivation -Layout $layout -Version '1.1.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} | Out-Null; "
+        f"Complete-PressayActivation -Layout $layout -Version '1.1.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
         "$afterSuccess = Get-PressayCurrentVersion -Layout $layout; "
         "[pscustomobject]@{ Failed = $failed; AfterFailure = $afterFailure; AfterSuccess = $afterSuccess } | ConvertTo-Json -Compress"
     )
@@ -146,6 +155,9 @@ def test_failed_activation_keeps_current_and_reinstall_preserves_shared_data(
     assert all(path.read_text(encoding="utf-8") == "keep" for path in preserved)
     launcher = app_root / "Pressay.ps1"
     assert launcher.is_file()
+    uninstaller = app_root / "Uninstall-Pressay.ps1"
+    assert uninstaller.is_file()
+    assert "shortcut-utils.ps1" not in uninstaller.read_text(encoding="utf-8")
     assert str(old_project) not in launcher.read_text(encoding="utf-8")
     assert str(new_project) not in launcher.read_text(encoding="utf-8")
 
@@ -161,52 +173,20 @@ def test_explicit_uninstall_flags_remove_only_owned_install_targets(tmp_path: Pa
     uninstall_source = uninstall_source.replace(
         "Local\\Pressay.Desktop.Singleton",
         mutex_name,
+    ).replace(
+        "Local\\Pressay.Desktop.Installer",
+        installer_mutex_name,
     )
     uninstall_script = scripts / "uninstall.ps1"
     uninstall_script.write_text(uninstall_source, encoding="utf-8")
-    (scripts / "shortcut-utils.ps1").write_text(
-        "function Get-PressayInstallLayout {\n"
-        "  $root = Join-Path $env:LOCALAPPDATA 'Pressay'\n"
-        "  [pscustomobject]@{\n"
-        "    Root = $root\n"
-        "    VersionsRoot = Join-Path $root 'app'\n"
-        "    CurrentFile = Join-Path $root 'current'\n"
-        "    LauncherPath = Join-Path $root 'Pressay.ps1'\n"
-        "    RuntimeRoot = Join-Path $root 'venv'\n"
-        "    IconPath = Join-Path $root 'pressay.ico'\n"
-        "  }\n"
-        "}\n"
-        "function Assert-PressayPathIsNotReparsePoint {\n"
-        "  param([string]$Path)\n"
-        "  return [System.IO.Path]::GetFullPath($Path)\n"
-        "}\n"
-        "function Get-PressaySafeTreeFiles { param([string]$Root) return @() }\n"
-        "function Enter-PressayInstallerGuard {\n"
-        "  $created = $false\n"
-        f"  $guard = New-Object System.Threading.Mutex($false, '{installer_mutex_name}', [ref]$created)\n"
-        "  if (-not $created) { $guard.Dispose(); throw 'installer busy' }\n"
-        "  return $guard\n"
-        "}\n"
-        "function Enter-PressayAppMaintenanceGuard {\n"
-        "  $created = $false\n"
-        f"  $guard = New-Object System.Threading.Mutex($false, '{mutex_name}', [ref]$created)\n"
-        "  if (-not $created) { $guard.Dispose(); throw 'app busy' }\n"
-        "  return $guard\n"
-        "}\n"
-        "function Exit-PressayGuard { param($Guard) if ($null -ne $Guard) { $Guard.Dispose() } }\n"
-        "function Get-PressayLauncherSpec { [pscustomobject]@{} }\n"
-        "function Remove-PressayShortcut {\n"
-        "  [CmdletBinding(SupportsShouldProcess = $true)]\n"
-        "  param([string]$ShortcutPath, [psobject]$Spec)\n"
-        "  return $true\n"
-        "}\n",
-        encoding="utf-8",
-    )
 
     local_appdata = tmp_path / "Local AppData"
     app_root = local_appdata / "Pressay"
+    shortcut_directory = tmp_path / "empty shortcuts"
+    shortcut_directory.mkdir()
     removed = [
         app_root / "app" / "1.0.0" / "src" / "pressay" / "__main__.py",
+        app_root / "runtime" / "1.0.0" / "venv" / "Scripts" / "python.exe",
         app_root / "current",
         app_root / "Pressay.ps1",
         app_root / "pressay.ico",
@@ -218,6 +198,7 @@ def test_explicit_uninstall_flags_remove_only_owned_install_targets(tmp_path: Pa
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("remove", encoding="utf-8")
     preserved = [
+        app_root / "Uninstall-Pressay.ps1",
         app_root / "models" / "model.bin",
         app_root / "notes.txt",
         local_appdata / "Unrelated App" / "data.txt",
@@ -240,6 +221,8 @@ def test_explicit_uninstall_flags_remove_only_owned_install_targets(tmp_path: Pa
             "-RemoveApp",
             "-RemoveRuntime",
             "-RemoveUserData",
+            "-ShortcutDirectories",
+            str(shortcut_directory),
         ],
         check=False,
         capture_output=True,
@@ -251,6 +234,142 @@ def test_explicit_uninstall_flags_remove_only_owned_install_targets(tmp_path: Pa
     assert result.returncode == 0, result.stdout + result.stderr
     assert all(not path.exists() for path in removed)
     assert all(path.read_text(encoding="utf-8") == "keep" for path in preserved)
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_versioned_runtime_ready_marker_reuse_and_active_cleanup_guard(
+    tmp_path: Path,
+) -> None:
+    local_appdata = tmp_path / "Runtime Local AppData"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        "$first = Initialize-PressayRuntimeBuild -Layout $layout -Version '2.0.0'; "
+        "$marker = Join-Path $first.RuntimeVersionRoot '.pressay-runtime.json'; "
+        "$markerBefore = Test-Path -LiteralPath $marker; "
+        "$scripts = Join-Path $first.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $scripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version '2.0.0' | Out-Null; "
+        "$second = Initialize-PressayRuntimeBuild -Layout $layout -Version '2.0.0'; "
+        "$inactive = Get-PressayRuntimeVersionRoot -Layout $layout -Version '3.0.0'; "
+        "New-Item -ItemType Directory -Path $inactive -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $inactive 'partial.txt') -Value 'partial'; "
+        "Set-PressayFileAtomically -Path $layout.CurrentFile -Content \"3.0.0`n\" | Out-Null; "
+        "$refused = $false; try { Initialize-PressayRuntimeBuild -Layout $layout -Version '3.0.0' | Out-Null } catch { $refused = $true }; "
+        "$partialKept = Test-Path -LiteralPath (Join-Path $inactive 'partial.txt'); "
+        "Set-PressayFileAtomically -Path $layout.CurrentFile -Content \"2.0.0`n\" | Out-Null; "
+        "$rebuilt = Initialize-PressayRuntimeBuild -Layout $layout -Version '3.0.0'; "
+        "$partialRemoved = -not (Test-Path -LiteralPath (Join-Path $inactive 'partial.txt')); "
+        "[pscustomobject]@{ MarkerBefore = $markerBefore; MarkerAfter = (Test-Path -LiteralPath $marker); Reused = $second.Reused; Refused = $refused; PartialKept = $partialKept; Rebuilt = (-not $rebuilt.Reused); PartialRemoved = $partialRemoved } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "MarkerBefore": False,
+        "MarkerAfter": True,
+        "Reused": True,
+        "Refused": True,
+        "PartialKept": True,
+        "Rebuilt": True,
+        "PartialRemoved": True,
+    }
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_activation_refuses_marked_payload_without_ready_runtime(tmp_path: Path) -> None:
+    project = _make_project(tmp_path, "4.0.0", "candidate")
+    local_appdata = tmp_path / "Activation Local AppData"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(project)} -Layout $layout -Version '4.0.0' | Out-Null; "
+        "$failed = $false; "
+        f"try {{ Complete-PressayActivation -Layout $layout -Version '4.0.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null }} catch {{ $failed = $true }}; "
+        "[pscustomobject]@{ Failed = $failed; Current = (Test-Path -LiteralPath $layout.CurrentFile); Launcher = (Test-Path -LiteralPath $layout.LauncherPath); Uninstaller = (Test-Path -LiteralPath $layout.UninstallerPath) } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "Failed": True,
+        "Current": False,
+        "Launcher": False,
+        "Uninstaller": False,
+    }
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_active_runtime_resolver_rejects_removed_manifested_marker(
+    tmp_path: Path,
+) -> None:
+    project = _make_project(tmp_path, "5.0.0", "resolver")
+    local_appdata = tmp_path / "Resolver Local AppData"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        f"$payload = Install-PressayPayload -ProjectRoot {_ps_quote(project)} -Layout $layout -Version '5.0.0'; "
+        "New-Item -ItemType Directory -Path (Join-Path $layout.LegacyRuntimeRoot 'Scripts') -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $layout.LegacyRuntimeRoot 'Scripts\\python.exe') -Value 'legacy'; "
+        "Set-PressayFileAtomically -Path $layout.CurrentFile -Content \"5.0.0`n\" | Out-Null; "
+        "Remove-Item -LiteralPath (Join-Path $payload '.pressay-runtime.json') -Force; "
+        "$rejected = $false; try { Get-PressayActiveRuntimeRoot -Layout $layout | Out-Null } catch { $rejected = $true }; "
+        "Write-PressayPayloadManifest -PayloadRoot $payload -Version '5.0.0' | Out-Null; "
+        "$legacy = Get-PressayActiveRuntimeRoot -Layout $layout; "
+        "[pscustomobject]@{ Rejected = $rejected; Legacy = $legacy } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["Rejected"] is True
+    assert Path(payload["Legacy"]) == local_appdata / "Pressay" / "venv"
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_installed_uninstaller_is_self_contained_after_checkout_removal(
+    tmp_path: Path,
+) -> None:
+    local_appdata = tmp_path / "Installed Local AppData"
+    install_root = local_appdata / "Pressay"
+    install_root.mkdir(parents=True)
+    installed = install_root / "Uninstall-Pressay.ps1"
+    installed.write_text(
+        (SCRIPTS / "uninstall.ps1").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    empty_shortcuts = tmp_path / "empty shortcuts"
+    empty_shortcuts.mkdir()
+    env = os.environ.copy()
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    result = subprocess.run(
+        [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(installed),
+            "-ShortcutDirectories",
+            str(empty_shortcuts),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = installed.read_text(encoding="utf-8")
+    assert "shortcut-utils.ps1" not in text
+    assert "install-layout.ps1" not in text
 
 
 @pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")

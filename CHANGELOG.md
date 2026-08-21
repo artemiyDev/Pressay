@@ -5,8 +5,8 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.4.0` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.4.0` указана в текущем исходном коде,
+`0.5.0` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.0` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
@@ -25,10 +25,14 @@ have a matching tagged release. Версия `0.4.0` указана в теку�
   uses the stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher for start-menu,
   desktop, and autostart shortcuts. Installing or upgrading requires Pressay to
   be fully exited.
+- Windows releases now pair each payload with a versioned runtime and activate
+  both through the same atomic pointer. Failed dependency installation cannot
+  mutate the active release, and a source-independent uninstaller is installed.
 - Windows uninstall now removes only Pressay-owned shortcuts by default. The
-  explicit `-RemoveApp`, `-RemoveRuntime`, and `-RemoveUserData` flags remove
-  installed payloads, the shared runtime, and configuration/logs respectively;
-  model caches remain preserved.
+  explicit `-RemoveApp`, `-RemoveRuntime`, `-RemoveUserData`, and
+  `-RemoveInstaller` flags remove installed payloads, versioned/legacy runtimes,
+  configuration/logs, and the installed uninstaller respectively; model caches
+  remain preserved.
 - The settings window now adapts to narrow and small screens, keeps its main
   actions visible, scrolls focused controls into view, and exposes complete
   keyboard and accessibility navigation.
@@ -37,9 +41,13 @@ have a matching tagged release. Версия `0.4.0` указана в теку�
   стабильный `%LOCALAPPDATA%\Pressay\Pressay.ps1` для ярлыков меню «Пуск»,
   рабочего стола и автозапуска. Перед установкой или обновлением Pressay нужно
   полностью завершить.
+- Каждый Windows payload теперь связан со своим версионным runtime и
+  активируется тем же атомарным указателем. Неудачная установка зависимостей не
+  изменяет активную версию; uninstaller устанавливается независимо от исходников.
 - По умолчанию удаление Windows теперь убирает только принадлежащие Pressay
-  ярлыки. Флаги `-RemoveApp`, `-RemoveRuntime` и `-RemoveUserData` отдельно
-  удаляют копии приложения, общий runtime и конфигурацию/логи; кэш моделей
+  ярлыки. Флаги `-RemoveApp`, `-RemoveRuntime`, `-RemoveUserData` и
+  `-RemoveInstaller` отдельно удаляют копии приложения, версионные/legacy
+  runtime, конфигурацию/логи и установленный uninstaller; кэш моделей
   сохраняется.
 - Окно настроек теперь адаптируется к узким и небольшим экранам, оставляет
   основные действия видимыми, прокручивает к элементу с фокусом и поддерживает

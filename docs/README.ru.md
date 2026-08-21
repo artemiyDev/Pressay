@@ -56,7 +56,8 @@ cd Pressay
   `%LOCALAPPDATA%\Pressay\app\<version>`;
 - переключает маленький указатель `%LOCALAPPDATA%\Pressay\current` и
   устанавливает стабильный launcher `%LOCALAPPDATA%\Pressay\Pressay.ps1`;
-- создаёт `%LOCALAPPDATA%\Pressay\venv`;
+- создаёт runtime `%LOCALAPPDATA%\Pressay\runtime\<version>\venv`;
+- устанавливает независимый от репозитория `Uninstall-Pressay.ps1`;
 - устанавливает зависимости и загружает модель `turbo`;
 - создаёт Pressay в меню «Пуск» и, по запросу, на рабочем столе;
 - по флагу `-EnableAutostart` создаёт ярлык в Startup;
@@ -65,9 +66,9 @@ cd Pressay
 Ярлыки меню «Пуск», рабочего стола и автозапуска указывают на стабильный
 launcher. Поэтому после успешной установки Windows-версия продолжает работать,
 даже если клонированную папку переместить или удалить. Для будущего обновления
-или обслуживания при необходимости снова получите исходный код Pressay. При
-обновлении общий runtime используется повторно, а конфигурация, логи и общий
-кэш моделей сохраняются вне версионной копии приложения.
+обновления снова получите исходный код Pressay; для удаления он не нужен. При
+обновлении предыдущая пара app/runtime сохраняется вместе с конфигурацией,
+логами и общим кэшем моделей.
 
 Полезные варианты:
 
@@ -173,11 +174,11 @@ Pressay, разрешите Python из
 Windows:
 
 ```powershell
-.\scripts\uninstall.ps1
-.\scripts\uninstall.ps1 -RemoveApp
-.\scripts\uninstall.ps1 -RemoveRuntime
-.\scripts\uninstall.ps1 -RemoveUserData
-.\scripts\uninstall.ps1 -RemoveApp -RemoveRuntime -RemoveUserData
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1"
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveApp
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveRuntime
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveUserData
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveApp -RemoveRuntime -RemoveUserData -RemoveInstaller
 ```
 
 Без флагов скрипт удаляет только принадлежащие Pressay ярлыки из меню «Пуск»,
@@ -186,9 +187,11 @@ Windows:
 полностью завершите Pressay через меню в трее.
 
 `-RemoveApp` удаляет версионные копии приложения, указатель `current`, launcher
-и иконку. `-RemoveRuntime` удаляет общий virtual environment Pressay.
-`-RemoveUserData` безвозвратно удаляет конфигурацию и логи. Флаги можно
-комбинировать. Общий кэш моделей Hugging Face этот скрипт не удаляет.
+и иконку. `-RemoveRuntime` удаляет версионные runtime и сохранённый legacy
+environment. `-RemoveUserData` безвозвратно удаляет конфигурацию и логи.
+`-RemoveInstaller` последним удаляет установленный uninstaller и требует
+`-RemoveApp`, пока Pressay установлен. Флаги можно комбинировать. Общий кэш
+моделей Hugging Face этот скрипт не удаляет.
 
 macOS:
 
@@ -208,8 +211,9 @@ bash scripts/uninstall-macos.sh --remove-user-data
 | Установленное приложение | `%LOCALAPPDATA%\Pressay\app\<version>` | Копия репозитория (developer beta) |
 | Указатель активной версии | `%LOCALAPPDATA%\Pressay\current` | — |
 | Стабильный launcher | `%LOCALAPPDATA%\Pressay\Pressay.ps1` | `~/Applications/Pressay.app` (зависит от репозитория) |
+| Установленный uninstaller | `%LOCALAPPDATA%\Pressay\Uninstall-Pressay.ps1` | — |
 | Конфигурация | `%LOCALAPPDATA%\Pressay\config.json` | `~/Library/Application Support/Pressay/config.json` |
-| Runtime | `%LOCALAPPDATA%\Pressay\venv` | `~/Library/Application Support/Pressay/venv` |
+| Runtime | `%LOCALAPPDATA%\Pressay\runtime\<version>\venv` | `~/Library/Application Support/Pressay/venv` |
 | Логи | `%LOCALAPPDATA%\Pressay\pressay.log` | `~/Library/Application Support/Pressay/pressay.log` |
 | Модели | Hugging Face cache | Hugging Face cache |
 

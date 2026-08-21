@@ -52,14 +52,14 @@ the app while it is running.
 The non-admin installer publishes a versioned application payload under
 `%LOCALAPPDATA%\Pressay\app\<version>`, activates it through the small `current`
 pointer, and installs the stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher.
-It also creates `%LOCALAPPDATA%\Pressay\venv`, installs the dependencies,
-downloads the `turbo` model, creates managed shortcuts, and starts Pressay in
-the system tray. Start-menu, desktop, and autostart shortcuts point to the
-stable launcher, so a successful Windows installation keeps working after the
-cloned repository is moved or deleted. Run later upgrades or maintenance
-scripts from a fresh Pressay source tree when needed. Upgrades reuse the shared
-runtime and preserve configuration, logs, and the shared model cache outside
-the versioned payload.
+It builds a matching immutable-by-policy runtime under
+`%LOCALAPPDATA%\Pressay\runtime\<version>`, installs a stable
+`Uninstall-Pressay.ps1`, downloads the `turbo` model, creates managed shortcuts,
+and starts Pressay in the system tray. Start-menu, desktop, and autostart
+shortcuts point to the stable launcher, so a successful Windows installation
+keeps working after the cloned repository is moved or deleted. A fresh source
+tree is needed for upgrades, but not for removal. Upgrades preserve the prior
+app/runtime pair, configuration, logs, and the shared model cache.
 
 ```powershell
 .\scripts\install.ps1 -NoLaunch
@@ -158,18 +158,19 @@ configuration, logs, and models. Fully exit Pressay from its tray menu before
 using any of the removal flags below.
 
 ```powershell
-.\scripts\uninstall.ps1
-.\scripts\uninstall.ps1 -RemoveApp
-.\scripts\uninstall.ps1 -RemoveRuntime
-.\scripts\uninstall.ps1 -RemoveUserData
-.\scripts\uninstall.ps1 -RemoveApp -RemoveRuntime -RemoveUserData
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1"
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveApp
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveRuntime
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveUserData
+& "$env:LOCALAPPDATA\Pressay\Uninstall-Pressay.ps1" -RemoveApp -RemoveRuntime -RemoveUserData -RemoveInstaller
 ```
 
 `-RemoveApp` removes the installed versioned payloads, `current` pointer,
-launcher, and icon. `-RemoveRuntime` removes the shared Pressay virtual
-environment. `-RemoveUserData` permanently removes configuration and logs.
-These flags can be combined. The shared Hugging Face model cache is never
-removed by this script.
+launcher, and icon. `-RemoveRuntime` removes both versioned runtimes and a
+preserved legacy shared environment. `-RemoveUserData` permanently removes
+configuration and logs. `-RemoveInstaller` removes the installed uninstaller
+last and requires `-RemoveApp` while Pressay is installed. These flags can be
+combined. The shared Hugging Face model cache is never removed by this script.
 
 ```bash
 bash scripts/uninstall-macos.sh
@@ -186,8 +187,9 @@ See the scripts' help output for details.
 | Installed application | `%LOCALAPPDATA%\Pressay\app\<version>` | Repository checkout (developer beta) |
 | Active-version pointer | `%LOCALAPPDATA%\Pressay\current` | — |
 | Stable launcher | `%LOCALAPPDATA%\Pressay\Pressay.ps1` | `~/Applications/Pressay.app` (repository-backed) |
+| Installed uninstaller | `%LOCALAPPDATA%\Pressay\Uninstall-Pressay.ps1` | — |
 | Configuration | `%LOCALAPPDATA%\Pressay\config.json` | `~/Library/Application Support/Pressay/config.json` |
-| Runtime | `%LOCALAPPDATA%\Pressay\venv` | `~/Library/Application Support/Pressay/venv` |
+| Runtime | `%LOCALAPPDATA%\Pressay\runtime\<version>\venv` | `~/Library/Application Support/Pressay/venv` |
 | Logs | `%LOCALAPPDATA%\Pressay\pressay.log` | `~/Library/Application Support/Pressay/pressay.log` |
 | Models | Shared Hugging Face cache | Shared Hugging Face cache |
 
