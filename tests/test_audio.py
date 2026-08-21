@@ -818,6 +818,7 @@ def test_stop_returns_before_blocking_stream_close_and_logs_completion(
         stream.allow_stop.set()
 
     assert stream.close_completed.wait(timeout=1)
+    assert recorder.wait_closed(timeout=1) is True
     assert stream.stop_calls == 1
     assert stream.close_calls == 1
     assert any(
@@ -897,6 +898,50 @@ def test_start_succeeds_while_previous_stream_closes(
     assert old_stream.close_completed.wait(timeout=1)
 
 
+def test_wait_closed_prunes_completed_operations_across_recorder_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice([np.ones(480, dtype=np.float32) * 0.1])
+    install_fake(monkeypatch, fake)
+    recorder = AudioRecorder(min_duration_seconds=0, silence_rms_threshold=0)
+
+    for _ in range(4):
+        recorder.start()
+        assert recorder.current_rms == pytest.approx(0.1)
+        assert recorder.current_peak == pytest.approx(0.1)
+        recorder.stop(validate=False)
+        assert recorder.wait_closed(timeout=1) is True
+        assert recorder._stream_close_operations == []
+
+    assert len(fake.streams) == 4
+    assert all(stream.stopped and stream.closed for stream in fake.streams)
+
+
+def test_failed_start_close_is_reported_by_native_close_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingStartCloseStream(FakeStream):
+        def start(self) -> None:
+            raise RuntimeError("driver start failed")
+
+        def close(self) -> None:
+            raise RuntimeError("driver close failed")
+
+    fake = FakeSoundDevice()
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(
+        fake,
+        "InputStream",
+        lambda **kwargs: FailingStartCloseStream(fake, **kwargs),
+    )
+    recorder = AudioRecorder()
+
+    with pytest.raises(AudioDeviceError, match="start microphone"):
+        recorder.start()
+
+    assert recorder.wait_closed(timeout=0) is False
+
+
 def test_async_stream_close_failure_is_logged_without_affecting_recording(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -935,6 +980,7 @@ def test_async_stream_close_failure_is_logged_without_affecting_recording(
 
     assert recording.audio.size == 1_600
     assert stream.closed_event.wait(timeout=1)
+    assert recorder.wait_closed(timeout=1) is False
     assert stream.close_calls == 1
     assert any(
         record.levelno == logging.WARNING

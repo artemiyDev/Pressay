@@ -1,13 +1,16 @@
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$venvPython = Join-Path $env:LOCALAPPDATA "Pressay\venv\Scripts\python.exe"
+. (Join-Path $PSScriptRoot "install-layout.ps1")
+$layout = Get-PressayInstallLayout
+$runtimeRoot = Get-PressayActiveRuntimeRoot -Layout $layout
+$venvPython = Join-Path $runtimeRoot "Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
     throw "Virtual environment is missing. Run .\scripts\setup.ps1 first."
 }
 
 $env:PYTHONPATH = Join-Path $projectRoot "src"
-$sitePackages = Join-Path $env:LOCALAPPDATA "Pressay\venv\Lib\site-packages"
+$sitePackages = Join-Path $runtimeRoot "Lib\site-packages"
 $cudaBins = @(
     (Join-Path $sitePackages "nvidia\cublas\bin"),
     (Join-Path $sitePackages "nvidia\cudnn\bin"),

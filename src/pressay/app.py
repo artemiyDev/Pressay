@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 from dataclasses import dataclass
 import logging
@@ -19,10 +19,26 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from . import hotkey_bindings
 from . import __version__
-from .audio import AudioCaptureError, AudioRecorder, normalize_device_selector
+from .audio import (
+    AudioCaptureError,
+    AudioRecorder,
+    LEGACY_MICROPHONE_SELECTOR_PREFIX,
+    MICROPHONE_SELECTOR_PREFIX,
+    normalize_device_selector,
+    parse_microphone_selector,
+)
 from .config import AppConfig, ConfigError
 from .controller import DictationController
-from .ui import MicrophoneChoice, SettingsWindow, StatusOverlay, TrayController, UiSignals
+from .hotkey_coordinator import _WindowsHotkeyCoordinator
+from .microphone_probe import MicrophoneProbeCoordinator, MicrophoneProbeResult
+from .ui import (
+    MicrophoneChoice,
+    SettingsWindow,
+    StatusOverlay,
+    TrayController,
+    UiSignals,
+    microphone_choice_index,
+)
 from .platform_support import input_adapter, is_macos, is_windows, user_data_directory
 
 
@@ -111,17 +127,26 @@ class _InputActionWorker:
 
     A single-worker ``ThreadPoolExecutor`` (rather than a bare
     ``threading.Lock``) is used so a burst of paste/copy requests queues
-    cleanly on one daemon-style worker instead of spawning a new thread per
-    request that then blocks on a lock.
+    cleanly instead of spawning a new thread per request that then blocks on a
+    lock. Shutdown cancels work that has not started and tracks the executor's
+    non-daemon worker under the process-wide deadline.
     """
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="pressay-input"
         )
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self._shutdown_complete = threading.Event()
+        self._shutdown_thread: threading.Thread | None = None
 
-    def submit(self, action: Callable[[], Any]) -> None:
-        self._executor.submit(self._run, action)
+    def submit(self, action: Callable[[], Any]) -> bool:
+        with self._state_lock:
+            if self._closed:
+                return False
+            self._executor.submit(self._run, action)
+            return True
 
     @staticmethod
     def _run(action: Callable[[], Any]) -> None:
@@ -132,8 +157,64 @@ class _InputActionWorker:
             # serializing worker; the next queued request still has to run.
             LOGGER.exception("input_action_failed")
 
-    def shutdown(self) -> None:
-        self._executor.shutdown(wait=False)
+    def shutdown(self) -> threading.Event:
+        """Close submissions immediately and finish the executor off-thread."""
+
+        with self._state_lock:
+            if self._closed:
+                return self._shutdown_complete
+            self._closed = True
+            # Cancel pending clipboard/input effects synchronously. The second
+            # blocking shutdown below only waits for the action already running.
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            thread = threading.Thread(
+                target=self._wait_for_shutdown,
+                name="pressay-input-close",
+                daemon=True,
+            )
+            self._shutdown_thread = thread
+            thread.start()
+            return self._shutdown_complete
+
+    def _wait_for_shutdown(self) -> None:
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            LOGGER.exception("input_worker_shutdown_failed")
+            return
+        self._shutdown_complete.set()
+
+
+def _save_settings_transaction(
+    updated: AppConfig,
+    coordinator: _WindowsHotkeyCoordinator | None,
+    *,
+    previous_hotkeys: Any,
+    before_hotkey_change: Callable[[], Any],
+    on_applied: Callable[[AppConfig], None],
+    on_failed: Callable[[BaseException], None],
+) -> Future[bool] | None:
+    """Persist only through the serialized runtime-hotkey commit path."""
+
+    if coordinator is not None:
+        return coordinator.request_change(
+            updated.hotkeys,
+            before_replace=(
+                before_hotkey_change
+                if updated.hotkeys != previous_hotkeys
+                else None
+            ),
+            persist=updated.save,
+            on_applied=lambda: on_applied(updated),
+            on_failed=on_failed,
+        )
+    try:
+        updated.save()
+    except ConfigError as exc:
+        on_failed(exc)
+        return None
+    on_applied(updated)
+    return None
 
 
 def _configure_logging() -> None:
@@ -167,6 +248,57 @@ def _overlay_auto_hide_ms(state: str) -> int:
     return 1500 if state in {"ready", "success", "warning", "error"} else 0
 
 
+_MACOS_HOTKEY_PERMISSION_WARNING = (
+    "Глобальные клавиши недоступны. Откройте System Settings → Privacy & "
+    "Security → Accessibility и Input Monitoring, разрешите Pressay (или "
+    "Python, если macOS показывает его), затем полностью закройте и снова "
+    "запустите Pressay."
+)
+_MACOS_HOTKEY_TRAY_ERROR = "Нужны разрешения macOS"
+
+
+def _effective_tray_status(
+    text: str,
+    state: str,
+    runtime_warning: str | None,
+) -> tuple[str, str]:
+    """Keep a fatal startup warning visible across later routine statuses."""
+
+    if runtime_warning:
+        return _MACOS_HOTKEY_TRAY_ERROR, "error"
+    return text, state
+
+
+def _report_hotkey_start_failure(
+    error: BaseException,
+    *,
+    macos: bool,
+    background: bool,
+    window: Any,
+    tray: Any,
+) -> str | None:
+    """Report a global-hotkey startup failure without exposing error details."""
+
+    LOGGER.error(
+        "hotkey_service_failed type=%s",
+        type(error).__name__,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    if macos:
+        message = _MACOS_HOTKEY_PERMISSION_WARNING
+        window.set_runtime_warning(message)
+        tray.update_state(_MACOS_HOTKEY_TRAY_ERROR, "error")
+        tray.notify("Pressay", message, warning=True)
+        if background:
+            tray.show_window()
+        return message
+
+    message = "Глобальные клавиши недоступны. Полностью перезапустите Pressay."
+    tray.update_state("Глобальные клавиши недоступны", "error")
+    tray.notify("Pressay", message, warning=True)
+    return None
+
+
 def _start_shutdown_watchdog(
     shutdown_complete: threading.Event,
     *,
@@ -197,16 +329,19 @@ def _start_shutdown_watchdog(
 def _start_native_shutdown(
     controller: DictationController,
     hotkey_service: Any | None,
+    input_worker: _InputActionWorker | None = None,
+    microphone_probe: MicrophoneProbeCoordinator | None = None,
     *,
     timeout_seconds: float = 3.0,
     hard_exit: Any = os._exit,
 ) -> tuple[threading.Event, threading.Thread, threading.Thread]:
     """Stop native services off the GUI thread under one hard deadline.
 
-    Controller/PortAudio cleanup and the low-level keyboard hook are independent
-    daemon workers, so one stuck native call cannot prevent the other cleanup
-    from starting. The watchdog is started first and also covers a synchronous
-    hang inside ``controller.close()`` itself.
+    Controller/PortAudio cleanup, the low-level keyboard hook and the serialized
+    input executor are independent, so one stuck native call cannot prevent the
+    other cleanup from starting. The watchdog is started first and also covers
+    a synchronous hang inside ``controller.close()`` or an in-flight clipboard
+    transaction.
     """
 
     shutdown_complete = threading.Event()
@@ -217,6 +352,26 @@ def _start_native_shutdown(
     )
     controller_call_done = threading.Event()
     hotkey_done = threading.Event()
+    input_done = threading.Event()
+    microphone_probe_done = threading.Event()
+    if microphone_probe is None:
+        microphone_probe_done.set()
+    else:
+        try:
+            # This only closes the gate and sets a cancellation event. Native
+            # cancel/PortAudio close remain on the probe worker.
+            microphone_probe_done = microphone_probe.shutdown()
+        except Exception:
+            LOGGER.exception("microphone_probe_shutdown_start_failed")
+    if input_worker is None:
+        input_done.set()
+    else:
+        try:
+            input_done = input_worker.shutdown()
+        except Exception:
+            # Keep input_done unset so the watchdog remains authoritative if
+            # the executor could not enter its bounded shutdown path.
+            LOGGER.exception("input_worker_shutdown_start_failed")
 
     def close_controller() -> None:
         try:
@@ -227,13 +382,20 @@ def _start_native_shutdown(
             controller_call_done.set()
 
     def stop_hotkeys() -> None:
+        stopped_cleanly = hotkey_service is None
         try:
             if hotkey_service is not None:
-                hotkey_service.stop()
+                stopped_cleanly = hotkey_service.stop() is not False
+                if not stopped_cleanly:
+                    LOGGER.error("hotkey_stop_incomplete")
         except Exception:
             LOGGER.exception("hotkey_stop_failed")
         finally:
-            hotkey_done.set()
+            # An explicit False means the service retained live native threads
+            # for background cleanup.  Do not declare shutdown complete: the
+            # process watchdog remains the final bound for an orphaned hook.
+            if stopped_cleanly:
+                hotkey_done.set()
 
     controller_thread = threading.Thread(
         target=close_controller,
@@ -251,6 +413,8 @@ def _start_native_shutdown(
     def coordinate() -> None:
         controller_call_done.wait()
         hotkey_done.wait()
+        input_done.wait()
+        microphone_probe_done.wait()
         try:
             native_closed = controller.wait_closed()
         except Exception:
@@ -268,6 +432,16 @@ def _start_native_shutdown(
     return shutdown_complete, watchdog, coordinator
 
 
+def _release_single_instance_after_shutdown(
+    single_instance: _SingleInstance,
+    shutdown_complete: threading.Event,
+) -> None:
+    """Keep the process lock until every bounded shutdown participant is done."""
+
+    shutdown_complete.wait()
+    single_instance.close()
+
+
 def _load_config() -> _ConfigLoadResult:
     try:
         return _ConfigLoadResult(AppConfig.load())
@@ -283,6 +457,7 @@ def _load_config() -> _ConfigLoadResult:
             remove_fillers=False,
             voice_press_enter=False,
             voice_formatting=False,
+            voice_translate=False,
             snippets={},
             replacements={},
         )
@@ -294,12 +469,29 @@ def _load_config() -> _ConfigLoadResult:
         return _ConfigLoadResult(safe_config, warning)
 
 
-def _microphones() -> list[MicrophoneChoice]:
+def _unavailable_microphone_name(value: object) -> str:
+    parsed = parse_microphone_selector(value)
+    if parsed is not None:
+        return parsed[0]
+    if type(value) is int or (isinstance(value, str) and value.isdecimal()):
+        return f"устройство #{int(value)}"
+    if isinstance(value, str):
+        display = value.strip()
+        if display.startswith(
+            (MICROPHONE_SELECTOR_PREFIX, LEGACY_MICROPHONE_SELECTOR_PREFIX)
+        ):
+            return "сохранённый микрофон"
+        if display:
+            return display
+    return "сохранённый микрофон"
+
+
+def _microphones(selected: object = None) -> list[MicrophoneChoice]:
     result = [MicrophoneChoice(None, "Системный микрофон по умолчанию")]
     try:
         devices = AudioRecorder.list_input_devices()
     except AudioCaptureError:
-        return result
+        devices = []
     seen: set[str] = set()
     for device in sorted(devices, key=lambda item: (not item.is_default, item.index)):
         selector = device.stable_selector
@@ -317,15 +509,20 @@ def _microphones() -> list[MicrophoneChoice]:
                 is_default=device.is_default,
             )
         )
+    if selected is not None and microphone_choice_index(result, selected) < 0:
+        result.append(
+            MicrophoneChoice(
+                selected,  # exact legacy/stable value must survive a no-op save
+                f"Недоступен: {_unavailable_microphone_name(selected)}",
+                available=False,
+            )
+        )
     return result
 
 
 def _settings_dict(config: AppConfig) -> dict[str, Any]:
-    microphone: str | int | None = config.microphone
-    if isinstance(microphone, str) and microphone.isdecimal():
-        microphone = int(microphone)
     return {
-        "microphone": microphone,
+        "microphone": config.microphone,
         "language": config.language,
         "model": config.model,
         "resource_mode": config.resource_mode,
@@ -334,6 +531,8 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "remove_fillers": config.remove_fillers,
         "press_enter": config.voice_press_enter,
         "voice_formatting": config.voice_formatting,
+        "voice_translate": config.voice_translate,
+        "translate_model": config.translate_model,
         "strict_editable_check": config.strict_editable_check,
         "replacements": dict(config.replacements),
         "hotkeys": config.hotkeys.to_mapping(),
@@ -354,10 +553,7 @@ def _build_microphone_test_handler(
     *,
     window: Any,
     tray: Any,
-    status_callback: Callable[[str, str], None],
-    notification_callback: Callable[[str, str, bool], None],
-    recorder_factory: Callable[..., AudioRecorder] = AudioRecorder,
-    thread_factory: Callable[..., threading.Thread] = threading.Thread,
+    microphone_probe: MicrophoneProbeCoordinator,
 ) -> Callable[[], None]:
     """Build the microphone-test slot: no settings save, form's own device.
 
@@ -373,22 +569,58 @@ def _build_microphone_test_handler(
             window.update_status(str(exc), "error")
             tray.notify("Pressay", str(exc), warning=True)
             return
-        window.update_status("Проверяю микрофон…", "processing")
         device = _test_microphone_device(values.get("microphone"))
 
-        def work() -> None:
-            try:
-                recorder = recorder_factory(device=device)
-                rate = recorder.warmup(0.10)
-            except Exception as exc:
-                status_callback("Микрофон недоступен", "error")
-                notification_callback("Pressay", str(exc), True)
-            else:
-                status_callback(f"Микрофон готов: {int(rate)} Hz", "success")
+        def complete(result: MicrophoneProbeResult) -> None:
+            text, state, notification = _microphone_probe_presentation(result)
+            window.finish_microphone_test(text, state)
+            if notification is not None:
+                tray.notify("Pressay", notification, warning=True)
 
-        thread_factory(target=work, name="pressay-mic-test", daemon=True).start()
+        if microphone_probe.running:
+            return
+        window.begin_microphone_test()
+        started = microphone_probe.start(
+            device,
+            on_level=window.update_microphone_test_level,
+            on_complete=complete,
+        )
+        if not started and not microphone_probe.running:
+            message = "Проверка микрофона сейчас недоступна. Перезапустите Pressay."
+            window.finish_microphone_test(message, "error")
+            tray.notify("Pressay", message, warning=True)
 
     return test_microphone
+
+
+def _microphone_probe_presentation(
+    result: MicrophoneProbeResult,
+) -> tuple[str, str, str | None]:
+    if result.signal_detected:
+        return "Сигнал микрофона обнаружен", "success", None
+    if result.error_kind == "silent":
+        message = (
+            "Сигнал не обнаружен. Проверьте выбранный микрофон, уровень входа "
+            "и разрешение на доступ."
+        )
+        return message, "warning", message
+    if result.error_kind == "device":
+        message = (
+            "Выбранный микрофон недоступен. Выберите другой микрофон или "
+            "освободите его в настройках звука."
+        )
+        return message, "error", message
+    if result.error_kind == "stream":
+        message = (
+            "Поток микрофона прерван. Закройте приложение, которое использует "
+            "микрофон, и повторите проверку."
+        )
+        return message, "error", message
+    message = (
+        "Не удалось проверить микрофон. Проверьте разрешение на доступ и "
+        "настройки звука."
+    )
+    return message, "error", message
 
 
 def _snapshot_target(*, strict_editable_check: bool = False) -> Any | None:
@@ -457,7 +689,6 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Pressay")
     app.setOrganizationName("Local")
     app.setQuitOnLastWindowClosed(False)
-    app.aboutToQuit.connect(single_instance.close)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         LOGGER.error("system_tray_unavailable")
@@ -465,19 +696,31 @@ def main(argv: list[str] | None = None) -> int:
     config_load = _load_config()
     config = config_load.config
     signals = UiSignals()
-    window = SettingsWindow(signals, _settings_dict(config), _microphones())
+    window = SettingsWindow(
+        signals,
+        _settings_dict(config),
+        _microphones(config.microphone),
+    )
     tray = TrayController(signals, window)
     app.aboutToQuit.connect(window.prepare_to_quit)
 
     dispatcher = _MainThreadDispatcher()
+    hotkey_runtime_warning: str | None = None
 
     def dispatch_ui(callback: Any, *args: Any, **kwargs: Any) -> None:
         dispatcher.requested.emit(callback, args, kwargs)
 
+    microphone_probe = MicrophoneProbeCoordinator(dispatch_ui)
+
     def status_callback(text: str, state: str) -> None:
         def update() -> None:
             window.update_status(text, state)
-            tray.update_state(text, state)
+            tray_text, tray_state = _effective_tray_status(
+                text,
+                state,
+                hotkey_runtime_warning,
+            )
+            tray.update_state(tray_text, tray_state)
             auto_hide = _overlay_auto_hide_ms(state)
             overlay.show_status(text, state, auto_hide_ms=auto_hide)
 
@@ -499,7 +742,10 @@ def main(argv: list[str] | None = None) -> int:
         notification_callback=notification_callback,
         model_ready_callback=model_ready_callback,
     )
-    overlay = StatusOverlay(level_provider=controller.current_recording_rms)
+    overlay = StatusOverlay(
+        level_provider=controller.current_recording_rms,
+        translation_provider=lambda: controller.translating,
+    )
 
     def start_or_stop(*, capture_target: bool = False) -> None:
         if controller.is_recording:
@@ -525,13 +771,23 @@ def main(argv: list[str] | None = None) -> int:
     signals.paste_last_requested.connect(lambda: input_worker.submit(controller.paste_last))
     signals.copy_last_requested.connect(lambda: input_worker.submit(controller.copy_last))
 
-    # Filled in once the hotkey service exists; empty when it failed to start.
-    hotkey_restart: dict[str, Any] = {}
+    hotkey_coordinator: _WindowsHotkeyCoordinator | None = None
 
-    def save_settings(values: dict[str, Any]) -> None:
+    def apply_saved_settings(updated: AppConfig) -> None:
         nonlocal config
         previous_resource_mode = config.resource_mode
-        previous_hotkeys = config.hotkeys
+        config = updated
+        controller.update_config(config)
+        if previous_resource_mode == "eco" and config.resource_mode != "eco":
+            controller.warmup_model()
+        window.update_status("Настройки сохранены", "success")
+
+    def report_settings_failure(error: BaseException) -> None:
+        message = f"Не удалось применить настройки: {error}"
+        window.update_status(message, "error")
+        tray.notify("Pressay", message, warning=True)
+
+    def save_settings(values: dict[str, Any]) -> None:
         microphone = values.get("microphone")
         try:
             hotkeys = hotkey_bindings.from_mapping(
@@ -545,12 +801,14 @@ def main(argv: list[str] | None = None) -> int:
         updated = AppConfig(
             model=str(values.get("model", config.model)),
             language=str(values.get("language", config.language)),
-            microphone=None if microphone is None else str(microphone),
+            microphone=microphone,
             auto_insert=bool(values.get("auto_insert", config.auto_insert)),
             smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
             remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
             voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
             voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
+            voice_translate=bool(values.get("voice_translate", config.voice_translate)),
+            translate_model=str(values.get("translate_model", config.translate_model)),
             strict_editable_check=bool(
                 values.get("strict_editable_check", config.strict_editable_check)
             ),
@@ -559,29 +817,23 @@ def main(argv: list[str] | None = None) -> int:
             replacements=dict(values.get("replacements", config.replacements)),
             hotkeys=hotkeys,
         )
-        try:
-            updated.save()
-        except ConfigError as exc:
-            # Keep the previous config in memory: a failed write must not leave
-            # the running app on settings that were never persisted.
-            tray.notify("Pressay", str(exc), warning=True)
-            return
-        config = updated
-        controller.update_config(config)
-        if previous_resource_mode == "eco" and config.resource_mode != "eco":
-            controller.warmup_model()
-        restart_hotkeys = hotkey_restart.get("restart")
-        if hotkeys != previous_hotkeys and restart_hotkeys is not None:
-            restart_hotkeys(hotkeys)
-        window.update_status("Настройки сохранены", "success")
+        if hotkey_coordinator is not None:
+            window.update_status("Применяю настройки…", "processing")
+        _save_settings_transaction(
+            updated,
+            hotkey_coordinator,
+            previous_hotkeys=config.hotkeys,
+            before_hotkey_change=controller.request_cancel,
+            on_applied=apply_saved_settings,
+            on_failed=report_settings_failure,
+        )
 
     signals.save_requested.connect(save_settings)
 
     test_microphone = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=status_callback,
-        notification_callback=notification_callback,
+        microphone_probe=microphone_probe,
     )
     signals.microphone_test_requested.connect(test_microphone)
 
@@ -596,7 +848,14 @@ def main(argv: list[str] | None = None) -> int:
 
             hotkey_type = WindowsHotkeyService
 
-        def hotkey_callback(action: Any) -> None:
+        def hotkey_callback(
+            action: Any,
+            still_current: Callable[[], bool] = lambda: True,
+        ) -> bool | None:
+            # Quartz must decide whether to suppress Esc before its event-tap
+            # callback returns. Other actions keep their existing async path.
+            if is_macos() and action == HotkeyAction.CANCEL:
+                return controller.request_cancel()
             # PASTE_LAST/COPY_LAST must not go through the Qt-thread dispatch
             # below; they share the same serialized input worker as the
             # Qt-signal path so a hotkey and a button click never race.
@@ -608,6 +867,8 @@ def main(argv: list[str] | None = None) -> int:
                 return
 
             def handle() -> None:
+                if not still_current():
+                    return
                 if action == getattr(HotkeyAction, "HOLD_CANDIDATE", None):
                     controller.prepare_capture()
                 elif action == getattr(HotkeyAction, "HOLD_ABANDONED", None):
@@ -627,47 +888,28 @@ def main(argv: list[str] | None = None) -> int:
 
             dispatch_ui(handle)
 
-        # macOS chords are still fixed, so only the Windows service is
-        # configurable; passing bindings it does not accept would break it.
-        hotkey_kwargs = {} if is_macos() else {"bindings": config.hotkeys}
-        hotkey_service = hotkey_type(hotkey_callback, **hotkey_kwargs)
-        hotkey_service.start()
-
-        if not is_macos():
-
-            def restart_hotkeys(bindings: Any) -> None:
-                """Swap the keyboard hook for one bound to the new chords.
-
-                Runs off the Qt thread: stopping the service joins the hook,
-                dispatcher and watchdog threads, which must not freeze the
-                settings window.
-                """
-
-                def swap() -> None:
-                    nonlocal hotkey_service
-                    try:
-                        if hotkey_service is not None:
-                            hotkey_service.stop()
-                        service = hotkey_type(hotkey_callback, bindings=bindings)
-                        service.start()
-                        hotkey_service = service
-                    except Exception as exc:
-                        LOGGER.exception("hotkey_restart_failed")
-                        notification_callback(
-                            "Pressay",
-                            f"Не удалось применить новые клавиши: {exc}. "
-                            "Перезапустите Pressay.",
-                            True,
-                        )
-
-                threading.Thread(
-                    target=swap, name="pressay-hotkey-swap", daemon=True
-                ).start()
-
-            hotkey_restart["restart"] = restart_hotkeys
+        if is_macos():
+            hotkey_service = hotkey_type(hotkey_callback)
+            hotkey_service.start()
+        else:
+            hotkey_coordinator = _WindowsHotkeyCoordinator(
+                hotkey_type,
+                hotkey_callback,
+                dispatch_ui,
+                config.hotkeys,
+            )
+            hotkey_coordinator.start()
+            # Native shutdown owns the stable coordinator so an in-flight
+            # candidate cannot appear after a captured service was stopped.
+            hotkey_service = hotkey_coordinator
     except Exception as exc:
-        LOGGER.exception("hotkey_service_failed")
-        tray.notify("Pressay", f"Глобальные клавиши недоступны: {exc}", warning=True)
+        hotkey_runtime_warning = _report_hotkey_start_failure(
+            exc,
+            macos=is_macos(),
+            background=args.background,
+            window=window,
+            tray=tray,
+        )
 
     shutdown_started = False
     shutdown_handle: tuple[threading.Event, threading.Thread, threading.Thread] | None = None
@@ -679,9 +921,12 @@ def main(argv: list[str] | None = None) -> int:
         shutdown_started = True
         # Start the hard deadline before touching PortAudio, CUDA or the
         # low-level keyboard hook. All native cleanup happens off the Qt thread.
-        shutdown_handle = _start_native_shutdown(controller, hotkey_service)
-        # Never block application exit on a queued/in-flight paste or copy.
-        input_worker.shutdown()
+        shutdown_handle = _start_native_shutdown(
+            controller,
+            hotkey_service,
+            input_worker,
+            microphone_probe,
+        )
 
     def quit_application() -> None:
         begin_shutdown()
@@ -699,7 +944,12 @@ def main(argv: list[str] | None = None) -> int:
         status_callback("Не удалось запустить подготовку модели", "error")
     if config_load.warning:
         window.update_status("Ошибка config.json — автовставка отключена", "error")
-        tray.update_state("Ошибка config.json — автовставка отключена", "error")
+        tray_text, tray_state = _effective_tray_status(
+            "Ошибка config.json — автовставка отключена",
+            "error",
+            hotkey_runtime_warning,
+        )
+        tray.update_state(tray_text, tray_state)
         tray.notify("Pressay", config_load.warning, warning=True)
     # Record which source tree is actually running: several shortcuts have
     # pointed at stale copies of the project, and a stale copy is otherwise
@@ -710,6 +960,12 @@ def main(argv: list[str] | None = None) -> int:
         Path(__file__).resolve().parent,
     )
     exit_code = int(app.exec())
+    # aboutToQuit normally starts cleanup. Keep this fallback for an event-loop
+    # return that bypasses the signal, then retain the singleton until cleanup
+    # is complete. A stuck participant remains covered by the active watchdog.
+    begin_shutdown()
+    assert shutdown_handle is not None
+    _release_single_instance_after_shutdown(single_instance, shutdown_handle[0])
     LOGGER.info("application_exited code=%d", exit_code)
     return exit_code
 

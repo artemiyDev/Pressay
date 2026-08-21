@@ -8,8 +8,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from pressay.audio import AudioStreamError, AudioTooShortError, SilentAudioError
 from pressay.config import AppConfig
-from pressay.controller import DictationController, _prepare_insertion_text, _setup_command
+from pressay.controller import (
+    DictationController,
+    _prepare_insertion_text,
+    _setup_command,
+    _setup_recovery_instruction,
+)
 from pressay.platform_support import hotkey_hint
 from pressay.transcriber import TranscriptionResult, TranscriptionTimings
 from pressay.windows_input import ForegroundTarget, send_text as real_send_text
@@ -28,11 +34,59 @@ class FakeRecording:
     limit_reached: bool = False
 
 
+@pytest.mark.parametrize(
+    ("error", "expected_status", "notification_fragment"),
+    (
+        (
+            AudioTooShortError("too short"),
+            ("Запись слишком короткая", "warning"),
+            "немного дольше",
+        ),
+        (
+            SilentAudioError("silent"),
+            ("Сигнал микрофона не обнаружен", "warning"),
+            "уровень входа",
+        ),
+        (
+            AudioStreamError(
+                reason="portaudio_status",
+                status_messages=("overflow",),
+                captured_samples=100,
+                source_rate=48_000,
+            ),
+            ("Ошибка аудиопотока", "error"),
+            "Поток микрофона прерван",
+        ),
+    ),
+)
+def test_recording_failures_have_distinct_actionable_messages(
+    error: Exception,
+    expected_status: tuple[str, str],
+    notification_fragment: str,
+) -> None:
+    assert DictationController._stop_failure_presentation(error) == expected_status
+    assert notification_fragment in DictationController._stop_failure_notification(error)
+
+
 def test_setup_command_is_native_to_each_platform(monkeypatch) -> None:
     monkeypatch.setattr("pressay.platform_support.sys.platform", "darwin")
     assert _setup_command("small") == "bash scripts/setup-macos.sh --model small"
     monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
     assert _setup_command("small") == ".\\scripts\\setup.ps1 -Model small"
+
+
+def test_setup_recovery_requires_windows_app_to_exit(monkeypatch) -> None:
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "darwin")
+    mac_instruction = _setup_recovery_instruction("small")
+    assert mac_instruction == (
+        "Запустите bash scripts/setup-macos.sh --model small и перезапустите Pressay."
+    )
+
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
+    windows_instruction = _setup_recovery_instruction("small")
+    assert "Полностью выйдите из Pressay через меню в трее" in windows_instruction
+    assert ".\\scripts\\setup.ps1 -Model small" in windows_instruction
+    assert windows_instruction.endswith("и откройте Pressay снова.")
 
 
 class FakeRecorder:
@@ -839,6 +893,229 @@ def test_auto_insert_exception_keeps_result_without_copying(monkeypatch) -> None
     assert statuses[-1] == ("Не вставлено — текст сохранён ниже", "warning")
     assert notifications and hotkey_hint("copy") in str(notifications[-1][1])
     controller.close()
+
+
+def _recovery_controller() -> tuple[
+    DictationController,
+    list[tuple[str, str]],
+    list[tuple[object, ...]],
+]:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    holder: dict[str, DictationController] = {}
+
+    def assert_callback_outside_lock() -> None:
+        controller = holder["controller"]
+        assert not controller._lock._is_owned()  # type: ignore[attr-defined]
+
+    def status_callback(text: str, state: str) -> None:
+        assert_callback_outside_lock()
+        statuses.append((text, state))
+
+    def notification_callback(*args: object) -> None:
+        assert_callback_outside_lock()
+        notifications.append(args)
+
+    controller = DictationController(
+        AppConfig(),
+        status_callback=status_callback,
+        result_callback=lambda *_args: None,
+        notification_callback=notification_callback,
+    )
+    holder["controller"] = controller
+    controller.last_transcript = "текст для восстановления"
+    return controller, statuses, notifications
+
+
+def test_copy_last_reports_real_success_outside_lock(monkeypatch) -> None:
+    controller, statuses, notifications = _recovery_controller()
+    copied: list[str] = []
+
+    def copy_text(text: str) -> SimpleNamespace:
+        copied.append(text)
+        return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(copy_text=copy_text),
+    )
+    try:
+        assert controller.copy_last() is True
+        assert copied == ["текст для восстановления"]
+        assert statuses == [("Скопировано", "success")]
+        assert notifications == []
+        assert controller.last_transcript == "текст для восстановления"
+    finally:
+        controller.close()
+
+
+def test_copy_last_reports_unsuccessful_outcome_without_losing_text(monkeypatch) -> None:
+    controller, statuses, notifications = _recovery_controller()
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(
+            copy_text=lambda _text: SimpleNamespace(
+                success=False,
+                reason="clipboard_write_failed",
+            )
+        ),
+    )
+    try:
+        assert controller.copy_last() is False
+        assert statuses == [("Не скопировано — текст сохранён ниже", "warning")]
+        assert notifications == [
+            (
+                "Pressay",
+                "Не удалось скопировать последнюю расшифровку. "
+                "Текст сохранён в окне Pressay.",
+                True,
+            )
+        ]
+        assert controller.last_transcript == "текст для восстановления"
+    finally:
+        controller.close()
+
+
+def test_copy_last_reports_exception_without_losing_text(monkeypatch) -> None:
+    controller, statuses, notifications = _recovery_controller()
+
+    def fail_copy(_text: str) -> None:
+        raise RuntimeError("simulated clipboard failure")
+
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(copy_text=fail_copy),
+    )
+    try:
+        assert controller.copy_last() is False
+        assert statuses == [("Не скопировано — текст сохранён ниже", "warning")]
+        assert len(notifications) == 1
+        assert notifications[0][0] == "Pressay"
+        assert notifications[0][2] is True
+        assert controller.last_transcript == "текст для восстановления"
+    finally:
+        controller.close()
+
+
+def test_paste_last_reports_success_outside_lock_without_copying(monkeypatch) -> None:
+    controller, statuses, notifications = _recovery_controller()
+    pasted: list[str] = []
+
+    def paste_last(text: str, **_kwargs: object) -> SimpleNamespace:
+        pasted.append(text)
+        return SimpleNamespace(success=True, copied=False)
+
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(
+            paste_last=paste_last,
+            copy_text=lambda _text: pytest.fail("paste success must not copy"),
+        ),
+    )
+    try:
+        assert controller.paste_last() is True
+        assert pasted == ["текст для восстановления"]
+        assert statuses == [("Вставлено", "success")]
+        assert notifications == []
+        assert controller.last_transcript == "текст для восстановления"
+    finally:
+        controller.close()
+
+
+def test_paste_last_reports_when_backend_copied_but_did_not_insert(monkeypatch) -> None:
+    controller, statuses, notifications = _recovery_controller()
+    copy_calls: list[str] = []
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(
+            paste_last=lambda _text, **_kwargs: SimpleNamespace(
+                success=False,
+                copied=True,
+                reason="physical_modifiers_not_released",
+            ),
+            copy_text=copy_calls.append,
+        ),
+    )
+    try:
+        assert controller.paste_last() is False
+        assert copy_calls == []
+        assert statuses == [("Не вставлено — текст скопирован", "warning")]
+        assert notifications == [
+            (
+                "Pressay",
+                "Не удалось вставить последнюю расшифровку, но текст "
+                "скопирован в буфер обмена. Вставьте его вручную.",
+                True,
+            )
+        ]
+        assert controller.last_transcript == "текст для восстановления"
+    finally:
+        controller.close()
+
+
+def test_paste_last_reports_failure_without_implicit_copy(monkeypatch) -> None:
+    controller, statuses, notifications = _recovery_controller()
+    copy_calls: list[str] = []
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(
+            paste_last=lambda _text, **_kwargs: SimpleNamespace(
+                success=False,
+                copied=False,
+                reason="target_mismatch",
+            ),
+            copy_text=copy_calls.append,
+        ),
+    )
+    try:
+        assert controller.paste_last() is False
+        assert copy_calls == []
+        assert statuses == [("Не вставлено: сменилось активное окно", "warning")]
+        assert len(notifications) == 1
+        assert hotkey_hint("copy") in str(notifications[0][1])
+        assert controller.last_transcript == "текст для восстановления"
+    finally:
+        controller.close()
+
+
+@pytest.mark.parametrize("action_name", ["copy_last", "paste_last"])
+def test_recovery_action_close_while_backend_blocks_suppresses_late_callbacks(
+    monkeypatch,
+    action_name: str,
+) -> None:
+    controller, statuses, notifications = _recovery_controller()
+    entered = threading.Event()
+    release = threading.Event()
+    results: list[bool] = []
+
+    def blocked_failure(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        entered.set()
+        assert release.wait(timeout=2)
+        return SimpleNamespace(success=False, copied=False, reason="input_failed")
+
+    monkeypatch.setattr(
+        "pressay.controller.input_adapter",
+        lambda: SimpleNamespace(
+            copy_text=blocked_failure,
+            paste_last=blocked_failure,
+        ),
+    )
+    worker = threading.Thread(
+        target=lambda: results.append(bool(getattr(controller, action_name)())),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=1)
+
+    controller.close()
+    release.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert results == [False]
+    assert statuses == []
+    assert notifications == []
+    assert controller.wait_closed(2)
 
 
 def test_paste_last_exception_never_falls_back_to_implicit_copy(monkeypatch) -> None:

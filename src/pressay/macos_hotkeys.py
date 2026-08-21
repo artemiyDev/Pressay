@@ -103,7 +103,11 @@ class MacHotkeyStateMachine:
 
 
 class MacOSHotkeyService:
-    """Long-lived Quartz event tap with bounded startup and clean shutdown."""
+    """Long-lived Quartz event tap with bounded startup and clean shutdown.
+
+    A callback must return literal ``True`` for ``CANCEL`` to suppress the
+    matching Escape down/up pair. Other callback results are ignored.
+    """
 
     _SPACE = 49
     _V = 9
@@ -112,7 +116,7 @@ class MacOSHotkeyService:
 
     def __init__(
         self,
-        callback: Callable[[HotkeyAction], None] | None = None,
+        callback: Callable[[HotkeyAction], object] | None = None,
         *,
         hold_delay_s: float = 0.12,
     ) -> None:
@@ -128,6 +132,8 @@ class MacOSHotkeyService:
         self._quartz: Any | None = None
         self._startup_error: BaseException | None = None
         self._suppressed: set[int] = set()
+        self._escape_pressed = False
+        self._escape_generation = 0
 
     def start(self) -> None:
         if sys.platform != "darwin":
@@ -138,6 +144,7 @@ class MacOSHotkeyService:
             self._started.clear()
             self._stopped.clear()
             self._startup_error = None
+            self._reset_escape_state()
             self._thread = threading.Thread(
                 target=self._run,
                 name="PressayMacHotkeys",
@@ -168,6 +175,7 @@ class MacOSHotkeyService:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
+        self._reset_escape_state()
         for action in self._machine.shutdown():
             self._emit(action)
 
@@ -178,12 +186,12 @@ class MacOSHotkeyService:
     def __exit__(self, *_: object) -> None:
         self.stop()
 
-    def _emit(self, action: HotkeyAction) -> None:
+    def _emit(self, action: HotkeyAction) -> object:
         try:
-            self._callback(action)
+            return self._callback(action)
         except Exception:
             # A user callback must not tear down the global event tap.
-            pass
+            return None
 
     def _emit_many(self, actions: tuple[HotkeyAction, ...]) -> None:
         for action in actions:
@@ -230,6 +238,51 @@ class MacOSHotkeyService:
             self._cancel_timer()
         return actions
 
+    def _reset_escape_state(self) -> None:
+        """Forget an incomplete Escape pair after lifecycle/tap recovery."""
+
+        with self._lock:
+            self._escape_generation += 1
+            self._escape_pressed = False
+            self._suppressed.discard(self._ESCAPE)
+
+    def _handle_escape(self, *, key_down: bool, is_repeat: bool = False) -> bool:
+        """Return whether this phase belongs to an accepted cancel gesture."""
+
+        with self._lock:
+            if not key_down:
+                suppressed = self._ESCAPE in self._suppressed
+                self._reset_escape_state()
+                return suppressed
+            if is_repeat:
+                if not self._escape_pressed:
+                    return False
+                return self._ESCAPE in self._suppressed
+
+            # A non-repeat down is a new physical press. Recover even if the
+            # preceding key-up was lost while the event tap was unavailable.
+            self._escape_generation += 1
+            generation = self._escape_generation
+            self._escape_pressed = True
+            self._suppressed.discard(self._ESCAPE)
+
+        accepted = self._emit(HotkeyAction.CANCEL) is True
+        with self._lock:
+            # stop(), start(), tap recovery or another non-repeat down may have
+            # invalidated this callback while it ran outside the service lock.
+            if generation != self._escape_generation or not self._escape_pressed:
+                return False
+            if accepted:
+                self._suppressed.add(self._ESCAPE)
+        return accepted
+
+    def _recover_disabled_tap(self, quartz: Any, event: Any) -> Any:
+        """Reset incomplete pairing before Quartz resumes event delivery."""
+
+        self._reset_escape_state()
+        quartz.CGEventTapEnable(self._tap, True)
+        return event
+
     def _run(self) -> None:  # pragma: no cover - exercised on a real Mac
         try:
             import ApplicationServices as ax
@@ -255,8 +308,7 @@ class MacOSHotkeyService:
                     Quartz.kCGEventTapDisabledByTimeout,
                     Quartz.kCGEventTapDisabledByUserInput,
                 }:
-                    Quartz.CGEventTapEnable(self._tap, True)
-                    return event
+                    return self._recover_disabled_tap(Quartz, event)
                 flags = int(Quartz.CGEventGetFlags(event))
                 chord = (flags & modifier_mask) == modifier_mask
                 self._emit_many(self._update_chord(chord))
@@ -267,15 +319,24 @@ class MacOSHotkeyService:
                         event, Quartz.kCGKeyboardEventKeycode
                     )
                 )
+                if keycode == self._ESCAPE:
+                    suppress = self._handle_escape(
+                        key_down=event_type == Quartz.kCGEventKeyDown,
+                        is_repeat=(
+                            event_type == Quartz.kCGEventKeyDown
+                            and bool(
+                                Quartz.CGEventGetIntegerValueField(
+                                    event, Quartz.kCGKeyboardEventAutorepeat
+                                )
+                            )
+                        ),
+                    )
+                    return None if suppress else event
                 if event_type == Quartz.kCGEventKeyUp and keycode in self._suppressed:
                     self._suppressed.discard(keycode)
                     return None
                 if event_type != Quartz.kCGEventKeyDown:
                     return event
-                if keycode == self._ESCAPE:
-                    self._emit_many(self._machine.cancel())
-                    self._suppressed.add(keycode)
-                    return None
                 shortcuts = {
                     self._SPACE: HotkeyAction.TOGGLE,
                     self._V: HotkeyAction.PASTE_LAST,

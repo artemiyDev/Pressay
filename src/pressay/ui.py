@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -34,7 +35,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
@@ -43,7 +47,7 @@ from PySide6.QtWidgets import (
 
 from . import hotkey_bindings
 from .audio import SILENCE_RMS_THRESHOLD
-from .platform_support import platform_label
+from .platform_support import hotkey_hint, is_macos, platform_label
 from .text import replacement_key
 
 
@@ -95,6 +99,9 @@ LIGHT_THEME = {
     "subtitle_text": "#64748b",
     "privacy_bg": "#ecfdf5",
     "privacy_text": "#475569",
+    "warning_bg": "#fffbeb",
+    "warning_border": "#f59e0b",
+    "warning_text": "#92400e",
 }
 DARK_THEME = {
     "status_bg": "#1e293b",
@@ -102,6 +109,9 @@ DARK_THEME = {
     "subtitle_text": "#94a3b8",
     "privacy_bg": "#0f172a",
     "privacy_text": "#e2e8f0",
+    "warning_bg": "#451a03",
+    "warning_border": "#f59e0b",
+    "warning_text": "#fde68a",
 }
 
 
@@ -172,14 +182,15 @@ def parse_replacements(text: str) -> dict[str, str]:
 
 @dataclass(slots=True)
 class MicrophoneChoice:
-    value: str | None
+    value: str | int | None
     name: str
     legacy_index: int | None = None
     device_name: str | None = None
     is_default: bool = False
+    available: bool = True
 
     @property
-    def index(self) -> str | None:
+    def index(self) -> str | int | None:
         """Compatibility alias for callers from the index-based UI."""
 
         return self.value
@@ -216,7 +227,7 @@ def microphone_choice_index(
         ]
         if matches:
             return min(matches, key=lambda item: (not item[1].is_default, item[0]))[0]
-    return 0
+    return -1
 
 
 class UiSignals(QObject):
@@ -261,7 +272,11 @@ def recording_level_fraction(rms: float) -> float:
 class StatusOverlay(QWidget):
     """A bottom-centre overlay that never steals keyboard focus."""
 
-    def __init__(self, level_provider: Callable[[], float] | None = None) -> None:
+    def __init__(
+        self,
+        level_provider: Callable[[], float] | None = None,
+        translation_provider: Callable[[], bool] | None = None,
+    ) -> None:
         super().__init__(None)
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -284,8 +299,15 @@ class StatusOverlay(QWidget):
         self._dot.setFont(QFont("Segoe UI", 13))
         self._label = QLabel("Готов")
         self._label.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
+        self._translation_badge = QLabel("→ EN")
+        self._translation_badge.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._translation_badge.setStyleSheet(
+            f"color: {STATE_COLORS_DARK['processing']}; font-weight: 700;"
+        )
+        self._translation_badge.hide()
         content_layout.addWidget(self._dot)
         content_layout.addWidget(self._label)
+        content_layout.addWidget(self._translation_badge)
         frame_layout.addLayout(content_layout)
         self._level_track = QFrame()
         self._level_track.setFixedHeight(5)
@@ -306,6 +328,7 @@ class StatusOverlay(QWidget):
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
         self._level_provider = level_provider
+        self._translation_provider = translation_provider
         self._level_fraction = 0.0
         self._level_timer = QTimer(self)
         self._level_timer.setInterval(50)
@@ -359,6 +382,11 @@ class StatusOverlay(QWidget):
         self._label.setText(text)
         self._apply_color(STATE_COLORS_DARK.get(state, STATE_COLORS_DARK["idle"]))
         recording = state == "recording"
+        try:
+            translating = bool(self._translation_provider()) if recording and self._translation_provider else False
+        except Exception:
+            translating = False
+        self._translation_badge.setVisible(translating)
         self._level_track.setVisible(recording)
         self.adjustSize()
         screen = QApplication.primaryScreen()
@@ -385,26 +413,59 @@ class SettingsWindow(QMainWindow):
         signals: UiSignals,
         settings: dict[str, Any],
         microphones: list[MicrophoneChoice],
+        *,
+        macos: bool | None = None,
     ) -> None:
         super().__init__()
         self.signals = signals
+        self._is_macos = is_macos() if macos is None else macos
         self.setWindowTitle("Pressay")
         self.setWindowIcon(make_icon())
-        self.setMinimumWidth(560)
-        self.resize(620, 790)
+        self.setMinimumSize(440, 320)
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            initial_width, initial_height = 620, 700
+        else:
+            available = screen.availableGeometry()
+            initial_width = min(620, max(self.minimumWidth(), available.width() - 32))
+            initial_height = min(700, max(self.minimumHeight(), available.height() - 32))
+        self.resize(initial_width, initial_height)
         self._really_close = False
         self._recent_transcripts: deque[str] = deque(maxlen=20)
         # Remembered so a later theme switch can redraw the status card
         # without a second, competing definition of "what the status is".
         self._status_text = "Готов к диктовке"
         self._status_state: str | None = None
+        self._microphone_test_active = False
         # Muted explanatory lines; recolored together on a theme switch.
         self._hint_labels: list[QLabel] = []
         self._color_scheme = detect_color_scheme()
 
         root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(24, 22, 24, 22)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setObjectName("settingsScroll")
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.settings_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.settings_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        settings_content = QWidget()
+        settings_content.setObjectName("settingsContent")
+        settings_content.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        layout = QVBoxLayout(settings_content)
+        layout.setContentsMargins(15, 18, 15, 18)
         layout.setSpacing(16)
 
         brand_row = QHBoxLayout()
@@ -415,6 +476,11 @@ class SettingsWindow(QMainWindow):
         title = QLabel("Pressay")
         title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
         self._subtitle_label = QLabel(f"Локальная диктовка в любом приложении {platform_label()}")
+        self._subtitle_label.setWordWrap(True)
+        self._subtitle_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
         brand_text.addWidget(title)
         brand_text.addWidget(self._subtitle_label)
         brand_row.addWidget(brand_icon)
@@ -424,37 +490,70 @@ class SettingsWindow(QMainWindow):
 
         self.status_label = QLabel(self._status_text)
         self.status_label.setObjectName("statusCard")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        self.runtime_warning_label = QLabel()
+        self.runtime_warning_label.setObjectName("runtimeWarning")
+        self.runtime_warning_label.setAccessibleName("Предупреждение Pressay")
+        self.runtime_warning_label.setWordWrap(True)
+        self.runtime_warning_label.setVisible(False)
+        layout.addWidget(self.runtime_warning_label)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         form.setVerticalSpacing(12)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         self.microphone_combo = QComboBox()
+        self._make_combo_responsive(self.microphone_combo)
         for microphone in microphones:
             self.microphone_combo.addItem(microphone.name, microphone.value)
+            if not microphone.available:
+                item_index = self.microphone_combo.count() - 1
+                self.microphone_combo.setItemData(
+                    item_index,
+                    "Этот сохранённый микрофон сейчас не найден. Выберите "
+                    "другой или оставьте значение без изменений.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         selected_mic = settings.get("microphone")
         selected_index = microphone_choice_index(microphones, selected_mic)
         self.microphone_combo.setCurrentIndex(selected_index)
         form.addRow("Микрофон", self.microphone_combo)
 
+        self.microphone_test_meter = QProgressBar()
+        self.microphone_test_meter.setObjectName("microphoneTestMeter")
+        self.microphone_test_meter.setRange(0, 1000)
+        self.microphone_test_meter.setValue(0)
+        self.microphone_test_meter.setTextVisible(False)
+        self.microphone_test_meter.setFixedHeight(8)
+        self.microphone_test_meter.setAccessibleName("Уровень сигнала микрофона")
+        self.microphone_test_meter.setAccessibleDescription(
+            "Проверка не запущена"
+        )
+        form.addRow("Сигнал", self.microphone_test_meter)
+
         self.language_combo = QComboBox()
+        self._make_combo_responsive(self.language_combo)
         self.language_combo.addItem("Автоматически (RU/EN)", "auto")
         self.language_combo.addItem("Русский", "ru")
         self.language_combo.addItem("English", "en")
         language_index = self.language_combo.findData(settings.get("language", "auto"))
         self.language_combo.setCurrentIndex(max(0, language_index))
         form.addRow("Язык", self.language_combo)
-        language_hint = QLabel(
+        self.language_hint = QLabel(
             "Постоянный язык примерно на треть быстрее: определение языка "
-            "пропускается. Но речь на другом языке будет не распознана, "
-            "а переведена — без предупреждения."
+            "пропускается. Речь на другом языке может распознаться неверно — "
+            "выбирайте постоянный язык только для одноязычной диктовки."
         )
-        language_hint.setWordWrap(True)
-        self._hint_labels.append(language_hint)
-        form.addRow("", language_hint)
+        self.language_hint.setWordWrap(True)
+        self._hint_labels.append(self.language_hint)
+        form.addRow("", self.language_hint)
 
         self.model_combo = QComboBox()
+        self._make_combo_responsive(self.model_combo)
         for label, value in (
             ("Small — быстрый старт (~0.5 ГБ)", "small"),
             ("Medium — выше качество (~1.5 ГБ)", "medium"),
@@ -470,10 +569,11 @@ class SettingsWindow(QMainWindow):
         form.addRow("", self.active_model_label)
 
         self.resource_mode_combo = QComboBox()
+        self._make_combo_responsive(self.resource_mode_combo)
         for label, value in (
-            ("Мгновенно — модель всегда в GPU", "instant"),
+            ("Мгновенно — модель остаётся загруженной", "instant"),
             ("Сбалансированно — выгрузить через 5 минут", "balanced"),
-            ("Экономно — выгружать после каждой фразы", "eco"),
+            ("Экономно — выгружать после каждой диктовки", "eco"),
         ):
             self.resource_mode_combo.addItem(label, value)
         resource_index = self.resource_mode_combo.findData(
@@ -483,19 +583,49 @@ class SettingsWindow(QMainWindow):
         form.addRow("Ресурсы", self.resource_mode_combo)
         layout.addLayout(form)
 
-        self.auto_insert_checkbox = QCheckBox("Автоматически вставлять в исходное окно")
+        self.auto_insert_checkbox = QCheckBox("Автовставка текста")
+        self.auto_insert_checkbox.setToolTip(
+            "Автоматически вставлять текст в исходное окно"
+        )
         self.auto_insert_checkbox.setChecked(bool(settings.get("auto_insert", True)))
-        self.smart_spacing_checkbox = QCheckBox("Добавлять пробел между диктовками")
+        self.smart_spacing_checkbox = QCheckBox("Пробел между диктовками")
+        self.smart_spacing_checkbox.setToolTip(
+            "Добавлять пробел между последовательными диктовками"
+        )
         self.smart_spacing_checkbox.setChecked(bool(settings.get("smart_spacing", True)))
-        self.remove_fillers_checkbox = QCheckBox("Удалять явные слова-паразиты (опционально)")
+        self.remove_fillers_checkbox = QCheckBox("Удалять слова-паразиты")
+        self.remove_fillers_checkbox.setToolTip(
+            "Удалять только явные слова-паразиты"
+        )
         self.remove_fillers_checkbox.setChecked(bool(settings.get("remove_fillers", False)))
-        self.press_enter_checkbox = QCheckBox('Разрешить голосовую команду «нажми Enter»')
+        self.press_enter_checkbox = QCheckBox('Голосом: «нажми Enter»')
+        self.press_enter_checkbox.setToolTip(
+            "Разрешить голосовую команду для нажатия Enter"
+        )
         self.press_enter_checkbox.setChecked(bool(settings.get("press_enter", False)))
         self.voice_formatting_checkbox = QCheckBox(
-            'Голосовые команды форматирования: «с новой строки», «абзац»'
+            "Голосовое форматирование"
+        )
+        self.voice_formatting_checkbox.setToolTip(
+            "Команды «с новой строки» и «абзац»"
         )
         self.voice_formatting_checkbox.setChecked(bool(settings.get("voice_formatting", False)))
+        voice_formatting_hint = QLabel(
+            "Команды форматирования: «с новой строки» и «абзац»."
+        )
+        voice_formatting_hint.setWordWrap(True)
+        self._hint_labels.append(voice_formatting_hint)
+        self.voice_translate_checkbox = QCheckBox(
+            "Голосом переключать перевод"
+        )
+        self.voice_translate_checkbox.setToolTip(
+            "Голосом включать и выключать перевод на английский"
+        )
+        self.voice_translate_checkbox.setChecked(bool(settings.get("voice_translate", False)))
         self.strict_editable_check_checkbox = QCheckBox(
+            "Строгая проверка поля"
+        )
+        self.strict_editable_check_checkbox.setToolTip(
             "Вставлять только в надёжно распознанные поля ввода"
         )
         self.strict_editable_check_checkbox.setChecked(
@@ -506,6 +636,38 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self.remove_fillers_checkbox)
         layout.addWidget(self.press_enter_checkbox)
         layout.addWidget(self.voice_formatting_checkbox)
+        layout.addWidget(voice_formatting_hint)
+        layout.addWidget(self.voice_translate_checkbox)
+
+        translation_form = QFormLayout()
+        translation_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        translation_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        translation_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.translate_model_combo = QComboBox()
+        self._make_combo_responsive(self.translate_model_combo)
+        for label, value in (
+            ("Small — быстрее, ниже качество", "small"),
+            ("Medium — баланс качества и скорости", "medium"),
+            ("Large v3 — рекомендовано", "large-v3"),
+        ):
+            self.translate_model_combo.addItem(label, value)
+        translate_model_index = self.translate_model_combo.findData(
+            settings.get("translate_model", "large-v3")
+        )
+        self.translate_model_combo.setCurrentIndex(max(0, translate_model_index))
+        translation_form.addRow("Модель перевода", self.translate_model_combo)
+        layout.addLayout(translation_form)
+
+        translation_hint = QLabel(
+            "Включение: «переведи на английский». Выключение: «хватит "
+            "переводить». Перевод работает только на английский; Turbo его не "
+            "поддерживает, поэтому по умолчанию используется отдельная Large v3."
+        )
+        translation_hint.setWordWrap(True)
+        self._hint_labels.append(translation_hint)
+        layout.addWidget(translation_hint)
         layout.addWidget(self.strict_editable_check_checkbox)
 
         strict_editable_check_hint = QLabel(
@@ -519,73 +681,170 @@ class SettingsWindow(QMainWindow):
 
         hotkeys_defaults = hotkey_bindings.HotkeyBindings().to_mapping()
         hotkeys_settings = settings.get("hotkeys", hotkeys_defaults)
+        self._initial_hotkeys = (
+            hotkey_bindings.from_mapping(hotkeys_settings).to_mapping()
+            if self._is_macos
+            else {}
+        )
 
-        hotkeys_label = QLabel("Горячие клавиши")
+        hotkeys_label = QLabel(
+            "Горячие клавиши macOS" if self._is_macos else "Горячие клавиши"
+        )
         hotkeys_label.setStyleSheet("font-weight: 600;")
         layout.addWidget(hotkeys_label)
 
-        hotkeys_form = QFormLayout()
-        hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        hotkeys_form.setVerticalSpacing(12)
+        self.macos_hotkeys_panel: QWidget | None = None
+        self.hotkeys_editor: QWidget | None = None
+        if self._is_macos:
+            self.macos_hotkeys_panel = QWidget()
+            self.macos_hotkeys_panel.setObjectName("macosFixedHotkeys")
+            macos_hotkeys_form = QFormLayout(self.macos_hotkeys_panel)
+            macos_hotkeys_form.setContentsMargins(0, 0, 0, 0)
+            macos_hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+            macos_hotkeys_form.setVerticalSpacing(10)
+            macos_hotkeys_form.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            macos_hotkeys_form.setRowWrapPolicy(
+                QFormLayout.RowWrapPolicy.WrapLongRows
+            )
+            self.macos_shortcut_labels: dict[str, QLabel] = {}
+            for action_label, action in (
+                ("Диктовка при удержании", "hold"),
+                ("Включить / выключить запись", "toggle"),
+                ("Отмена", "cancel"),
+                ("Вставить последнюю", "paste"),
+                ("Скопировать", "copy"),
+            ):
+                shortcut = hotkey_hint(action)
+                value = QLabel(shortcut or "—")
+                value.setWordWrap(True)
+                value.setAccessibleName(f"{action_label}: {shortcut or 'не назначено'}")
+                self.macos_shortcut_labels[action] = value
+                macos_hotkeys_form.addRow(action_label, value)
+            layout.addWidget(self.macos_hotkeys_panel)
 
-        self.hold_modifiers_combo = QComboBox()
-        for pair in hotkey_bindings.HOLD_MODIFIER_PAIRS:
-            canonical = "+".join(pair)
-            label = "+".join(part.capitalize() for part in pair)
-            self.hold_modifiers_combo.addItem(label, canonical)
-        hold_index = self.hold_modifiers_combo.findData(
-            hotkeys_settings.get("hold_modifiers", hotkeys_defaults["hold_modifiers"])
-        )
-        self.hold_modifiers_combo.setCurrentIndex(max(0, hold_index))
-        hotkeys_form.addRow("Комбинация удержания", self.hold_modifiers_combo)
+            macos_hotkeys_hint = QLabel(
+                "Сочетания macOS фиксированы. Для глобальных клавиш нужны "
+                "разрешения Accessibility и Input Monitoring."
+            )
+            macos_hotkeys_hint.setWordWrap(True)
+            self._hint_labels.append(macos_hotkeys_hint)
+            layout.addWidget(macos_hotkeys_hint)
+        else:
+            self.hotkeys_editor = QWidget()
+            windows_hotkeys_layout = QVBoxLayout(self.hotkeys_editor)
+            windows_hotkeys_layout.setContentsMargins(0, 0, 0, 0)
+            windows_hotkeys_layout.setSpacing(12)
 
-        self.push_to_talk_checkbox = QCheckBox(
-            "Push-to-talk (при выключении запись включается и выключается только "
-            "сочетанием с клавишей переключения, без удержания)"
-        )
-        self.push_to_talk_checkbox.setChecked(
-            bool(hotkeys_settings.get("push_to_talk", hotkeys_defaults["push_to_talk"]))
-        )
-        hotkeys_form.addRow(self.push_to_talk_checkbox)
+            hotkeys_form = QFormLayout()
+            hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+            hotkeys_form.setVerticalSpacing(12)
+            hotkeys_form.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            hotkeys_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
-        self.toggle_key_edit = QLineEdit(
-            str(hotkeys_settings.get("toggle_key", hotkeys_defaults["toggle_key"]))
-        )
-        hotkeys_form.addRow("Клавиша переключения", self.toggle_key_edit)
+            self.hold_modifiers_combo = QComboBox()
+            self._make_combo_responsive(self.hold_modifiers_combo)
+            for pair in hotkey_bindings.HOLD_MODIFIER_PAIRS:
+                canonical = "+".join(pair)
+                label = "+".join(part.capitalize() for part in pair)
+                self.hold_modifiers_combo.addItem(label, canonical)
+            hold_index = self.hold_modifiers_combo.findData(
+                hotkeys_settings.get(
+                    "hold_modifiers", hotkeys_defaults["hold_modifiers"]
+                )
+            )
+            self.hold_modifiers_combo.setCurrentIndex(max(0, hold_index))
+            hotkeys_form.addRow("Комбинация удержания", self.hold_modifiers_combo)
 
-        self.paste_last_edit = QLineEdit(
-            str(hotkeys_settings.get("paste_last", hotkeys_defaults["paste_last"]))
-        )
-        hotkeys_form.addRow("Вставить последнюю", self.paste_last_edit)
+            self.push_to_talk_checkbox = QCheckBox("Push-to-talk")
+            self.push_to_talk_checkbox.setToolTip(
+                "Удерживать сочетание горячих клавиш во время речи"
+            )
+            self.push_to_talk_checkbox.setChecked(
+                bool(
+                    hotkeys_settings.get(
+                        "push_to_talk", hotkeys_defaults["push_to_talk"]
+                    )
+                )
+            )
+            hotkeys_form.addRow(self.push_to_talk_checkbox)
+            push_to_talk_hint = QLabel(
+                "Если выключено, сочетание с клавишей переключения запускает и "
+                "останавливает запись без удержания."
+            )
+            push_to_talk_hint.setWordWrap(True)
+            self._hint_labels.append(push_to_talk_hint)
+            hotkeys_form.addRow("", push_to_talk_hint)
 
-        self.copy_last_edit = QLineEdit(
-            str(hotkeys_settings.get("copy_last", hotkeys_defaults["copy_last"]))
-        )
-        hotkeys_form.addRow("Скопировать", self.copy_last_edit)
-        layout.addLayout(hotkeys_form)
+            self.toggle_key_edit = QLineEdit(
+                str(
+                    hotkeys_settings.get(
+                        "toggle_key", hotkeys_defaults["toggle_key"]
+                    )
+                )
+            )
+            hotkeys_form.addRow("Клавиша переключения", self.toggle_key_edit)
 
-        hotkeys_format_label = QLabel(
-            "Части сочетания пишутся через «+»: модификаторы ctrl, win, shift, alt "
-            "и одна обычная клавиша — буква, цифра, space или f1–f12. Слово none "
-            "отключает действие."
-        )
-        hotkeys_format_label.setWordWrap(True)
-        self._hint_labels.append(hotkeys_format_label)
-        layout.addWidget(hotkeys_format_label)
+            self.paste_last_edit = QLineEdit(
+                str(
+                    hotkeys_settings.get(
+                        "paste_last", hotkeys_defaults["paste_last"]
+                    )
+                )
+            )
+            hotkeys_form.addRow("Вставить последнюю", self.paste_last_edit)
 
-        hotkeys_conflict_label = QLabel(
-            "Внимание, возможные конфликты: Ctrl+Alt на многих раскладках равносилен "
-            "AltGr и используется для ввода символов; Ctrl+Shift и Shift+Alt — "
-            "стандартные сочетания переключения раскладки Windows; Ctrl+Win "
-            "(по умолчанию) конфликтов не имеет."
-        )
-        hotkeys_conflict_label.setWordWrap(True)
-        self._hint_labels.append(hotkeys_conflict_label)
-        layout.addWidget(hotkeys_conflict_label)
+            self.copy_last_edit = QLineEdit(
+                str(
+                    hotkeys_settings.get(
+                        "copy_last", hotkeys_defaults["copy_last"]
+                    )
+                )
+            )
+            hotkeys_form.addRow("Скопировать", self.copy_last_edit)
+            windows_hotkeys_layout.addLayout(hotkeys_form)
 
-        dictionary_label = QLabel("Личный словарь: произношение = правильное написание")
+            hotkeys_format_label = QLabel(
+                "Части сочетания пишутся через «+»: модификаторы ctrl, win, "
+                "shift, alt и одна обычная клавиша — буква, цифра, space или "
+                "f1–f12. Слово none отключает действие."
+            )
+            hotkeys_format_label.setWordWrap(True)
+            self._hint_labels.append(hotkeys_format_label)
+            windows_hotkeys_layout.addWidget(hotkeys_format_label)
+
+            self.hotkeys_conflict_label = QLabel(
+                "Внимание, возможные конфликты: Ctrl+Alt на многих раскладках "
+                "равносилен AltGr и используется для ввода символов; Ctrl+Shift "
+                "и Shift+Alt — стандартные сочетания переключения раскладки "
+                "Windows; Ctrl+Win тоже может пересекаться с системными или "
+                "приложенческими сочетаниями. Универсально бесконфликтной пары нет."
+            )
+            self.hotkeys_conflict_label.setWordWrap(True)
+            self._hint_labels.append(self.hotkeys_conflict_label)
+            windows_hotkeys_layout.addWidget(self.hotkeys_conflict_label)
+            layout.addWidget(self.hotkeys_editor)
+
+        dictionary_label = QLabel("Личный словарь")
+        dictionary_label.setToolTip(
+            "Формат строки: произношение = правильное написание"
+        )
         dictionary_label.setStyleSheet("font-weight: 600;")
+        dictionary_hint = QLabel(
+            "Формат строки: произношение = правильное написание."
+        )
+        dictionary_hint.setWordWrap(True)
+        self._hint_labels.append(dictionary_hint)
         self.dictionary_edit = QTextEdit()
+        self.dictionary_edit.setTabChangesFocus(True)
+        self.dictionary_edit.setAccessibleName("Личный словарь")
+        self.dictionary_edit.setAccessibleDescription(
+            "Строки в формате: произношение = правильное написание"
+        )
+        dictionary_label.setBuddy(self.dictionary_edit)
         self.dictionary_edit.setPlaceholderText(
             "фаст апи = FastAPI\nдокер композ = Docker Compose"
         )
@@ -594,21 +853,35 @@ class SettingsWindow(QMainWindow):
         )
         self.dictionary_edit.setMaximumHeight(90)
         layout.addWidget(dictionary_label)
+        layout.addWidget(dictionary_hint)
         layout.addWidget(self.dictionary_edit)
 
-        actions = QHBoxLayout()
+        self.action_panel = QFrame()
+        self.action_panel.setObjectName("stickyActions")
+        actions = QGridLayout(self.action_panel)
+        actions.setContentsMargins(20, 10, 20, 14)
+        actions.setSpacing(8)
         self.toggle_button = QPushButton("Тестовая диктовка")
-        self.toggle_button.setDefault(True)
+        self.toggle_button.setAccessibleName("Тестовая диктовка")
+        self.toggle_button.setToolTip("Начать или завершить тестовую диктовку")
+        self.toggle_button.setAutoDefault(False)
+        self.toggle_button.setDefault(False)
         self.toggle_button.clicked.connect(signals.toggle_requested)
         self.test_button = QPushButton("Проверить микрофон")
+        self.test_button.setAccessibleName("Проверить микрофон")
+        self.test_button.setToolTip("Проверить выбранный микрофон")
+        self.test_button.setAutoDefault(False)
+        self.test_button.setDefault(False)
         self.test_button.clicked.connect(signals.microphone_test_requested)
-        save_button = QPushButton("Сохранить")
-        save_button.clicked.connect(self._emit_save)
-        actions.addWidget(self.toggle_button)
-        actions.addWidget(self.test_button)
-        actions.addStretch(1)
-        actions.addWidget(save_button)
-        layout.addLayout(actions)
+        self.save_button = QPushButton("Сохранить")
+        self.save_button.setAutoDefault(False)
+        self.save_button.setDefault(False)
+        self.save_button.clicked.connect(self._emit_save)
+        actions.addWidget(self.toggle_button, 0, 0, 1, 2)
+        actions.addWidget(self.test_button, 1, 0)
+        actions.addWidget(self.save_button, 1, 1)
+        actions.setColumnStretch(0, 1)
+        actions.setColumnStretch(1, 1)
 
         history_label = QLabel("История расшифровок")
         history_label.setStyleSheet("font-weight: 600;")
@@ -616,34 +889,55 @@ class SettingsWindow(QMainWindow):
         history_hint.setWordWrap(True)
         self._hint_labels.append(history_hint)
         self.last_transcript = _TranscriptHistoryList()
+        self.last_transcript.setAccessibleName("История расшифровок")
+        self.last_transcript.setAccessibleDescription(
+            "До 20 записей, только в памяти до закрытия приложения"
+        )
+        history_label.setBuddy(self.last_transcript)
         self.last_transcript.setMaximumHeight(190)
         self.last_transcript.itemDoubleClicked.connect(self._copy_transcript_item)
         layout.addWidget(history_label)
         layout.addWidget(history_hint)
         layout.addWidget(self.last_transcript)
 
-        last_actions = QHBoxLayout()
+        last_actions = QGridLayout()
         paste_button = QPushButton("Вставить последнюю")
+        paste_button.setToolTip("Вставить последнюю расшифровку")
         paste_button.clicked.connect(signals.paste_last_requested)
         self.copy_transcript_button = QPushButton("Копировать")
         self.copy_transcript_button.setEnabled(False)
         self.copy_transcript_button.clicked.connect(self._copy_selected_transcript)
         self.clear_transcript_history_button = QPushButton("Очистить историю")
+        self.clear_transcript_history_button.setToolTip("Очистить историю расшифровок")
         self.clear_transcript_history_button.clicked.connect(self._clear_transcript_history)
-        last_actions.addWidget(paste_button)
-        last_actions.addWidget(self.copy_transcript_button)
-        last_actions.addWidget(self.clear_transcript_history_button)
-        last_actions.addStretch(1)
+        last_actions.addWidget(paste_button, 0, 0)
+        last_actions.addWidget(self.copy_transcript_button, 0, 1)
+        last_actions.addWidget(self.clear_transcript_history_button, 1, 0)
+        last_actions.setColumnStretch(2, 1)
         layout.addLayout(last_actions)
 
         self._privacy_label = QLabel(
             "🔒 Аудио не покидает компьютер и не сохраняется на диск. "
-            "Сеть нужна только для первой загрузки модели."
+            "Сеть нужна только для загрузки выбранных моделей; распознавание "
+            "затем работает локально."
         )
         self._privacy_label.setWordWrap(True)
         layout.addWidget(self._privacy_label)
 
+        self.settings_scroll.setWidget(settings_content)
+        root_layout.addWidget(self.settings_scroll, 1)
+        root_layout.addWidget(self.action_panel, 0)
         self.setCentralWidget(root)
+        self.setTabOrder(self.dictionary_edit, self.last_transcript)
+        self.setTabOrder(self.last_transcript, paste_button)
+        self.setTabOrder(paste_button, self.copy_transcript_button)
+        self.setTabOrder(
+            self.copy_transcript_button,
+            self.clear_transcript_history_button,
+        )
+        self.setTabOrder(self.clear_transcript_history_button, self.toggle_button)
+        self.setTabOrder(self.toggle_button, self.test_button)
+        self.setTabOrder(self.test_button, self.save_button)
         self._apply_theme(self._color_scheme)
 
         # The style hints singleton outlives this window; PySide auto-drops
@@ -653,6 +947,43 @@ class SettingsWindow(QMainWindow):
         color_scheme_changed = getattr(style_hints, "colorSchemeChanged", None)
         if color_scheme_changed is not None:
             color_scheme_changed.connect(self._on_color_scheme_changed)
+
+    @staticmethod
+    def _make_combo_responsive(combo: QComboBox) -> None:
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        combo.setMinimumContentsLength(12)
+        combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        combo.currentTextChanged.connect(combo.setToolTip)
+        combo.currentTextChanged.connect(combo.setAccessibleDescription)
+
+    def focusNextPrevChild(self, next: bool) -> bool:  # noqa: N802 - Qt API
+        changed = super().focusNextPrevChild(next)
+        if changed:
+            QTimer.singleShot(0, self, self._scroll_focused_setting_into_view)
+        return changed
+
+    def _scroll_focused_setting_into_view(self) -> None:
+        focused = QApplication.focusWidget()
+        content = self.settings_scroll.widget()
+        if focused is None or content is None or not content.isAncestorOf(focused):
+            return
+
+        margin = 8
+        top = focused.mapTo(content, QPoint(0, 0)).y()
+        bottom = top + focused.height()
+        viewport_height = self.settings_scroll.viewport().height()
+        scrollbar = self.settings_scroll.verticalScrollBar()
+        visible_top = scrollbar.value()
+        visible_bottom = visible_top + viewport_height
+        if top - margin < visible_top:
+            scrollbar.setValue(top - margin)
+        elif bottom + margin > visible_bottom:
+            scrollbar.setValue(bottom + margin - viewport_height)
 
     def current_settings(self) -> dict[str, Any]:
         return {
@@ -665,12 +996,16 @@ class SettingsWindow(QMainWindow):
             "remove_fillers": self.remove_fillers_checkbox.isChecked(),
             "press_enter": self.press_enter_checkbox.isChecked(),
             "voice_formatting": self.voice_formatting_checkbox.isChecked(),
+            "voice_translate": self.voice_translate_checkbox.isChecked(),
+            "translate_model": self.translate_model_combo.currentData(),
             "strict_editable_check": self.strict_editable_check_checkbox.isChecked(),
             "replacements": parse_replacements(self.dictionary_edit.toPlainText()),
             "hotkeys": self._current_hotkeys(),
         }
 
     def _current_hotkeys(self) -> dict[str, Any]:
+        if self._is_macos:
+            return dict(self._initial_hotkeys)
         raw = {
             "hold_modifiers": self.hold_modifiers_combo.currentData(),
             "toggle_key": self.toggle_key_edit.text(),
@@ -698,6 +1033,52 @@ class SettingsWindow(QMainWindow):
         self.status_label.setText(text)
         self._restyle_status()
         self.toggle_button.setText("Завершить тест" if state == "recording" else "Тестовая диктовка")
+
+    def begin_microphone_test(self) -> None:
+        """Reset and lock microphone controls for one bounded signal probe."""
+
+        self._microphone_test_active = True
+        self.microphone_combo.setEnabled(False)
+        self.test_button.setEnabled(False)
+        self.test_button.setText("Проверяю…")
+        self.microphone_test_meter.setValue(0)
+        self.microphone_test_meter.setAccessibleDescription(
+            "Говорите обычным голосом"
+        )
+        self.update_status("Говорите обычным голосом…", "processing")
+
+    def update_microphone_test_level(self, rms: float, peak: float) -> None:
+        """Render scalar probe levels without retaining captured audio."""
+
+        if not self._microphone_test_active:
+            return
+        fraction = max(recording_level_fraction(rms), recording_level_fraction(peak))
+        self.microphone_test_meter.setValue(round(fraction * 1000))
+        self.microphone_test_meter.setAccessibleDescription(
+            f"RMS {max(0.0, rms):.5f}; пик {max(0.0, peak):.5f}"
+        )
+
+    def finish_microphone_test(self, text: str, state: str) -> None:
+        """Restore controls and clear transient meter state after a probe."""
+
+        if not self._microphone_test_active:
+            return
+        self._microphone_test_active = False
+        self.microphone_combo.setEnabled(True)
+        self.test_button.setEnabled(True)
+        self.test_button.setText("Проверить микрофон")
+        self.microphone_test_meter.setValue(0)
+        self.microphone_test_meter.setAccessibleDescription(
+            "Проверка завершена; шкала сброшена"
+        )
+        self.update_status(text, state)
+
+    def set_runtime_warning(self, text: str | None) -> None:
+        """Show a persistent warning independently from transient status updates."""
+
+        message = "" if text is None else text.strip()
+        self.runtime_warning_label.setText(message)
+        self.runtime_warning_label.setVisible(bool(message))
 
     def update_active_model(self, model: str, device: str, compute_type: str) -> None:
         """Show the backend that successfully completed model warmup."""
@@ -740,6 +1121,11 @@ class SettingsWindow(QMainWindow):
         self._privacy_label.setStyleSheet(
             f"color: {tokens['privacy_text']}; background: {tokens['privacy_bg']};"
             " padding: 10px; border-radius: 8px;"
+        )
+        self.runtime_warning_label.setStyleSheet(
+            f"color: {tokens['warning_text']}; background: {tokens['warning_bg']};"
+            f" border: 1px solid {tokens['warning_border']};"
+            " padding: 10px; border-radius: 8px; font-weight: 600;"
         )
         self._restyle_status()
 

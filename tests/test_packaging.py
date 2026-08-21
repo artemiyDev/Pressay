@@ -45,6 +45,23 @@ def _load_pyproject_dependencies() -> tuple[list[str], list[str], list[str]]:
     return dependencies, optional["dev"], optional["macos"]
 
 
+def _load_pyproject_version() -> str:
+    pyproject = PROJECT_ROOT / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        data = tomllib.load(handle)
+    return data["project"]["version"]
+
+
+def _extract_single_match(*, path: Path, pattern: str, label: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    matches = re.findall(pattern, text, flags=re.MULTILINE)
+    assert len(matches) == 1, (
+        f"Expected exactly one {label} in {path.relative_to(PROJECT_ROOT)}, "
+        f"found {len(matches)}."
+    )
+    return matches[0]
+
+
 def _applicable_base_specs(specs: list[str], *, excluded_platform: str) -> set[str]:
     """Base specifiers that install on every platform except ``excluded_platform``.
 
@@ -88,35 +105,29 @@ def _assert_same_specs(
 
 
 def _extract_setup_ps1_pip_specs() -> list[str]:
-    """Pull the quoted package specifiers out of the `pip install` call.
+    """Pull Windows runtime specs from the installer contract function.
 
-    Deliberately not a PowerShell interpreter: this looks for the
-    line-continuation block between the backtick-continued `-m pip install`
-    line and the following `$LASTEXITCODE` check, and reads the quoted
-    strings inside it. If `setup.ps1` is restructured enough that this block
-    can no longer be found, the test fails loudly instead of silently
-    checking nothing.
+    `setup.ps1` consumes this function directly, so the contract has one
+    source of truth while this test still checks it against pyproject.toml.
     """
 
-    text = (SCRIPTS / "setup.ps1").read_text(encoding="utf-8")
+    text = (SCRIPTS / "install-layout.ps1").read_text(encoding="utf-8")
     match = re.search(
-        r"-m pip install\s*`\r?\n"
-        r"((?:.*?\r?\n)*?)"
-        r"\s*if \(\$LASTEXITCODE -ne 0\) \{ throw \"Failed to install Pressay dependencies\.\" \}",
+        r"function Get-PressayWindowsRuntimeDependencySpecs\s*\{"
+        r"(.*?)"
+        r"return \[string\[\]\]@\((.*?)\)\s*\}",
         text,
+        flags=re.DOTALL,
     )
     if match is None:
         pytest.fail(
-            "Could not locate the dependency `pip install` block in "
-            "scripts/setup.ps1. The script format changed; update the regex "
-            "in _extract_setup_ps1_pip_specs() instead of letting this check "
-            "silently pass."
+            "Could not locate Get-PressayWindowsRuntimeDependencySpecs in "
+            "scripts/install-layout.ps1."
         )
-    specs = re.findall(r'"([^"]+)"', match.group(1))
+    specs = re.findall(r'"([^"]+)"', match.group(2))
     if not specs:
         pytest.fail(
-            "No quoted package specifiers were found inside the "
-            "scripts/setup.ps1 `pip install` block; the parser needs updating."
+            "No package specifiers were found in the Windows runtime contract."
         )
     return specs
 
@@ -175,4 +186,32 @@ def test_setup_macos_script_installs_dependencies_from_pyproject_not_a_duplicate
         "scripts/setup-macos.sh no longer installs via the pyproject.toml "
         "'macos' extra. If it now hardcodes a package/version list, add a "
         "parity test against pyproject.toml here."
+    )
+
+
+def test_project_python_and_macos_bundle_versions_match() -> None:
+    """All public version declarations must move together."""
+
+    project_version = _load_pyproject_version()
+    package_version = _extract_single_match(
+        path=PROJECT_ROOT / "src" / "pressay" / "__init__.py",
+        pattern=r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$',
+        label="__version__ assignment",
+    )
+    macos_bundle_version = _extract_single_match(
+        path=SCRIPTS / "install-macos.sh",
+        pattern=(
+            r"<key>CFBundleShortVersionString</key>\s*"
+            r"<string>([^<]+)</string>"
+        ),
+        label="CFBundleShortVersionString declaration",
+    )
+
+    assert package_version == project_version, (
+        "src/pressay/__init__.py __version__ does not match "
+        "pyproject.toml [project].version"
+    )
+    assert macos_bundle_version == project_version, (
+        "scripts/install-macos.sh CFBundleShortVersionString does not match "
+        "pyproject.toml [project].version"
     )

@@ -55,6 +55,9 @@ def test_light_theme_tokens_match_the_original_hardcoded_literals() -> None:
         "subtitle_text": "#64748b",
         "privacy_bg": "#ecfdf5",
         "privacy_text": "#475569",
+        "warning_bg": "#fffbeb",
+        "warning_border": "#f59e0b",
+        "warning_text": "#92400e",
     }
 
 
@@ -63,9 +66,9 @@ def test_dark_theme_tokens_differ_with_dark_backgrounds_and_light_text() -> None
 
     assert dark_tokens == DARK_THEME
     assert dark_tokens != LIGHT_THEME
-    for key in ("status_bg", "privacy_bg"):
+    for key in ("status_bg", "privacy_bg", "warning_bg"):
         assert _relative_luminance(dark_tokens[key]) < _relative_luminance(LIGHT_THEME[key])
-    for key in ("status_text", "subtitle_text", "privacy_text"):
+    for key in ("status_text", "subtitle_text", "privacy_text", "warning_text"):
         assert _relative_luminance(dark_tokens[key]) > _relative_luminance(LIGHT_THEME[key])
 
 
@@ -74,9 +77,11 @@ def test_dark_theme_status_card_and_privacy_meet_wcag_aa_contrast() -> None:
 
     status_ratio = _contrast_ratio(dark_tokens["status_bg"], dark_tokens["status_text"])
     privacy_ratio = _contrast_ratio(dark_tokens["privacy_bg"], dark_tokens["privacy_text"])
+    warning_ratio = _contrast_ratio(dark_tokens["warning_bg"], dark_tokens["warning_text"])
 
     assert status_ratio >= 4.5
     assert privacy_ratio >= 4.5
+    assert warning_ratio >= 4.5
 
 
 def test_dark_state_accents_stay_readable_on_the_dark_status_card() -> None:

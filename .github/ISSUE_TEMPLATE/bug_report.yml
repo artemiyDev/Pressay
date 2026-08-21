@@ -1,0 +1,64 @@
+name: Bug report / Сообщить об ошибке
+description: Report a reproducible Pressay problem / Сообщить о воспроизводимой проблеме
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Pressay. Do not attach audio, transcripts, credentials, full configuration files, or unredacted logs.
+
+        Спасибо за помощь. Не прикладывайте аудио, расшифровки, учётные данные, полные конфиги или неочищенные логи.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform / Платформа
+      options:
+        - Windows 11
+        - macOS 13+
+        - Other / Другое
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit / Версия или commit
+      placeholder: "0.4.0 or commit hash"
+    validations:
+      required: true
+  - type: input
+    id: application
+    attributes:
+      label: Target application / Приложение для вставки
+      description: Name only; do not include window titles or dictated text. / Только название, без заголовка окна и текста диктовки.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps / Шаги воспроизведения
+      description: Use neutral sample text and omit private data. / Используйте нейтральный пример без личных данных.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / Ожидаемое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / Фактическое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics / Очищенная диагностика
+      description: Paste only relevant doctor output or log lines after removing local paths and device details. / Только нужные строки doctor или лога после удаления локальных путей и данных устройств.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check / Проверка приватности
+      options:
+        - label: I removed audio, transcripts, credentials, configuration, window titles, local paths, and other private data. / Я удалил аудио, расшифровки, учётные данные, конфиг, заголовки окон, локальные пути и другие личные данные.
+          required: true
