@@ -15,6 +15,7 @@ from pressay.app import (
     _build_microphone_test_handler,
     _effective_tray_status,
     _load_config,
+    _microphone_probe_presentation,
     _microphones,
     _overlay_auto_hide_ms,
     _release_single_instance_after_shutdown,
@@ -25,9 +26,14 @@ from pressay.app import (
     _test_microphone_device,
 )
 from pressay.controller import DictationController
-from pressay.audio import AudioDevice
+from pressay.audio import (
+    AudioDevice,
+    AudioDeviceError,
+    build_microphone_selector,
+)
 from pressay.config import AppConfig
 from pressay.hotkey_bindings import HotkeyBindings
+from pressay.microphone_probe import MicrophoneProbeResult
 from pressay.ui import (
     MicrophoneChoice,
     SettingsWindow,
@@ -127,11 +133,74 @@ def test_picker_resolves_legacy_index_and_name_to_stable_choice() -> None:
     assert microphone_choice_index(choices, "4") == 1
     assert microphone_choice_index(choices, "usb microphone") == 2
     assert microphone_choice_index(choices, "stable-usb") == 1
-    assert microphone_choice_index(choices, "missing") == 0
+    assert microphone_choice_index(choices, "missing") == -1
     assert _settings_dict(AppConfig(microphone=4))["microphone"] == 4
-    assert _settings_dict(AppConfig(microphone="4"))["microphone"] == 4
+    assert _settings_dict(AppConfig(microphone="4"))["microphone"] == "4"
     assert _settings_dict(AppConfig())["smart_spacing"] is True
     assert _settings_dict(AppConfig(smart_spacing=False))["smart_spacing"] is False
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected_label"),
+    (
+        (7, "Недоступен: устройство #7"),
+        ("7", "Недоступен: устройство #7"),
+        ("Old USB Mic", "Недоступен: Old USB Mic"),
+        (
+            "pressay:microphone:v1?broken",
+            "Недоступен: сохранённый микрофон",
+        ),
+    ),
+)
+def test_picker_keeps_missing_legacy_selector_fail_honest(
+    monkeypatch,
+    selected: object,
+    expected_label: str,
+) -> None:
+    monkeypatch.setattr("pressay.app.AudioRecorder.list_input_devices", lambda: [])
+
+    choices = _microphones(selected)
+
+    assert choices[-1].value == selected
+    assert choices[-1].name == expected_label
+    assert choices[-1].available is False
+    assert microphone_choice_index(choices, selected) == len(choices) - 1
+
+
+def test_picker_decodes_missing_stable_selector_without_showing_encoded_value(
+    monkeypatch,
+) -> None:
+    selected = build_microphone_selector(
+        name="Conference Microphone",
+        host_api="Windows WASAPI",
+        sample_rate=48_000,
+    )
+    monkeypatch.setattr("pressay.app.AudioRecorder.list_input_devices", lambda: [])
+
+    choices = _microphones(selected)
+
+    assert choices[-1].value == selected
+    assert choices[-1].name == "Недоступен: Conference Microphone"
+    assert selected not in choices[-1].name
+    assert choices[-1].available is False
+
+
+def test_picker_keeps_saved_selector_when_device_enumeration_fails(monkeypatch) -> None:
+    selected = "Legacy Microphone"
+
+    def fail_enumeration() -> list[AudioDevice]:
+        raise AudioDeviceError("PortAudio unavailable")
+
+    monkeypatch.setattr(
+        "pressay.app.AudioRecorder.list_input_devices",
+        fail_enumeration,
+    )
+
+    choices = _microphones(selected)
+
+    assert [choice.value for choice in choices] == [None, selected]
+    assert choices[-1].name == "Недоступен: Legacy Microphone"
+    assert choices[-1].available is False
 
 
 def test_personal_dictionary_text_round_trip_and_validation() -> None:
@@ -425,10 +494,68 @@ def test_native_shutdown_does_not_complete_while_hotkey_cleanup_is_live() -> Non
     assert coordinator.is_alive()
 
 
+def test_native_shutdown_waits_for_microphone_probe_native_close() -> None:
+    controller = SimpleNamespace(
+        close=lambda: None,
+        wait_closed=lambda: True,
+    )
+    probe_done = threading.Event()
+    shutdown_call_threads: list[int] = []
+
+    class Probe:
+        running = True
+
+        def shutdown(self) -> threading.Event:
+            shutdown_call_threads.append(threading.get_ident())
+            return probe_done
+
+    exits: list[int] = []
+    caller_thread = threading.get_ident()
+    complete, watchdog, coordinator = _start_native_shutdown(
+        controller,  # type: ignore[arg-type]
+        None,
+        None,
+        Probe(),  # type: ignore[arg-type]
+        timeout_seconds=0.2,
+        hard_exit=exits.append,
+    )
+
+    assert shutdown_call_threads == [caller_thread]
+    assert complete.wait(timeout=0.02) is False
+    probe_done.set()
+    assert complete.wait(timeout=1)
+    coordinator.join(timeout=1)
+    watchdog.join(timeout=1)
+    assert exits == []
+
+
 def test_microphone_device_normalizes_digit_strings_only() -> None:
     assert _test_microphone_device(None) is None
     assert _test_microphone_device("7") == 7
     assert _test_microphone_device("stable-usb-selector") == "stable-usb-selector"
+
+
+@pytest.mark.parametrize(
+    ("error_kind", "state", "fragment"),
+    (
+        ("device", "error", "Выбранный микрофон недоступен"),
+        ("silent", "warning", "уровень входа"),
+        ("stream", "error", "Поток микрофона прерван"),
+        ("capture", "error", "разрешение на доступ"),
+    ),
+)
+def test_microphone_probe_presentation_is_actionable_and_sanitized(
+    error_kind: str,
+    state: str,
+    fragment: str,
+) -> None:
+    text, actual_state, notification = _microphone_probe_presentation(
+        MicrophoneProbeResult(False, None, 0.0, 0.0, 0.0, error_kind)
+    )
+
+    assert actual_state == state
+    assert fragment in text
+    assert notification == text
 
 
 class _FakeMicTestWindow:
@@ -436,6 +563,9 @@ class _FakeMicTestWindow:
         self._settings = settings or {}
         self._error = error
         self.status_calls: list[tuple[str, str]] = []
+        self.begin_calls = 0
+        self.levels: list[tuple[float, float]] = []
+        self.finish_calls: list[tuple[str, str]] = []
 
     def current_settings(self) -> dict:
         if self._error is not None:
@@ -444,6 +574,33 @@ class _FakeMicTestWindow:
 
     def update_status(self, text: str, state: str) -> None:
         self.status_calls.append((text, state))
+
+    def begin_microphone_test(self) -> None:
+        self.begin_calls += 1
+
+    def update_microphone_test_level(self, rms: float, peak: float) -> None:
+        self.levels.append((rms, peak))
+
+    def finish_microphone_test(self, text: str, state: str) -> None:
+        self.finish_calls.append((text, state))
+
+
+class _FakeMicProbe:
+    def __init__(self, result: MicrophoneProbeResult | None = None) -> None:
+        self.result = result
+        self.running = False
+        self.devices: list[object] = []
+
+    def start(self, device: object, *, on_level, on_complete) -> bool:
+        if self.running:
+            return False
+        self.running = True
+        self.devices.append(device)
+        if self.result is not None:
+            on_level(self.result.rms, self.result.peak)
+            self.running = False
+            on_complete(self.result)
+        return True
 
 
 class _FakeMicTestTray:
@@ -461,8 +618,7 @@ def test_microphone_test_handler_reports_form_error_without_raising() -> None:
     handler = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=lambda *_args: None,
-        notification_callback=lambda *_args: None,
+        microphone_probe=_FakeMicProbe(),  # type: ignore[arg-type]
     )
 
     handler()  # must not raise ValueError out of the Qt slot
@@ -480,118 +636,77 @@ def test_microphone_test_handler_never_saves_settings(monkeypatch) -> None:
     monkeypatch.setattr(AppConfig, "save", _forbidden_save)
     window = _FakeMicTestWindow({"microphone": None})
     tray = _FakeMicTestTray()
-    done = threading.Event()
-
-    def status_callback(_text: str, _state: str) -> None:
-        done.set()
+    probe = _FakeMicProbe(MicrophoneProbeResult(True, 48_000, 0.01, 0.02, 0.01))
 
     handler = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=status_callback,
-        notification_callback=lambda *_args: None,
-        recorder_factory=lambda device: SimpleNamespace(warmup=lambda _s: 48_000),
+        microphone_probe=probe,  # type: ignore[arg-type]
     )
 
     handler()
 
-    assert done.wait(timeout=1)
+    assert window.begin_calls == 1
+    assert window.levels == [(0.01, 0.02)]
+    assert window.finish_calls == [("Сигнал микрофона обнаружен", "success")]
+    assert tray.notifications == []
 
 
 def test_microphone_test_handler_uses_form_device_not_saved_config() -> None:
     window = _FakeMicTestWindow({"microphone": "5"})
     tray = _FakeMicTestTray()
-    seen_devices: list[object] = []
-    done = threading.Event()
-
-    def recorder_factory(device: object) -> SimpleNamespace:
-        seen_devices.append(device)
-        return SimpleNamespace(warmup=lambda _s: 44_100)
-
-    def status_callback(_text: str, _state: str) -> None:
-        done.set()
+    probe = _FakeMicProbe(MicrophoneProbeResult(True, 44_100, 0.1, 0.2, 0.1))
 
     handler = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=status_callback,
-        notification_callback=lambda *_args: None,
-        recorder_factory=recorder_factory,
+        microphone_probe=probe,  # type: ignore[arg-type]
     )
 
     handler()
 
-    assert done.wait(timeout=1)
-    assert seen_devices == [5]
+    assert probe.devices == [5]
 
 
-def test_microphone_test_handler_runs_off_the_calling_thread() -> None:
+def test_microphone_test_handler_keeps_single_flight_ui_state() -> None:
     window = _FakeMicTestWindow({"microphone": None})
     tray = _FakeMicTestTray()
-    entered = threading.Event()
-    release = threading.Event()
-    status_events: list[tuple[str, str]] = []
-
-    class BlockingRecorder:
-        def __init__(self, device: object) -> None:
-            self.device = device
-
-        def warmup(self, _duration: float) -> int:
-            entered.set()
-            assert release.wait(timeout=2)
-            return 16_000
+    probe = _FakeMicProbe()
 
     handler = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=lambda text, state: status_events.append((text, state)),
-        notification_callback=lambda *_args: None,
-        recorder_factory=BlockingRecorder,
+        microphone_probe=probe,  # type: ignore[arg-type]
     )
 
     handler()
+    handler()
 
-    # The call above must return before the blocking warmup() unblocks.
-    assert entered.wait(timeout=1)
-    assert status_events == []
-    release.set()
-
-    deadline = time.monotonic() + 1
-    while not status_events and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert status_events == [("Микрофон готов: 16000 Hz", "success")]
+    assert probe.devices == [None]
+    assert window.begin_calls == 1
+    assert window.finish_calls == []
 
 
-def test_microphone_test_handler_reports_recorder_failure() -> None:
+def test_microphone_test_handler_reports_actionable_silent_result() -> None:
     window = _FakeMicTestWindow({"microphone": None})
     tray = _FakeMicTestTray()
-    status_events: list[tuple[str, str]] = []
-    notifications: list[tuple[str, str, bool]] = []
-    done = threading.Event()
-
-    def recorder_factory(device: object) -> SimpleNamespace:
-        raise RuntimeError("микрофон занят")
-
-    def status_callback(text: str, state: str) -> None:
-        status_events.append((text, state))
-        done.set()
-
-    def notification_callback(title: str, message: str, warning: bool) -> None:
-        notifications.append((title, message, warning))
+    probe = _FakeMicProbe(
+        MicrophoneProbeResult(False, 48_000, 0.0, 0.0, 0.0, "silent")
+    )
 
     handler = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=status_callback,
-        notification_callback=notification_callback,
-        recorder_factory=recorder_factory,
+        microphone_probe=probe,  # type: ignore[arg-type]
     )
 
     handler()
 
-    assert done.wait(timeout=1)
-    assert status_events == [("Микрофон недоступен", "error")]
-    assert notifications == [("Pressay", "микрофон занят", True)]
+    assert window.finish_calls
+    text, state = window.finish_calls[-1]
+    assert state == "warning"
+    assert "уровень входа" in text
+    assert tray.notifications == [("Pressay", text, True)]
 
 
 def test_input_action_worker_submit_returns_before_action_completes() -> None:

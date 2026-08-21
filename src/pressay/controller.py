@@ -1142,13 +1142,33 @@ class DictationController:
 
     @staticmethod
     def _stop_failure_presentation(exc: Exception) -> tuple[str, str]:
-        if isinstance(exc, (AudioTooShortError, SilentAudioError)):
-            return "Речь не обнаружена", "warning"
+        if isinstance(exc, AudioTooShortError):
+            return "Запись слишком короткая", "warning"
+        if isinstance(exc, SilentAudioError):
+            return "Сигнал микрофона не обнаружен", "warning"
         if type(exc).__name__ == "AudioDurationLimitError":
             return "Лимит записи достигнут", "warning"
         if type(exc).__name__ == "AudioStreamError":
             return "Ошибка аудиопотока", "error"
         return "Ошибка записи", "error"
+
+    @staticmethod
+    def _stop_failure_notification(exc: Exception) -> str:
+        if isinstance(exc, AudioTooShortError):
+            return "Говорите немного дольше перед завершением записи."
+        if isinstance(exc, SilentAudioError):
+            return (
+                "Pressay не получает сигнал. Проверьте выбранный микрофон, "
+                "уровень входа и разрешение на доступ."
+            )
+        if type(exc).__name__ == "AudioDurationLimitError":
+            return "Запись превысила допустимый лимит. Начните новую диктовку."
+        if type(exc).__name__ == "AudioStreamError":
+            return (
+                "Поток микрофона прерван. Закройте приложение, которое "
+                "использует микрофон, и повторите запись."
+            )
+        return "Не удалось завершить запись. Проверьте микрофон и повторите."
 
     def _audio_stop(self, command: _AudioCommand) -> bool:
         session_id = command.session_id
@@ -1195,7 +1215,11 @@ class DictationController:
             if current and self._session_is_current(session_id):
                 self.status_callback(text, status)
             if current and self._session_is_current(session_id):
-                self.notification_callback("Pressay", str(exc), True)
+                self.notification_callback(
+                    "Pressay",
+                    self._stop_failure_notification(exc),
+                    True,
+                )
             if current and status == "error":
                 LOGGER.warning("microphone_stop_failed: %s", type(exc).__name__)
             return False

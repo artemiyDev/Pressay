@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -181,14 +182,15 @@ def parse_replacements(text: str) -> dict[str, str]:
 
 @dataclass(slots=True)
 class MicrophoneChoice:
-    value: str | None
+    value: str | int | None
     name: str
     legacy_index: int | None = None
     device_name: str | None = None
     is_default: bool = False
+    available: bool = True
 
     @property
-    def index(self) -> str | None:
+    def index(self) -> str | int | None:
         """Compatibility alias for callers from the index-based UI."""
 
         return self.value
@@ -225,7 +227,7 @@ def microphone_choice_index(
         ]
         if matches:
             return min(matches, key=lambda item: (not item[1].is_default, item[0]))[0]
-    return 0
+    return -1
 
 
 class UiSignals(QObject):
@@ -434,6 +436,7 @@ class SettingsWindow(QMainWindow):
         # without a second, competing definition of "what the status is".
         self._status_text = "Готов к диктовке"
         self._status_state: str | None = None
+        self._microphone_test_active = False
         # Muted explanatory lines; recolored together on a theme switch.
         self._hint_labels: list[QLabel] = []
         self._color_scheme = detect_color_scheme()
@@ -507,10 +510,30 @@ class SettingsWindow(QMainWindow):
         self._make_combo_responsive(self.microphone_combo)
         for microphone in microphones:
             self.microphone_combo.addItem(microphone.name, microphone.value)
+            if not microphone.available:
+                item_index = self.microphone_combo.count() - 1
+                self.microphone_combo.setItemData(
+                    item_index,
+                    "Этот сохранённый микрофон сейчас не найден. Выберите "
+                    "другой или оставьте значение без изменений.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         selected_mic = settings.get("microphone")
         selected_index = microphone_choice_index(microphones, selected_mic)
         self.microphone_combo.setCurrentIndex(selected_index)
         form.addRow("Микрофон", self.microphone_combo)
+
+        self.microphone_test_meter = QProgressBar()
+        self.microphone_test_meter.setObjectName("microphoneTestMeter")
+        self.microphone_test_meter.setRange(0, 1000)
+        self.microphone_test_meter.setValue(0)
+        self.microphone_test_meter.setTextVisible(False)
+        self.microphone_test_meter.setFixedHeight(8)
+        self.microphone_test_meter.setAccessibleName("Уровень сигнала микрофона")
+        self.microphone_test_meter.setAccessibleDescription(
+            "Проверка не запущена"
+        )
+        form.addRow("Сигнал", self.microphone_test_meter)
 
         self.language_combo = QComboBox()
         self._make_combo_responsive(self.language_combo)
@@ -1010,6 +1033,45 @@ class SettingsWindow(QMainWindow):
         self.status_label.setText(text)
         self._restyle_status()
         self.toggle_button.setText("Завершить тест" if state == "recording" else "Тестовая диктовка")
+
+    def begin_microphone_test(self) -> None:
+        """Reset and lock microphone controls for one bounded signal probe."""
+
+        self._microphone_test_active = True
+        self.microphone_combo.setEnabled(False)
+        self.test_button.setEnabled(False)
+        self.test_button.setText("Проверяю…")
+        self.microphone_test_meter.setValue(0)
+        self.microphone_test_meter.setAccessibleDescription(
+            "Говорите обычным голосом"
+        )
+        self.update_status("Говорите обычным голосом…", "processing")
+
+    def update_microphone_test_level(self, rms: float, peak: float) -> None:
+        """Render scalar probe levels without retaining captured audio."""
+
+        if not self._microphone_test_active:
+            return
+        fraction = max(recording_level_fraction(rms), recording_level_fraction(peak))
+        self.microphone_test_meter.setValue(round(fraction * 1000))
+        self.microphone_test_meter.setAccessibleDescription(
+            f"RMS {max(0.0, rms):.5f}; пик {max(0.0, peak):.5f}"
+        )
+
+    def finish_microphone_test(self, text: str, state: str) -> None:
+        """Restore controls and clear transient meter state after a probe."""
+
+        if not self._microphone_test_active:
+            return
+        self._microphone_test_active = False
+        self.microphone_combo.setEnabled(True)
+        self.test_button.setEnabled(True)
+        self.test_button.setText("Проверить микрофон")
+        self.microphone_test_meter.setValue(0)
+        self.microphone_test_meter.setAccessibleDescription(
+            "Проверка завершена; шкала сброшена"
+        )
+        self.update_status(text, state)
 
     def set_runtime_warning(self, text: str | None) -> None:
         """Show a persistent warning independently from transient status updates."""

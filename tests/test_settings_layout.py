@@ -117,6 +117,63 @@ def test_small_window_scrolls_vertically_with_sticky_primary_actions(
         _close(app, window)
 
 
+def test_missing_microphone_remains_explicit_and_preserves_original_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = _app()
+    signals = UiSignals()
+    original = "pressay:microphone:v1?name=Missing+Mic&host_api=WASAPI&sample_rate=48000"
+    window = SettingsWindow(
+        signals,
+        {**_settings_dict(AppConfig()), "microphone": original},
+        [
+            MicrophoneChoice(None, "Системный микрофон"),
+            MicrophoneChoice(
+                original,
+                "Недоступен: Missing Mic",
+                available=False,
+            ),
+        ],
+        macos=False,
+    )
+    try:
+        assert window.microphone_combo.currentIndex() == 1
+        assert window.microphone_combo.currentData() == original
+        assert window.microphone_combo.currentText() == "Недоступен: Missing Mic"
+        assert window.current_settings()["microphone"] == original
+    finally:
+        _close(app, window)
+
+
+def test_microphone_probe_ui_resets_controls_and_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app, _signals, window = _window()
+    try:
+        window.begin_microphone_test()
+        assert window.microphone_combo.isEnabled() is False
+        assert window.test_button.isEnabled() is False
+        assert window.test_button.text() == "Проверяю…"
+        assert window.microphone_test_meter.value() == 0
+
+        window.update_microphone_test_level(0.02, 0.08)
+        assert window.microphone_test_meter.value() > 0
+        assert "RMS" in window.microphone_test_meter.accessibleDescription()
+
+        window.finish_microphone_test("Сигнал микрофона обнаружен", "success")
+        assert window.microphone_combo.isEnabled() is True
+        assert window.test_button.isEnabled() is True
+        assert window.test_button.text() == "Проверить микрофон"
+        assert window.microphone_test_meter.value() == 0
+        assert window.status_label.text() == "Сигнал микрофона обнаружен"
+        window.update_microphone_test_level(0.5, 0.8)
+        assert window.microphone_test_meter.value() == 0
+    finally:
+        _close(app, window)
+
+
 @pytest.mark.parametrize("width", (440, 480, 620))
 def test_target_width_has_no_horizontal_scroll_or_hidden_content(
     monkeypatch: pytest.MonkeyPatch,

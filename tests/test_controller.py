@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from pressay.audio import AudioStreamError, AudioTooShortError, SilentAudioError
 from pressay.config import AppConfig
 from pressay.controller import (
     DictationController,
@@ -31,6 +32,40 @@ def _controller_uses_testable_windows_adapter(monkeypatch):
 class FakeRecording:
     audio: np.ndarray
     limit_reached: bool = False
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "notification_fragment"),
+    (
+        (
+            AudioTooShortError("too short"),
+            ("Запись слишком короткая", "warning"),
+            "немного дольше",
+        ),
+        (
+            SilentAudioError("silent"),
+            ("Сигнал микрофона не обнаружен", "warning"),
+            "уровень входа",
+        ),
+        (
+            AudioStreamError(
+                reason="portaudio_status",
+                status_messages=("overflow",),
+                captured_samples=100,
+                source_rate=48_000,
+            ),
+            ("Ошибка аудиопотока", "error"),
+            "Поток микрофона прерван",
+        ),
+    ),
+)
+def test_recording_failures_have_distinct_actionable_messages(
+    error: Exception,
+    expected_status: tuple[str, str],
+    notification_fragment: str,
+) -> None:
+    assert DictationController._stop_failure_presentation(error) == expected_status
+    assert notification_fragment in DictationController._stop_failure_notification(error)
 
 
 def test_setup_command_is_native_to_each_platform(monkeypatch) -> None:

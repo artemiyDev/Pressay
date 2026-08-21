@@ -19,11 +19,26 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from . import hotkey_bindings
 from . import __version__
-from .audio import AudioCaptureError, AudioRecorder, normalize_device_selector
+from .audio import (
+    AudioCaptureError,
+    AudioRecorder,
+    LEGACY_MICROPHONE_SELECTOR_PREFIX,
+    MICROPHONE_SELECTOR_PREFIX,
+    normalize_device_selector,
+    parse_microphone_selector,
+)
 from .config import AppConfig, ConfigError
 from .controller import DictationController
 from .hotkey_coordinator import _WindowsHotkeyCoordinator
-from .ui import MicrophoneChoice, SettingsWindow, StatusOverlay, TrayController, UiSignals
+from .microphone_probe import MicrophoneProbeCoordinator, MicrophoneProbeResult
+from .ui import (
+    MicrophoneChoice,
+    SettingsWindow,
+    StatusOverlay,
+    TrayController,
+    UiSignals,
+    microphone_choice_index,
+)
 from .platform_support import input_adapter, is_macos, is_windows, user_data_directory
 
 
@@ -315,6 +330,7 @@ def _start_native_shutdown(
     controller: DictationController,
     hotkey_service: Any | None,
     input_worker: _InputActionWorker | None = None,
+    microphone_probe: MicrophoneProbeCoordinator | None = None,
     *,
     timeout_seconds: float = 3.0,
     hard_exit: Any = os._exit,
@@ -337,6 +353,16 @@ def _start_native_shutdown(
     controller_call_done = threading.Event()
     hotkey_done = threading.Event()
     input_done = threading.Event()
+    microphone_probe_done = threading.Event()
+    if microphone_probe is None:
+        microphone_probe_done.set()
+    else:
+        try:
+            # This only closes the gate and sets a cancellation event. Native
+            # cancel/PortAudio close remain on the probe worker.
+            microphone_probe_done = microphone_probe.shutdown()
+        except Exception:
+            LOGGER.exception("microphone_probe_shutdown_start_failed")
     if input_worker is None:
         input_done.set()
     else:
@@ -388,6 +414,7 @@ def _start_native_shutdown(
         controller_call_done.wait()
         hotkey_done.wait()
         input_done.wait()
+        microphone_probe_done.wait()
         try:
             native_closed = controller.wait_closed()
         except Exception:
@@ -442,12 +469,29 @@ def _load_config() -> _ConfigLoadResult:
         return _ConfigLoadResult(safe_config, warning)
 
 
-def _microphones() -> list[MicrophoneChoice]:
+def _unavailable_microphone_name(value: object) -> str:
+    parsed = parse_microphone_selector(value)
+    if parsed is not None:
+        return parsed[0]
+    if type(value) is int or (isinstance(value, str) and value.isdecimal()):
+        return f"устройство #{int(value)}"
+    if isinstance(value, str):
+        display = value.strip()
+        if display.startswith(
+            (MICROPHONE_SELECTOR_PREFIX, LEGACY_MICROPHONE_SELECTOR_PREFIX)
+        ):
+            return "сохранённый микрофон"
+        if display:
+            return display
+    return "сохранённый микрофон"
+
+
+def _microphones(selected: object = None) -> list[MicrophoneChoice]:
     result = [MicrophoneChoice(None, "Системный микрофон по умолчанию")]
     try:
         devices = AudioRecorder.list_input_devices()
     except AudioCaptureError:
-        return result
+        devices = []
     seen: set[str] = set()
     for device in sorted(devices, key=lambda item: (not item.is_default, item.index)):
         selector = device.stable_selector
@@ -465,15 +509,20 @@ def _microphones() -> list[MicrophoneChoice]:
                 is_default=device.is_default,
             )
         )
+    if selected is not None and microphone_choice_index(result, selected) < 0:
+        result.append(
+            MicrophoneChoice(
+                selected,  # exact legacy/stable value must survive a no-op save
+                f"Недоступен: {_unavailable_microphone_name(selected)}",
+                available=False,
+            )
+        )
     return result
 
 
 def _settings_dict(config: AppConfig) -> dict[str, Any]:
-    microphone: str | int | None = config.microphone
-    if isinstance(microphone, str) and microphone.isdecimal():
-        microphone = int(microphone)
     return {
-        "microphone": microphone,
+        "microphone": config.microphone,
         "language": config.language,
         "model": config.model,
         "resource_mode": config.resource_mode,
@@ -504,10 +553,7 @@ def _build_microphone_test_handler(
     *,
     window: Any,
     tray: Any,
-    status_callback: Callable[[str, str], None],
-    notification_callback: Callable[[str, str, bool], None],
-    recorder_factory: Callable[..., AudioRecorder] = AudioRecorder,
-    thread_factory: Callable[..., threading.Thread] = threading.Thread,
+    microphone_probe: MicrophoneProbeCoordinator,
 ) -> Callable[[], None]:
     """Build the microphone-test slot: no settings save, form's own device.
 
@@ -523,22 +569,58 @@ def _build_microphone_test_handler(
             window.update_status(str(exc), "error")
             tray.notify("Pressay", str(exc), warning=True)
             return
-        window.update_status("Проверяю микрофон…", "processing")
         device = _test_microphone_device(values.get("microphone"))
 
-        def work() -> None:
-            try:
-                recorder = recorder_factory(device=device)
-                rate = recorder.warmup(0.10)
-            except Exception as exc:
-                status_callback("Микрофон недоступен", "error")
-                notification_callback("Pressay", str(exc), True)
-            else:
-                status_callback(f"Микрофон готов: {int(rate)} Hz", "success")
+        def complete(result: MicrophoneProbeResult) -> None:
+            text, state, notification = _microphone_probe_presentation(result)
+            window.finish_microphone_test(text, state)
+            if notification is not None:
+                tray.notify("Pressay", notification, warning=True)
 
-        thread_factory(target=work, name="pressay-mic-test", daemon=True).start()
+        if microphone_probe.running:
+            return
+        window.begin_microphone_test()
+        started = microphone_probe.start(
+            device,
+            on_level=window.update_microphone_test_level,
+            on_complete=complete,
+        )
+        if not started and not microphone_probe.running:
+            message = "Проверка микрофона сейчас недоступна. Перезапустите Pressay."
+            window.finish_microphone_test(message, "error")
+            tray.notify("Pressay", message, warning=True)
 
     return test_microphone
+
+
+def _microphone_probe_presentation(
+    result: MicrophoneProbeResult,
+) -> tuple[str, str, str | None]:
+    if result.signal_detected:
+        return "Сигнал микрофона обнаружен", "success", None
+    if result.error_kind == "silent":
+        message = (
+            "Сигнал не обнаружен. Проверьте выбранный микрофон, уровень входа "
+            "и разрешение на доступ."
+        )
+        return message, "warning", message
+    if result.error_kind == "device":
+        message = (
+            "Выбранный микрофон недоступен. Выберите другой микрофон или "
+            "освободите его в настройках звука."
+        )
+        return message, "error", message
+    if result.error_kind == "stream":
+        message = (
+            "Поток микрофона прерван. Закройте приложение, которое использует "
+            "микрофон, и повторите проверку."
+        )
+        return message, "error", message
+    message = (
+        "Не удалось проверить микрофон. Проверьте разрешение на доступ и "
+        "настройки звука."
+    )
+    return message, "error", message
 
 
 def _snapshot_target(*, strict_editable_check: bool = False) -> Any | None:
@@ -614,7 +696,11 @@ def main(argv: list[str] | None = None) -> int:
     config_load = _load_config()
     config = config_load.config
     signals = UiSignals()
-    window = SettingsWindow(signals, _settings_dict(config), _microphones())
+    window = SettingsWindow(
+        signals,
+        _settings_dict(config),
+        _microphones(config.microphone),
+    )
     tray = TrayController(signals, window)
     app.aboutToQuit.connect(window.prepare_to_quit)
 
@@ -623,6 +709,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def dispatch_ui(callback: Any, *args: Any, **kwargs: Any) -> None:
         dispatcher.requested.emit(callback, args, kwargs)
+
+    microphone_probe = MicrophoneProbeCoordinator(dispatch_ui)
 
     def status_callback(text: str, state: str) -> None:
         def update() -> None:
@@ -713,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         updated = AppConfig(
             model=str(values.get("model", config.model)),
             language=str(values.get("language", config.language)),
-            microphone=None if microphone is None else str(microphone),
+            microphone=microphone,
             auto_insert=bool(values.get("auto_insert", config.auto_insert)),
             smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
             remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
@@ -745,8 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     test_microphone = _build_microphone_test_handler(
         window=window,
         tray=tray,
-        status_callback=status_callback,
-        notification_callback=notification_callback,
+        microphone_probe=microphone_probe,
     )
     signals.microphone_test_requested.connect(test_microphone)
 
@@ -838,6 +925,7 @@ def main(argv: list[str] | None = None) -> int:
             controller,
             hotkey_service,
             input_worker,
+            microphone_probe,
         )
 
     def quit_application() -> None:

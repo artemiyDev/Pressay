@@ -204,6 +204,14 @@ class _FinalizedCapture:
     first_frame_latency_seconds: float
 
 
+@dataclass(eq=False, slots=True)
+class _StreamCloseOperation:
+    """Completion state for one detached native stream close."""
+
+    complete: threading.Event = field(default_factory=threading.Event)
+    succeeded: bool | None = None
+
+
 def _import_sounddevice() -> Any:
     try:
         import sounddevice  # type: ignore[import-not-found]
@@ -344,6 +352,7 @@ class AudioRecorder:
         self._duration_limit_reached = False
         self._duration_limit_event = threading.Event()
         self._current_rms = 0.0
+        self._current_peak = 0.0
         self._stop_signal_event = threading.Event()
         self._stop_signal_reason: str | None = None
         self._finishing = False
@@ -354,6 +363,8 @@ class AudioRecorder:
         self._prearmed = False
         self._first_frame_origin: float | None = None
         self._first_frame_at: float | None = None
+        self._stream_close_operations: list[_StreamCloseOperation] = []
+        self._stream_close_failed = False
 
     @staticmethod
     def _default_input_index(sd: Any) -> int:
@@ -435,8 +446,8 @@ class AudioRecorder:
 
         Stable selectors prefer an exact name/host API/rate match.  Driver
         updates may alter one component, so progressively weaker name matches
-        are allowed.  A missing device deliberately falls back to the system
-        default input instead of accidentally opening an unrelated index.
+        are allowed. A missing explicit device fails closed instead of opening
+        the system default or another unrelated index.
         """
 
         cached = self._resolved_device
@@ -529,7 +540,15 @@ class AudioRecorder:
     def current_rms(self) -> float:
         """Return the most recent capture-buffer RMS, or zero when idle."""
 
-        return self._current_rms
+        with self._lock:
+            return self._current_rms
+
+    @property
+    def current_peak(self) -> float:
+        """Return the most recent capture-buffer absolute peak, or zero."""
+
+        with self._lock:
+            return self._current_peak
 
     @property
     def duration_limit_reached(self) -> bool:
@@ -684,6 +703,7 @@ class AudioRecorder:
         try:
             chunk = _mono_float32(indata)
             rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+            peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
             with self._lock:
                 if (
                     not self._recording
@@ -695,6 +715,7 @@ class AudioRecorder:
                 ):
                     return
                 self._current_rms = rms
+                self._current_peak = peak
                 if chunk.size:
                     if self._first_frame_at is None:
                         self._first_frame_at = time.perf_counter()
@@ -772,6 +793,7 @@ class AudioRecorder:
         self._chunks.clear()
         self._status_messages.clear()
         self._current_rms = 0.0
+        self._current_peak = 0.0
         self._retained_samples = 0
         self._max_retained_samples = None
         self._duration_limit_reached = False
@@ -836,7 +858,8 @@ class AudioRecorder:
                 try:
                     stream.close()
                 except Exception:
-                    pass
+                    with self._lock:
+                        self._stream_close_failed = True
             raise AudioDeviceError("Could not start microphone capture") from exc
 
     def prepare_capture(self, buffer_seconds: float = 2.0) -> int:
@@ -895,7 +918,8 @@ class AudioRecorder:
                 try:
                     stream.close()
                 except Exception:
-                    pass
+                    with self._lock:
+                        self._stream_close_failed = True
             raise AudioDeviceError("Could not prepare microphone capture") from exc
 
     def activate_prepared_capture(self) -> bool:
@@ -945,8 +969,13 @@ class AudioRecorder:
             first_frame_latency_seconds=first_frame_latency_seconds,
         )
 
-    def _close_stream_async(self, stream: Any) -> None:
+    def _close_stream_async(self, stream: Any) -> _StreamCloseOperation:
         """Close a detached PortAudio stream without delaying recognition."""
+
+        operation = _StreamCloseOperation()
+        with self._lock:
+            self._prune_stream_close_operations_locked()
+            self._stream_close_operations.append(operation)
 
         def close_stream() -> None:
             started = time.perf_counter()
@@ -969,6 +998,11 @@ class AudioRecorder:
                     False,
                     type(error).__name__,
                 )
+            with self._lock:
+                operation.succeeded = error is None
+                if error is not None:
+                    self._stream_close_failed = True
+                operation.complete.set()
 
         try:
             threading.Thread(
@@ -983,6 +1017,43 @@ class AudioRecorder:
                 False,
                 type(exc).__name__,
             )
+            with self._lock:
+                operation.succeeded = False
+                self._stream_close_failed = True
+                operation.complete.set()
+        return operation
+
+    def _prune_stream_close_operations_locked(self) -> None:
+        self._stream_close_operations = [
+            operation
+            for operation in self._stream_close_operations
+            if not operation.complete.is_set()
+        ]
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        """Wait for every detached stream to finish native stop/close calls."""
+
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout cannot be negative")
+        with self._lock:
+            self._prune_stream_close_operations_locked()
+            operations = tuple(self._stream_close_operations)
+            close_failed = self._stream_close_failed
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for operation in operations:
+            remaining = (
+                None
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            if not operation.complete.wait(remaining):
+                return False
+            if operation.succeeded is not True:
+                close_failed = True
+        with self._lock:
+            self._prune_stream_close_operations_locked()
+            close_failed = close_failed or self._stream_close_failed
+        return not close_failed
 
     def stop(self, *, validate: bool = True) -> AudioRecording:
         """Stop, resample to the target rate and return capture metadata."""
