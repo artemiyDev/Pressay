@@ -112,17 +112,26 @@ class _InputActionWorker:
 
     A single-worker ``ThreadPoolExecutor`` (rather than a bare
     ``threading.Lock``) is used so a burst of paste/copy requests queues
-    cleanly on one daemon-style worker instead of spawning a new thread per
-    request that then blocks on a lock.
+    cleanly instead of spawning a new thread per request that then blocks on a
+    lock. Shutdown cancels work that has not started and tracks the executor's
+    non-daemon worker under the process-wide deadline.
     """
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="pressay-input"
         )
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self._shutdown_complete = threading.Event()
+        self._shutdown_thread: threading.Thread | None = None
 
-    def submit(self, action: Callable[[], Any]) -> None:
-        self._executor.submit(self._run, action)
+    def submit(self, action: Callable[[], Any]) -> bool:
+        with self._state_lock:
+            if self._closed:
+                return False
+            self._executor.submit(self._run, action)
+            return True
 
     @staticmethod
     def _run(action: Callable[[], Any]) -> None:
@@ -133,8 +142,32 @@ class _InputActionWorker:
             # serializing worker; the next queued request still has to run.
             LOGGER.exception("input_action_failed")
 
-    def shutdown(self) -> None:
-        self._executor.shutdown(wait=False)
+    def shutdown(self) -> threading.Event:
+        """Close submissions immediately and finish the executor off-thread."""
+
+        with self._state_lock:
+            if self._closed:
+                return self._shutdown_complete
+            self._closed = True
+            # Cancel pending clipboard/input effects synchronously. The second
+            # blocking shutdown below only waits for the action already running.
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            thread = threading.Thread(
+                target=self._wait_for_shutdown,
+                name="pressay-input-close",
+                daemon=True,
+            )
+            self._shutdown_thread = thread
+            thread.start()
+            return self._shutdown_complete
+
+    def _wait_for_shutdown(self) -> None:
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            LOGGER.exception("input_worker_shutdown_failed")
+            return
+        self._shutdown_complete.set()
 
 
 def _save_settings_transaction(
@@ -230,16 +263,18 @@ def _start_shutdown_watchdog(
 def _start_native_shutdown(
     controller: DictationController,
     hotkey_service: Any | None,
+    input_worker: _InputActionWorker | None = None,
     *,
     timeout_seconds: float = 3.0,
     hard_exit: Any = os._exit,
 ) -> tuple[threading.Event, threading.Thread, threading.Thread]:
     """Stop native services off the GUI thread under one hard deadline.
 
-    Controller/PortAudio cleanup and the low-level keyboard hook are independent
-    daemon workers, so one stuck native call cannot prevent the other cleanup
-    from starting. The watchdog is started first and also covers a synchronous
-    hang inside ``controller.close()`` itself.
+    Controller/PortAudio cleanup, the low-level keyboard hook and the serialized
+    input executor are independent, so one stuck native call cannot prevent the
+    other cleanup from starting. The watchdog is started first and also covers
+    a synchronous hang inside ``controller.close()`` or an in-flight clipboard
+    transaction.
     """
 
     shutdown_complete = threading.Event()
@@ -250,6 +285,16 @@ def _start_native_shutdown(
     )
     controller_call_done = threading.Event()
     hotkey_done = threading.Event()
+    input_done = threading.Event()
+    if input_worker is None:
+        input_done.set()
+    else:
+        try:
+            input_done = input_worker.shutdown()
+        except Exception:
+            # Keep input_done unset so the watchdog remains authoritative if
+            # the executor could not enter its bounded shutdown path.
+            LOGGER.exception("input_worker_shutdown_start_failed")
 
     def close_controller() -> None:
         try:
@@ -291,6 +336,7 @@ def _start_native_shutdown(
     def coordinate() -> None:
         controller_call_done.wait()
         hotkey_done.wait()
+        input_done.wait()
         try:
             native_closed = controller.wait_closed()
         except Exception:
@@ -306,6 +352,16 @@ def _start_native_shutdown(
     )
     coordinator.start()
     return shutdown_complete, watchdog, coordinator
+
+
+def _release_single_instance_after_shutdown(
+    single_instance: _SingleInstance,
+    shutdown_complete: threading.Event,
+) -> None:
+    """Keep the process lock until every bounded shutdown participant is done."""
+
+    shutdown_complete.wait()
+    single_instance.close()
 
 
 def _load_config() -> _ConfigLoadResult:
@@ -500,7 +556,6 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Pressay")
     app.setOrganizationName("Local")
     app.setQuitOnLastWindowClosed(False)
-    app.aboutToQuit.connect(single_instance.close)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         LOGGER.error("system_tray_unavailable")
@@ -717,9 +772,11 @@ def main(argv: list[str] | None = None) -> int:
         shutdown_started = True
         # Start the hard deadline before touching PortAudio, CUDA or the
         # low-level keyboard hook. All native cleanup happens off the Qt thread.
-        shutdown_handle = _start_native_shutdown(controller, hotkey_service)
-        # Never block application exit on a queued/in-flight paste or copy.
-        input_worker.shutdown()
+        shutdown_handle = _start_native_shutdown(
+            controller,
+            hotkey_service,
+            input_worker,
+        )
 
     def quit_application() -> None:
         begin_shutdown()
@@ -748,6 +805,12 @@ def main(argv: list[str] | None = None) -> int:
         Path(__file__).resolve().parent,
     )
     exit_code = int(app.exec())
+    # aboutToQuit normally starts cleanup. Keep this fallback for an event-loop
+    # return that bypasses the signal, then retain the singleton until cleanup
+    # is complete. A stuck participant remains covered by the active watchdog.
+    begin_shutdown()
+    assert shutdown_handle is not None
+    _release_single_instance_after_shutdown(single_instance, shutdown_handle[0])
     LOGGER.info("application_exited code=%d", exit_code)
     return exit_code
 

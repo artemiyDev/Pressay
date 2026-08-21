@@ -16,6 +16,7 @@ from pressay.app import (
     _load_config,
     _microphones,
     _overlay_auto_hide_ms,
+    _release_single_instance_after_shutdown,
     _settings_dict,
     _save_settings_transaction,
     _start_native_shutdown,
@@ -54,6 +55,31 @@ def test_windows_single_instance_mutex_is_reacquirable() -> None:
     third = _SingleInstance(name)
     assert third.acquire() is True
     third.close()
+
+
+def test_single_instance_is_held_until_shutdown_completes() -> None:
+    shutdown_complete = threading.Event()
+    release_called = threading.Event()
+    waiter_started = threading.Event()
+    single_instance = SimpleNamespace(close=release_called.set)
+
+    def release_after_shutdown() -> None:
+        waiter_started.set()
+        _release_single_instance_after_shutdown(
+            single_instance,  # type: ignore[arg-type]
+            shutdown_complete,
+        )
+
+    waiter = threading.Thread(target=release_after_shutdown, daemon=True)
+    waiter.start()
+    assert waiter_started.wait(timeout=1)
+    assert release_called.is_set() is False
+
+    shutdown_complete.set()
+    waiter.join(timeout=1)
+
+    assert not waiter.is_alive()
+    assert release_called.is_set()
 
 
 def test_microphone_picker_persists_stable_selector(monkeypatch) -> None:
@@ -467,7 +493,7 @@ def test_input_action_worker_submit_returns_before_action_completes() -> None:
     assert elapsed < 0.2
     assert entered.wait(timeout=1)
     release.set()
-    worker.shutdown()
+    assert worker.shutdown().wait(timeout=1)
 
 
 def test_input_action_worker_serializes_queued_requests() -> None:
@@ -495,7 +521,7 @@ def test_input_action_worker_serializes_queued_requests() -> None:
     release_first.set()
     assert second_done.wait(timeout=1)
     assert order == ["first", "second"]
-    worker.shutdown()
+    assert worker.shutdown().wait(timeout=1)
 
 
 def test_input_action_worker_survives_action_exception() -> None:
@@ -512,7 +538,132 @@ def test_input_action_worker_survives_action_exception() -> None:
     worker.submit(next_action)
 
     assert done.wait(timeout=1)
-    worker.shutdown()
+    assert worker.shutdown().wait(timeout=1)
+
+
+def test_input_action_worker_shutdown_closes_gate_and_cancels_queued_actions() -> None:
+    worker = _InputActionWorker()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    queued_effect = threading.Event()
+    rejected_effect = threading.Event()
+
+    def first() -> None:
+        first_entered.set()
+        assert release_first.wait(timeout=2)
+
+    assert worker.submit(first) is True
+    assert first_entered.wait(timeout=1)
+    assert worker.submit(queued_effect.set) is True
+
+    shutdown_complete = worker.shutdown()
+
+    assert worker.submit(rejected_effect.set) is False
+    assert worker._shutdown_thread is not None
+    assert worker._shutdown_thread.daemon is True
+    assert shutdown_complete.is_set() is False
+    release_first.set()
+    assert shutdown_complete.wait(timeout=1)
+    assert worker.shutdown() is shutdown_complete
+    assert queued_effect.is_set() is False
+    assert rejected_effect.is_set() is False
+
+
+def test_input_action_worker_shutdown_failure_keeps_completion_unset() -> None:
+    worker = _InputActionWorker()
+    real_executor = worker._executor
+
+    class FailingExecutor:
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert cancel_futures is True
+            if wait:
+                raise RuntimeError("simulated executor join failure")
+
+    worker._executor = FailingExecutor()  # type: ignore[assignment]
+    try:
+        shutdown_complete = worker.shutdown()
+        assert worker._shutdown_thread is not None
+        worker._shutdown_thread.join(timeout=1)
+
+        assert not worker._shutdown_thread.is_alive()
+        assert shutdown_complete.is_set() is False
+    finally:
+        real_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_native_shutdown_cancels_queued_input_and_waits_for_running_action() -> None:
+    controller = SimpleNamespace(
+        close=lambda: None,
+        wait_closed=lambda: True,
+    )
+    worker = _InputActionWorker()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    queued_effect = threading.Event()
+    exits: list[int] = []
+
+    def first() -> None:
+        first_entered.set()
+        assert release_first.wait(timeout=2)
+
+    assert worker.submit(first) is True
+    assert first_entered.wait(timeout=1)
+    assert worker.submit(queued_effect.set) is True
+    complete, watchdog, coordinator = _start_native_shutdown(
+        controller,
+        None,
+        worker,
+        timeout_seconds=0.5,
+        hard_exit=exits.append,
+    )
+    try:
+        assert complete.wait(timeout=0.03) is False
+        assert worker.submit(queued_effect.set) is False
+    finally:
+        release_first.set()
+
+    assert complete.wait(timeout=1)
+    coordinator.join(timeout=1)
+    watchdog.join(timeout=1)
+    assert not coordinator.is_alive()
+    assert exits == []
+    assert queued_effect.is_set() is False
+
+
+def test_shutdown_deadline_covers_blocking_input_action() -> None:
+    controller = SimpleNamespace(
+        close=lambda: None,
+        wait_closed=lambda: True,
+    )
+    worker = _InputActionWorker()
+    entered = threading.Event()
+    release = threading.Event()
+    exits: list[int] = []
+
+    def blocking_action() -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+
+    assert worker.submit(blocking_action) is True
+    assert entered.wait(timeout=1)
+    complete, watchdog, coordinator = _start_native_shutdown(
+        controller,
+        None,
+        worker,
+        timeout_seconds=0.03,
+        hard_exit=exits.append,
+    )
+    try:
+        watchdog.join(timeout=1)
+        assert exits == [0]
+        assert complete.is_set() is False
+        assert coordinator.is_alive()
+    finally:
+        release.set()
+
+    assert complete.wait(timeout=1)
+    coordinator.join(timeout=1)
+    assert not coordinator.is_alive()
 
 
 def test_settings_transaction_cancels_capture_before_deferring_changed_hotkeys(
