@@ -132,12 +132,15 @@ Under **System Settings → Privacy & Security**, allow Pressay access to:
 2. **Accessibility** for editable-control verification and Unicode input;
 3. **Input Monitoring** for global hotkeys.
 
-Restart Pressay after changing Accessibility or Input Monitoring. In the
-source beta, macOS may identify the runtime Python executable instead of the
+Fully quit and reopen Pressay after changing Accessibility or Input Monitoring.
+If the global event tap cannot start, Pressay opens its settings even from a
+background launch and keeps a permission warning visible. A later “model ready”
+status does not restore hotkeys; grant the permissions and restart the app. In
+the source beta, macOS may identify the runtime Python executable instead of the
 wrapper app. A signed and notarized `.dmg` is a separate release milestone.
 
-The current macOS beta uses fixed shortcuts. The hotkey fields in Pressay's
-settings are Windows-only and do not change these macOS shortcuts.
+The current macOS beta uses fixed shortcuts. Pressay shows them in a read-only
+macOS table; the configurable Windows hotkey editor is not shown on macOS.
 
 | Action | Fixed macOS hotkey |
 |---|---|

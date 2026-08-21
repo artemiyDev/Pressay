@@ -109,9 +109,13 @@ uses local cached model files.
 
 - Grant Microphone, Accessibility, and Input Monitoring, then fully restart
   Pressay after changing Accessibility or Input Monitoring.
+- If Pressay opens its settings with a persistent permission warning, grant
+  Accessibility and Input Monitoring to Pressay (or the displayed Python
+  runtime), then fully quit and reopen Pressay. A later model-ready status does
+  not restore the failed global event tap.
 - macOS shortcuts are currently fixed at `Control+Option`,
-  `Control+Option+Space`, `Control+Option+V`, and `Control+Option+C`. The hotkey
-  fields in settings are Windows-only.
+  `Control+Option+Space`, `Control+Option+V`, and `Control+Option+C`. Settings
+  show them in a read-only Mac table; the Windows editor is not shown.
 - Recognition uses CPU; faster-whisper/CTranslate2 does not use Metal/MPS.
 - CI checks imports, state machines, scripts, and tests. Real microphone,
   permissions, global shortcuts, and insertion still require a real Mac; see
@@ -224,9 +228,14 @@ Pressay запоминает активное редактируемое пол�
 
 - Разрешите Microphone, Accessibility и Input Monitoring; после изменения
   Accessibility или Input Monitoring полностью перезапустите Pressay.
+- Если Pressay открыл настройки с постоянным предупреждением о разрешениях,
+  выдайте Accessibility и Input Monitoring приложению Pressay (или показанному
+  Python), затем полностью закройте и снова запустите Pressay. Поздний статус
+  готовности модели не восстанавливает не запустившийся механизм глобальных
+  клавиш.
 - Сочетания пока фиксированы: `Control+Option`, `Control+Option+Space`,
-  `Control+Option+V` и `Control+Option+C`. Поля настройки сочетаний относятся к
-  Windows.
+  `Control+Option+V` и `Control+Option+C`. В настройках они показаны в таблице
+  только для чтения; редактор Windows на macOS не отображается.
 - Распознавание работает на CPU: faster-whisper/CTranslate2 не использует
   Metal/MPS.
 - CI проверяет импорты, state machines, скрипты и тесты. Микрофон, разрешения,

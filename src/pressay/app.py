@@ -233,6 +233,57 @@ def _overlay_auto_hide_ms(state: str) -> int:
     return 1500 if state in {"ready", "success", "warning", "error"} else 0
 
 
+_MACOS_HOTKEY_PERMISSION_WARNING = (
+    "Глобальные клавиши недоступны. Откройте System Settings → Privacy & "
+    "Security → Accessibility и Input Monitoring, разрешите Pressay (или "
+    "Python, если macOS показывает его), затем полностью закройте и снова "
+    "запустите Pressay."
+)
+_MACOS_HOTKEY_TRAY_ERROR = "Нужны разрешения macOS"
+
+
+def _effective_tray_status(
+    text: str,
+    state: str,
+    runtime_warning: str | None,
+) -> tuple[str, str]:
+    """Keep a fatal startup warning visible across later routine statuses."""
+
+    if runtime_warning:
+        return _MACOS_HOTKEY_TRAY_ERROR, "error"
+    return text, state
+
+
+def _report_hotkey_start_failure(
+    error: BaseException,
+    *,
+    macos: bool,
+    background: bool,
+    window: Any,
+    tray: Any,
+) -> str | None:
+    """Report a global-hotkey startup failure without exposing error details."""
+
+    LOGGER.error(
+        "hotkey_service_failed type=%s",
+        type(error).__name__,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    if macos:
+        message = _MACOS_HOTKEY_PERMISSION_WARNING
+        window.set_runtime_warning(message)
+        tray.update_state(_MACOS_HOTKEY_TRAY_ERROR, "error")
+        tray.notify("Pressay", message, warning=True)
+        if background:
+            tray.show_window()
+        return message
+
+    message = "Глобальные клавиши недоступны. Полностью перезапустите Pressay."
+    tray.update_state("Глобальные клавиши недоступны", "error")
+    tray.notify("Pressay", message, warning=True)
+    return None
+
+
 def _start_shutdown_watchdog(
     shutdown_complete: threading.Event,
     *,
@@ -568,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     app.aboutToQuit.connect(window.prepare_to_quit)
 
     dispatcher = _MainThreadDispatcher()
+    hotkey_runtime_warning: str | None = None
 
     def dispatch_ui(callback: Any, *args: Any, **kwargs: Any) -> None:
         dispatcher.requested.emit(callback, args, kwargs)
@@ -575,7 +627,12 @@ def main(argv: list[str] | None = None) -> int:
     def status_callback(text: str, state: str) -> None:
         def update() -> None:
             window.update_status(text, state)
-            tray.update_state(text, state)
+            tray_text, tray_state = _effective_tray_status(
+                text,
+                state,
+                hotkey_runtime_warning,
+            )
+            tray.update_state(tray_text, tray_state)
             auto_hide = _overlay_auto_hide_ms(state)
             overlay.show_status(text, state, auto_hide_ms=auto_hide)
 
@@ -759,8 +816,13 @@ def main(argv: list[str] | None = None) -> int:
             # candidate cannot appear after a captured service was stopped.
             hotkey_service = hotkey_coordinator
     except Exception as exc:
-        LOGGER.exception("hotkey_service_failed")
-        tray.notify("Pressay", f"Глобальные клавиши недоступны: {exc}", warning=True)
+        hotkey_runtime_warning = _report_hotkey_start_failure(
+            exc,
+            macos=is_macos(),
+            background=args.background,
+            window=window,
+            tray=tray,
+        )
 
     shutdown_started = False
     shutdown_handle: tuple[threading.Event, threading.Thread, threading.Thread] | None = None
@@ -794,7 +856,12 @@ def main(argv: list[str] | None = None) -> int:
         status_callback("Не удалось запустить подготовку модели", "error")
     if config_load.warning:
         window.update_status("Ошибка config.json — автовставка отключена", "error")
-        tray.update_state("Ошибка config.json — автовставка отключена", "error")
+        tray_text, tray_state = _effective_tray_status(
+            "Ошибка config.json — автовставка отключена",
+            "error",
+            hotkey_runtime_warning,
+        )
+        tray.update_state(tray_text, tray_state)
         tray.notify("Pressay", config_load.warning, warning=True)
     # Record which source tree is actually running: several shortcuts have
     # pointed at stale copies of the project, and a stale copy is otherwise

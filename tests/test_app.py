@@ -13,10 +13,12 @@ from pressay.app import (
     _InputActionWorker,
     _SingleInstance,
     _build_microphone_test_handler,
+    _effective_tray_status,
     _load_config,
     _microphones,
     _overlay_auto_hide_ms,
     _release_single_instance_after_shutdown,
+    _report_hotkey_start_failure,
     _settings_dict,
     _save_settings_transaction,
     _start_native_shutdown,
@@ -217,6 +219,121 @@ def test_overlay_hides_transient_states_but_not_active_work() -> None:
     assert _overlay_auto_hide_ms("error") == 1500
     assert _overlay_auto_hide_ms("recording") == 0
     assert _overlay_auto_hide_ms("processing") == 0
+
+
+class _FakeHotkeyFailureWindow:
+    def __init__(self) -> None:
+        self.runtime_warnings: list[str] = []
+
+    def set_runtime_warning(self, message: str) -> None:
+        self.runtime_warnings.append(message)
+
+
+class _FakeHotkeyFailureTray:
+    def __init__(self) -> None:
+        self.states: list[tuple[str, str]] = []
+        self.notifications: list[tuple[str, str, bool]] = []
+        self.show_calls = 0
+
+    def update_state(self, text: str, state: str) -> None:
+        self.states.append((text, state))
+
+    def notify(self, title: str, message: str, *, warning: bool = False) -> None:
+        self.notifications.append((title, message, warning))
+
+    def show_window(self) -> None:
+        self.show_calls += 1
+
+
+@pytest.mark.parametrize(
+    ("background", "expected_show_calls"),
+    ((True, 1), (False, 0)),
+)
+def test_macos_hotkey_failure_is_persistent_actionable_and_hides_raw_error(
+    caplog,
+    background: bool,
+    expected_show_calls: int,
+) -> None:
+    window = _FakeHotkeyFailureWindow()
+    tray = _FakeHotkeyFailureTray()
+    secret_error = "permission details that must stay private"
+
+    warning = _report_hotkey_start_failure(
+        RuntimeError(secret_error),
+        macos=True,
+        background=background,
+        window=window,
+        tray=tray,
+    )
+
+    assert warning is not None
+    assert window.runtime_warnings == [warning]
+    assert "System Settings" in warning
+    assert "Privacy & Security" in warning
+    assert "Accessibility" in warning
+    assert "Input Monitoring" in warning
+    assert "полностью закройте" in warning
+    assert tray.states == [("Нужны разрешения macOS", "error")]
+    assert tray.notifications == [("Pressay", warning, True)]
+    assert tray.show_calls == expected_show_calls
+    assert secret_error not in warning
+    assert all(
+        secret_error not in message
+        for _title, message, _warning in tray.notifications
+    )
+    assert secret_error in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+def test_late_ready_status_cannot_hide_macos_hotkey_tray_error() -> None:
+    warning = "persistent permission warning"
+
+    assert _effective_tray_status(
+        "Готов — удерживайте Control+Option",
+        "ready",
+        warning,
+    ) == ("Нужны разрешения macOS", "error")
+    assert _effective_tray_status(
+        "Ошибка config.json — автовставка отключена",
+        "error",
+        warning,
+    ) == ("Нужны разрешения macOS", "error")
+    assert _effective_tray_status("Слушаю…", "recording", None) == (
+        "Слушаю…",
+        "recording",
+    )
+
+
+def test_windows_hotkey_failure_is_sanitized_without_macos_onboarding(caplog) -> None:
+    window = _FakeHotkeyFailureWindow()
+    tray = _FakeHotkeyFailureTray()
+    secret_error = "driver path that must stay private"
+
+    warning = _report_hotkey_start_failure(
+        RuntimeError(secret_error),
+        macos=False,
+        background=True,
+        window=window,
+        tray=tray,
+    )
+
+    assert warning is None
+    assert window.runtime_warnings == []
+    assert tray.states == [("Глобальные клавиши недоступны", "error")]
+    assert tray.show_calls == 0
+    assert tray.notifications == [
+        (
+            "Pressay",
+            "Глобальные клавиши недоступны. Полностью перезапустите Pressay.",
+            True,
+        )
+    ]
+    assert all(
+        secret_error not in message
+        for _title, message, _warning in tray.notifications
+    )
+    assert secret_error in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 def test_native_shutdown_completes_without_hard_exit() -> None:
