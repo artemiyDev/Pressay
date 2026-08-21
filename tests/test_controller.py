@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from pressay.config import AppConfig
-from pressay.controller import DictationController, _prepare_insertion_text, _setup_command
+from pressay.controller import (
+    DictationController,
+    _prepare_insertion_text,
+    _setup_command,
+    _setup_recovery_instruction,
+)
 from pressay.platform_support import hotkey_hint
 from pressay.transcriber import TranscriptionResult, TranscriptionTimings
 from pressay.windows_input import ForegroundTarget, send_text as real_send_text
@@ -33,6 +38,20 @@ def test_setup_command_is_native_to_each_platform(monkeypatch) -> None:
     assert _setup_command("small") == "bash scripts/setup-macos.sh --model small"
     monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
     assert _setup_command("small") == ".\\scripts\\setup.ps1 -Model small"
+
+
+def test_setup_recovery_requires_windows_app_to_exit(monkeypatch) -> None:
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "darwin")
+    mac_instruction = _setup_recovery_instruction("small")
+    assert mac_instruction == (
+        "Запустите bash scripts/setup-macos.sh --model small и перезапустите Pressay."
+    )
+
+    monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
+    windows_instruction = _setup_recovery_instruction("small")
+    assert "Полностью выйдите из Pressay через меню в трее" in windows_instruction
+    assert ".\\scripts\\setup.ps1 -Model small" in windows_instruction
+    assert windows_instruction.endswith("и откройте Pressay снова.")
 
 
 class FakeRecorder:

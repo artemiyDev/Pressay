@@ -283,6 +283,7 @@ def _load_config() -> _ConfigLoadResult:
             remove_fillers=False,
             voice_press_enter=False,
             voice_formatting=False,
+            voice_translate=False,
             snippets={},
             replacements={},
         )
@@ -334,6 +335,8 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "remove_fillers": config.remove_fillers,
         "press_enter": config.voice_press_enter,
         "voice_formatting": config.voice_formatting,
+        "voice_translate": config.voice_translate,
+        "translate_model": config.translate_model,
         "strict_editable_check": config.strict_editable_check,
         "replacements": dict(config.replacements),
         "hotkeys": config.hotkeys.to_mapping(),
@@ -499,7 +502,10 @@ def main(argv: list[str] | None = None) -> int:
         notification_callback=notification_callback,
         model_ready_callback=model_ready_callback,
     )
-    overlay = StatusOverlay(level_provider=controller.current_recording_rms)
+    overlay = StatusOverlay(
+        level_provider=controller.current_recording_rms,
+        translation_provider=lambda: controller.translating,
+    )
 
     def start_or_stop(*, capture_target: bool = False) -> None:
         if controller.is_recording:
@@ -551,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
             remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
             voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
             voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
+            voice_translate=bool(values.get("voice_translate", config.voice_translate)),
+            translate_model=str(values.get("translate_model", config.translate_model)),
             strict_editable_check=bool(
                 values.get("strict_editable_check", config.strict_editable_check)
             ),
@@ -596,7 +604,11 @@ def main(argv: list[str] | None = None) -> int:
 
             hotkey_type = WindowsHotkeyService
 
-        def hotkey_callback(action: Any) -> None:
+        def hotkey_callback(action: Any) -> bool | None:
+            # Quartz must decide whether to suppress Esc before its event-tap
+            # callback returns. Other actions keep their existing async path.
+            if is_macos() and action == HotkeyAction.CANCEL:
+                return controller.request_cancel()
             # PASTE_LAST/COPY_LAST must not go through the Qt-thread dispatch
             # below; they share the same serialized input worker as the
             # Qt-signal path so a hotkey and a button click never race.

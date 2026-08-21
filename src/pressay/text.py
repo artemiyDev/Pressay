@@ -45,6 +45,22 @@ _VOICE_FORMATTING_COMMAND_RE = re.compile(
     r"|(?<!\w)(?P<paragraph>абзац)(?!\w)[.,;:!?…]*",
     flags=re.IGNORECASE,
 )
+TRANSLATION_ON_PHRASES: frozenset[str] = frozenset(
+    {
+        "переведи на английский",
+        "переведи на английский язык",
+        "перевод на английский",
+        "translate to english",
+    }
+)
+TRANSLATION_OFF_PHRASES: frozenset[str] = frozenset(
+    {
+        "хватит переводить",
+        "выключи перевод",
+        "отмени перевод",
+        "stop translating",
+    }
+)
 _INVISIBLE_ARTIFACTS = str.maketrans("", "", "\ufeff\u200b\u2060")
 
 
@@ -59,6 +75,7 @@ class ProcessedText:
     text: str
     press_enter: bool = False
     snippet_expanded: bool = False
+    translation_mode: str | None = None
 
 
 def normalize_text(text: str) -> str:
@@ -217,6 +234,19 @@ def is_press_enter_command(text: str, *, enabled: bool = False) -> bool:
     return snippet_key(text) in PRESS_ENTER_PHRASES
 
 
+def translation_command(text: str, *, enabled: bool = False) -> str | None:
+    """Return an opted-in whole-phrase translation mode command."""
+
+    if not enabled:
+        return None
+    key = snippet_key(text)
+    if key in TRANSLATION_ON_PHRASES:
+        return "on"
+    if key in TRANSLATION_OFF_PHRASES:
+        return "off"
+    return None
+
+
 def apply_voice_formatting(text: str) -> str:
     """Replace opted-in voice formatting commands inside one utterance.
 
@@ -242,12 +272,17 @@ def process_transcript(
     snippets: Mapping[str, str] | None = None,
     voice_press_enter: bool = False,
     voice_formatting: bool = False,
+    voice_translate: bool = False,
 ) -> ProcessedText:
     """Run the deterministic post-processing pipeline for one transcript."""
 
     normalized = normalize_text(text)
     if is_press_enter_command(normalized, enabled=voice_press_enter):
         return ProcessedText(text="", press_enter=True)
+
+    translation_mode = translation_command(normalized, enabled=voice_translate)
+    if translation_mode is not None:
+        return ProcessedText(text="", translation_mode=translation_mode)
 
     if remove_fillers:
         normalized = remove_filler_words(normalized)

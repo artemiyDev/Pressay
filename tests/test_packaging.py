@@ -45,6 +45,23 @@ def _load_pyproject_dependencies() -> tuple[list[str], list[str], list[str]]:
     return dependencies, optional["dev"], optional["macos"]
 
 
+def _load_pyproject_version() -> str:
+    pyproject = PROJECT_ROOT / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        data = tomllib.load(handle)
+    return data["project"]["version"]
+
+
+def _extract_single_match(*, path: Path, pattern: str, label: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    matches = re.findall(pattern, text, flags=re.MULTILINE)
+    assert len(matches) == 1, (
+        f"Expected exactly one {label} in {path.relative_to(PROJECT_ROOT)}, "
+        f"found {len(matches)}."
+    )
+    return matches[0]
+
+
 def _applicable_base_specs(specs: list[str], *, excluded_platform: str) -> set[str]:
     """Base specifiers that install on every platform except ``excluded_platform``.
 
@@ -175,4 +192,32 @@ def test_setup_macos_script_installs_dependencies_from_pyproject_not_a_duplicate
         "scripts/setup-macos.sh no longer installs via the pyproject.toml "
         "'macos' extra. If it now hardcodes a package/version list, add a "
         "parity test against pyproject.toml here."
+    )
+
+
+def test_project_python_and_macos_bundle_versions_match() -> None:
+    """All public version declarations must move together."""
+
+    project_version = _load_pyproject_version()
+    package_version = _extract_single_match(
+        path=PROJECT_ROOT / "src" / "pressay" / "__init__.py",
+        pattern=r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$',
+        label="__version__ assignment",
+    )
+    macos_bundle_version = _extract_single_match(
+        path=SCRIPTS / "install-macos.sh",
+        pattern=(
+            r"<key>CFBundleShortVersionString</key>\s*"
+            r"<string>([^<]+)</string>"
+        ),
+        label="CFBundleShortVersionString declaration",
+    )
+
+    assert package_version == project_version, (
+        "src/pressay/__init__.py __version__ does not match "
+        "pyproject.toml [project].version"
+    )
+    assert macos_bundle_version == project_version, (
+        "scripts/install-macos.sh CFBundleShortVersionString does not match "
+        "pyproject.toml [project].version"
     )

@@ -22,13 +22,20 @@ from .audio import (
 from .config import AppConfig
 from .state import SessionState
 from .text import process_transcript
-from .transcriber import FasterWhisperTranscriber, NoSpeechDetected, TranscriptionError
+from .transcriber import (
+    FasterWhisperTranscriber,
+    ModelLoadError,
+    NoSpeechDetected,
+    TranscriptionError,
+)
 from .platform_support import hotkey_hint, input_adapter, is_macos
 
 
 LOGGER = logging.getLogger(__name__)
 _SETUP_MODELS = frozenset({"small", "medium", "turbo", "large-v3"})
 _SHORT_RECORDING_VAD_THRESHOLD_SECONDS = 15.0
+# Turbo was empirically verified to ignore faster-whisper's translate task.
+_TRANSLATION_INCAPABLE_MODELS = frozenset({"turbo"})
 _PREPARE_CAPTURE_TIMEOUT_SECONDS = 1.5
 _PREPARE_CAPTURE_BUFFER_SECONDS = 2.0
 _MODEL_RETIRE_SECONDS: dict[str, float | None] = {
@@ -47,6 +54,18 @@ def _setup_command(model_size: str) -> str:
         f".\\scripts\\setup.ps1 -Model {model_size}"
         if model_size in _SETUP_MODELS
         else ".\\scripts\\setup.ps1"
+    )
+
+
+def _setup_recovery_instruction(model_size: str) -> str:
+    """Describe the platform-specific safe model setup sequence."""
+
+    setup_command = _setup_command(model_size)
+    if is_macos():
+        return f"Запустите {setup_command} и перезапустите Pressay."
+    return (
+        "Полностью выйдите из Pressay через меню в трее, запустите "
+        f"{setup_command} и откройте Pressay снова."
     )
 
 
@@ -156,6 +175,8 @@ class _TranscriptionJob:
     finalize_breakdown: dict[str, float]
     prearmed: bool
     vad_used: bool | None
+    translating: bool
+    translation_generation: int
 
 
 class _CaptureIntent(str, Enum):
@@ -200,13 +221,16 @@ class DictationController:
         self.notification_callback = notification_callback
         self.model_ready_callback = model_ready_callback
         self.state = SessionState()
+        self.translating = False
         self.last_transcript = ""
         self.target: Any | None = None
         self._recorder: AudioRecorder | None = None
         self._transcriber: FasterWhisperTranscriber | None = None
+        self._translator: FasterWhisperTranscriber | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pressay-asr")
         self._future: Future[Any] | None = None
         self._warmup_future: Future[Any] | None = None
+        self._translator_warmup_future: Future[Any] | None = None
         self._lock = threading.RLock()
         # Serializes warmup-only UI callbacks against state invalidation. It is
         # deliberately separate from _lock: user callbacks never run while the
@@ -218,6 +242,7 @@ class DictationController:
         self._audio_close_complete = threading.Event()
         self._session_cancelled: threading.Event | None = None
         self._model_generation = 0
+        self._translation_generation = 0
         self._preload_enabled = False
         self._residency_generation = 0
         self._residency_timer: threading.Timer | None = None
@@ -240,11 +265,11 @@ class DictationController:
         if timer is not None:
             timer.cancel()
 
-    def _schedule_model_retirement(self, resource_mode: str) -> None:
-        delay = _MODEL_RETIRE_SECONDS.get(resource_mode)
+    def _schedule_model_retirement(self) -> None:
         with self._lock:
             if self._closed:
                 return
+            delay = _MODEL_RETIRE_SECONDS.get(self.config.resource_mode)
             self._cancel_model_retirement_locked()
             if delay is None:
                 return
@@ -270,7 +295,7 @@ class DictationController:
             self._residency_timer = None
         LOGGER.info("model_retirement_queued resource_mode=%s", self.config.resource_mode)
         try:
-            self._executor.submit(self._dispose_transcriber)
+            self._executor.submit(self._dispose_models)
         except RuntimeError:
             return
 
@@ -326,6 +351,14 @@ class DictationController:
             self._transcriber = self._new_transcriber(model_size)
         return self._transcriber
 
+    def _ensure_translator(self, model_size: str) -> FasterWhisperTranscriber:
+        """Return the separately resident translation model on the ASR worker."""
+
+        if self._translator is None or self._translator.model_size != model_size:
+            self._dispose_translator()
+            self._translator = self._new_transcriber(model_size)
+        return self._translator
+
     @staticmethod
     def _new_transcriber(model_size: str) -> FasterWhisperTranscriber:
         return FasterWhisperTranscriber(model_size=model_size, local_files_only=False)
@@ -340,6 +373,23 @@ class DictationController:
             transcriber.close()
         except Exception:
             LOGGER.exception("transcriber_close_failed")
+
+    def _dispose_translator(self) -> None:
+        with self._lock:
+            translator = self._translator
+            self._translator = None
+        if translator is None:
+            return
+        try:
+            translator.close()
+        except Exception:
+            LOGGER.exception("translator_close_failed")
+
+    def _dispose_models(self) -> None:
+        """Release both native model slots from the serialized ASR worker."""
+
+        self._dispose_transcriber()
+        self._dispose_translator()
 
     def warmup_model(self) -> bool:
         """Queue a local model preload without blocking the caller.
@@ -429,13 +479,18 @@ class DictationController:
                 setup_command = _setup_command(model_size)
                 message = (
                     f"Локальная модель {model_size!r} не загрузилась. "
-                    f"Запустите {setup_command} и перезапустите Pressay."
+                    f"{_setup_recovery_instruction(model_size)}"
                 )
                 if not session_active:
-                    self.status_callback(
-                        f"Модель {model_size} не готова — запустите {setup_command}",
-                        "error",
-                    )
+                    status = f"Модель {model_size} не готова — "
+                    if is_macos():
+                        status += f"запустите {setup_command}"
+                    else:
+                        status += (
+                            "выйдите из Pressay и запустите "
+                            f"{setup_command}"
+                        )
+                    self.status_callback(status, "error")
                 self.notification_callback("Pressay", message, True)
             LOGGER.warning("model_warmup_failed: %s", type(exc).__name__)
             return
@@ -449,7 +504,141 @@ class DictationController:
             if current and not session_active:
                 self.status_callback(self._ready_status_text(), "ready")
         if current:
-            self._schedule_model_retirement(self.config.resource_mode)
+            self._schedule_model_retirement()
+
+    def _translation_warmup_is_current_locked(
+        self, model_size: str, generation: int
+    ) -> bool:
+        return (
+            not self._closed
+            and self.translating
+            and self._translation_generation == generation
+            and self.config.model in _TRANSLATION_INCAPABLE_MODELS
+            and self.config.translate_model == model_size
+        )
+
+    def _translation_warmup_is_current(
+        self, model_size: str, generation: int
+    ) -> bool:
+        with self._lock:
+            return self._translation_warmup_is_current_locked(model_size, generation)
+
+    def _translation_warmup_progress_callback(
+        self, model_size: str, generation: int
+    ) -> Callable[[int], None]:
+        last_update = time.monotonic()
+
+        def report(percent: int) -> None:
+            nonlocal last_update
+            now = time.monotonic()
+            with self._warmup_status_gate:
+                with self._lock:
+                    current = self._translation_warmup_is_current_locked(
+                        model_size, generation
+                    )
+                    show_status = not self.state.active
+                if not current or not show_status or now - last_update < 1.0:
+                    return
+                last_update = now
+                self.status_callback(
+                    "Скачиваю модель перевода "
+                    f"{model_size} — {max(0, min(100, percent))}%…",
+                    "processing",
+                )
+
+        return report
+
+    def _queue_translation_warmup_locked(self) -> bool:
+        if (
+            self._closed
+            or not self.translating
+            or self.config.model not in _TRANSLATION_INCAPABLE_MODELS
+        ):
+            return False
+        model_size = self.config.translate_model
+        translator = self._translator
+        if (
+            translator is not None
+            and translator.model_size == model_size
+            and bool(getattr(translator, "is_loaded", False))
+        ):
+            return False
+        self._translation_generation += 1
+        generation = self._translation_generation
+        self._translator_warmup_future = self._executor.submit(
+            self._translation_warmup_worker,
+            model_size,
+            generation,
+        )
+        return True
+
+    def _translation_warmup_worker(self, model_size: str, generation: int) -> None:
+        with self._warmup_status_gate:
+            with self._lock:
+                if not self._translation_warmup_is_current_locked(
+                    model_size, generation
+                ):
+                    return
+                show_status = not self.state.active
+            if show_status:
+                self.status_callback(
+                    f"Готовлю модель перевода {model_size}…",
+                    "processing",
+                )
+
+        if not self._translation_warmup_is_current(model_size, generation):
+            return
+        try:
+            translator = self._ensure_translator(model_size)
+            set_progress_callback = getattr(
+                translator, "set_download_progress_callback", None
+            )
+            if set_progress_callback is not None:
+                set_progress_callback(
+                    self._translation_warmup_progress_callback(model_size, generation)
+                )
+            translator.warmup()
+        except Exception as exc:
+            with self._warmup_status_gate:
+                with self._lock:
+                    current = self._translation_warmup_is_current_locked(
+                        model_size, generation
+                    )
+                    session_active = self.state.active
+                    if current:
+                        self.translating = False
+                        self._translation_generation += 1
+                if not current:
+                    LOGGER.debug(
+                        "stale_translation_warmup_failure: %s",
+                        type(exc).__name__,
+                    )
+                    return
+                self._dispose_translator()
+                message = (
+                    f"Модель перевода {model_size!r} не загрузилась. "
+                    "Режим перевода выключен; обычная диктовка продолжит работать. "
+                    f"{_setup_recovery_instruction(model_size)}"
+                )
+                if not session_active:
+                    self.status_callback(
+                        "Перевод выключен: модель перевода не готова",
+                        "warning",
+                    )
+                self.notification_callback("Pressay", message, True)
+            LOGGER.warning("translation_model_warmup_failed: %s", type(exc).__name__)
+            return
+
+        with self._warmup_status_gate:
+            with self._lock:
+                current = self._translation_warmup_is_current_locked(
+                    model_size, generation
+                )
+                session_active = self.state.active
+            if current and not session_active:
+                self.status_callback("Перевод на английский включён — → EN", "ready")
+        if current:
+            self._schedule_model_retirement()
 
     def _capture_is_current_locked(
         self,
@@ -1047,6 +1236,8 @@ class DictationController:
                     if recording_duration is not None
                     else None
                 ),
+                translating=self.translating,
+                translation_generation=self._translation_generation,
             )
         if recording.limit_reached and current and self._session_is_current(session_id):
             # Recognition proceeds on the truncated buffer below; the user
@@ -1143,6 +1334,84 @@ class DictationController:
             )
         return True
 
+    def _disable_translation_after_load_failure(
+        self,
+        job: _TranscriptionJob,
+        model_size: str,
+        exc: Exception,
+    ) -> None:
+        """Fail translation closed while keeping the current dictation usable."""
+
+        with self._lock:
+            current = (
+                not self._closed
+                and self.translating
+                and self.config.voice_translate
+                and self._translation_generation == job.translation_generation
+                and self.config.model == job.config.model
+                and self.config.translate_model == model_size
+            )
+            if current:
+                self.translating = False
+                self._translation_generation += 1
+        self._dispose_translator()
+        if not current:
+            LOGGER.debug(
+                "stale_translation_model_load_failure: %s", type(exc).__name__
+            )
+            return
+        message = (
+            f"Модель перевода {model_size!r} не загрузилась. "
+            "Режим перевода выключен; эта фраза распознаётся без перевода. "
+            f"{_setup_recovery_instruction(model_size)}"
+        )
+        if self._job_is_active(job.session_id):
+            self.status_callback("Перевод выключен: модель не готова", "warning")
+        if self._job_is_active(job.session_id):
+            self.notification_callback("Pressay", message, True)
+        LOGGER.warning("translation_model_load_failed: %s", type(exc).__name__)
+
+    def _complete_translation_command(
+        self, job: _TranscriptionJob, command: str
+    ) -> bool:
+        enabled = command == "on"
+        with self._lock:
+            if not self._job_is_active_locked(job.session_id):
+                return False
+            ignored = enabled and not self.config.voice_translate
+            if not ignored:
+                self.translating = enabled
+                if enabled:
+                    queued = self._queue_translation_warmup_locked()
+                    if not queued:
+                        self._translation_generation += 1
+                else:
+                    self._translation_generation += 1
+            accepted = self.state.accept_result(job.session_id, "")
+            if accepted is self.state:
+                return False
+            self.state = accepted.reset()
+            if self._session_cancelled is job.cancelled:
+                self._session_cancelled = None
+
+        if not self._session_is_current(job.session_id):
+            return False
+        if ignored:
+            self.status_callback(self._ready_status_text(), "ready")
+            self._schedule_model_retirement()
+            return True
+        if enabled:
+            status_text = "Перевод на английский включён — → EN"
+            notification_text = "Перевод на английский включён."
+        else:
+            status_text = "Перевод выключен — обычная диктовка"
+            notification_text = "Перевод на английский выключен."
+        self.status_callback(status_text, "success")
+        if self._session_is_current(job.session_id):
+            self.notification_callback("Pressay", notification_text, False)
+        self._schedule_model_retirement()
+        return True
+
     def _transcribe_worker(self, job: _TranscriptionJob) -> None:
         with self._lock:
             if not self._job_is_active_locked(job.session_id):
@@ -1154,10 +1423,57 @@ class DictationController:
                 transcribe_options["initial_prompt"] = prompt
             if job.vad_used is not None:
                 transcribe_options["vad_filter"] = job.vad_used
-            result = self._ensure_transcriber(job.config.model).transcribe(
-                job.audio,
-                **transcribe_options,
-            )
+            with self._lock:
+                translating = job.translating and self.translating
+            task = "translate" if translating else "transcribe"
+            if translating and job.config.model in _TRANSLATION_INCAPABLE_MODELS:
+                try:
+                    selected_transcriber = self._ensure_translator(
+                        job.config.translate_model
+                    )
+                except Exception as exc:
+                    self._disable_translation_after_load_failure(
+                        job, job.config.translate_model, exc
+                    )
+                    if not self._job_is_active(job.session_id):
+                        return
+                    task = "transcribe"
+                    selected_transcriber = self._ensure_transcriber(job.config.model)
+                    result = selected_transcriber.transcribe(
+                        job.audio,
+                        **transcribe_options,
+                    )
+                else:
+                    try:
+                        result = selected_transcriber.transcribe(
+                            job.audio,
+                            task="translate",
+                            **transcribe_options,
+                        )
+                    except ModelLoadError as exc:
+                        self._disable_translation_after_load_failure(
+                            job, job.config.translate_model, exc
+                        )
+                        if not self._job_is_active(job.session_id):
+                            return
+                        task = "transcribe"
+                        result = self._ensure_transcriber(job.config.model).transcribe(
+                            job.audio,
+                            **transcribe_options,
+                        )
+            else:
+                selected_transcriber = self._ensure_transcriber(job.config.model)
+                if translating:
+                    result = selected_transcriber.transcribe(
+                        job.audio,
+                        task="translate",
+                        **transcribe_options,
+                    )
+                else:
+                    result = selected_transcriber.transcribe(
+                        job.audio,
+                        **transcribe_options,
+                    )
             postprocess_started = time.perf_counter()
             processed = process_transcript(
                 result.text,
@@ -1166,9 +1482,14 @@ class DictationController:
                 snippets=job.config.snippets,
                 voice_press_enter=job.config.voice_press_enter,
                 voice_formatting=job.config.voice_formatting,
+                voice_translate=job.config.voice_translate,
             )
             postprocess_seconds = time.perf_counter() - postprocess_started
-            if not processed.text and not processed.press_enter:
+            if (
+                not processed.text
+                and not processed.press_enter
+                and processed.translation_mode is None
+            ):
                 raise NoSpeechDetected("Речь не обнаружена")
         except (NoSpeechDetected, TranscriptionError) as exc:
             reported = self._report_failure(
@@ -1198,7 +1519,7 @@ class DictationController:
         LOGGER.info(
             "transcription_completed language=%s device=%s compute=%s "
             "audio_seconds=%.3f vad_used=%s load_seconds=%.3f inference_seconds=%.3f "
-            "total_seconds=%.3f characters=%d",
+            "total_seconds=%.3f characters=%d task=%s",
             getattr(result, "language", "unknown"),
             getattr(result, "device", "unknown"),
             getattr(result, "compute_type", "unknown"),
@@ -1208,7 +1529,12 @@ class DictationController:
             float(getattr(timings, "inference_seconds", 0.0) or 0.0),
             float(getattr(timings, "total_seconds", 0.0) or 0.0),
             len(processed.text),
+            task,
         )
+
+        if processed.translation_mode is not None:
+            self._complete_translation_command(job, processed.translation_mode)
+            return
 
         with self._lock:
             if not self._job_is_active_locked(job.session_id):
@@ -1260,7 +1586,7 @@ class DictationController:
                 postprocess_seconds,
                 insertion_timing[0],
             )
-            self._schedule_model_retirement(job.config.resource_mode)
+            self._schedule_model_retirement()
 
     def _deliver(
         self,
@@ -1410,10 +1736,28 @@ class DictationController:
                 if self._closed:
                     return
                 model_changed = config.model != self.config.model
+                translate_model_changed = (
+                    config.translate_model != self.config.translate_model
+                )
+                voice_translate_disabled = (
+                    self.config.voice_translate and not config.voice_translate
+                )
+                translation_disabled = self.translating and not config.voice_translate
                 resource_mode_changed = config.resource_mode != self.config.resource_mode
+                translator_redundant = (
+                    model_changed
+                    and config.model not in _TRANSLATION_INCAPABLE_MODELS
+                )
+                translator_cleanup_queued = (
+                    voice_translate_disabled or translator_redundant
+                )
                 self.config = config
+                if translation_disabled:
+                    self.translating = False
                 if resource_mode_changed:
                     self._cancel_model_retirement_locked()
+                if translator_cleanup_queued:
+                    self._executor.submit(self._dispose_translator)
                 if model_changed:
                     # Queued behind any active inference; never release native
                     # model resources from the GUI thread. Once startup
@@ -1430,7 +1774,17 @@ class DictationController:
                     else:
                         self._executor.submit(self._dispose_transcriber)
                 elif resource_mode_changed:
-                    self._schedule_model_retirement(config.resource_mode)
+                    self._schedule_model_retirement()
+
+                if model_changed or translate_model_changed or translation_disabled:
+                    self._translation_generation += 1
+                    if (
+                        self.translating
+                        and config.model in _TRANSLATION_INCAPABLE_MODELS
+                    ):
+                        self._queue_translation_warmup_locked()
+                    elif translate_model_changed and not translator_cleanup_queued:
+                        self._executor.submit(self._dispose_translator)
 
     def close(self) -> None:
         with self._warmup_status_gate:
@@ -1443,7 +1797,9 @@ class DictationController:
                 # a result, submit ASR, or deliver text after this point.
                 self._capture_generation += 1
                 self._model_generation += 1
+                self._translation_generation += 1
                 self._preload_enabled = False
+                self.translating = False
                 self._cancel_model_retirement_locked()
                 self._cancel_prepared_timeout_locked()
                 if self._session_cancelled is not None:
@@ -1479,7 +1835,7 @@ class DictationController:
 
     def _close_worker(self) -> None:
         try:
-            self._dispose_transcriber()
+            self._dispose_models()
         finally:
             self._asr_close_complete.set()
             self._maybe_signal_close_complete()

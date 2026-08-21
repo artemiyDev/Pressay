@@ -476,6 +476,7 @@ class FasterWhisperTranscriber:
     def _transcribe_kwargs(
         self,
         language: str,
+        task: str,
         vad_filter: bool | None,
         vad_parameters: Mapping[str, Any] | None,
         initial_prompt: str | None,
@@ -483,6 +484,7 @@ class FasterWhisperTranscriber:
         use_vad = self.vad_filter if vad_filter is None else bool(vad_filter)
         kwargs: dict[str, Any] = {
             "language": None if language == "auto" else language,
+            "task": task,
             "beam_size": self.beam_size,
             "temperature": 0.0,
             "condition_on_previous_text": False,
@@ -638,6 +640,7 @@ class FasterWhisperTranscriber:
         *,
         sample_rate: int = TARGET_SAMPLE_RATE,
         language: str = "auto",
+        task: str = "transcribe",
         vad_filter: bool | None = None,
         vad_parameters: Mapping[str, Any] | None = None,
         initial_prompt: str | None = None,
@@ -648,6 +651,11 @@ class FasterWhisperTranscriber:
         language = language.casefold().strip()
         if language not in self.SUPPORTED_LANGUAGES:
             raise ValueError("language must be auto, ru, or en")
+        if not isinstance(task, str):
+            raise ValueError("task must be transcribe or translate")
+        task = task.casefold().strip()
+        if task not in {"transcribe", "translate"}:
+            raise ValueError("task must be transcribe or translate")
         if sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
 
@@ -680,7 +688,7 @@ class FasterWhisperTranscriber:
             def infer(run_language: str) -> tuple[list[Any], Any]:
                 nonlocal inference_seconds, load_seconds, model
                 kwargs = self._transcribe_kwargs(
-                    run_language, vad_filter, vad_parameters, initial_prompt
+                    run_language, task, vad_filter, vad_parameters, initial_prompt
                 )
                 attempt_started = time.perf_counter()
                 try:

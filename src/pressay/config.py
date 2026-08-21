@@ -24,6 +24,7 @@ LEGACY_APP_DIRECTORY = "WhisperFlow"
 CONFIG_FILENAME = "config.json"
 SUPPORTED_LANGUAGES = frozenset({"auto", "ru", "en"})
 SUPPORTED_RESOURCE_MODES = frozenset({"instant", "balanced", "eco"})
+SUPPORTED_TRANSLATE_MODELS = frozenset({"small", "medium", "large-v3"})
 
 
 class ConfigError(ValueError):
@@ -125,6 +126,8 @@ class AppConfig:
     remove_fillers: bool = False
     voice_press_enter: bool = False
     voice_formatting: bool = False
+    voice_translate: bool = False
+    translate_model: str = "large-v3"
     strict_editable_check: bool = False
     resource_mode: str = "instant"
     snippets: dict[str, str] = field(default_factory=dict)
@@ -156,6 +159,20 @@ class AppConfig:
         )
         if resource_mode not in SUPPORTED_RESOURCE_MODES:
             raise ConfigError("resource_mode must be one of: instant, balanced, eco")
+        translate_model = _non_empty_string(
+            raw.get("translate_model", defaults.translate_model),
+            "translate_model",
+        )
+        if translate_model not in SUPPORTED_TRANSLATE_MODELS:
+            if translate_model == "turbo":
+                raise ConfigError(
+                    "translate_model: turbo не поддерживает перевод; "
+                    "выберите small, medium или large-v3"
+                )
+            raise ConfigError(
+                "translate_model должен быть одной из моделей: "
+                "small, medium, large-v3 (turbo не поддерживает перевод)"
+            )
 
         microphone = raw.get("microphone", defaults.microphone)
         if type(microphone) is int:
@@ -183,6 +200,11 @@ class AppConfig:
                 raw.get("voice_formatting", defaults.voice_formatting),
                 "voice_formatting",
             ),
+            voice_translate=_bool(
+                raw.get("voice_translate", defaults.voice_translate),
+                "voice_translate",
+            ),
+            translate_model=translate_model,
             strict_editable_check=_bool(
                 raw.get("strict_editable_check", defaults.strict_editable_check),
                 "strict_editable_check",
