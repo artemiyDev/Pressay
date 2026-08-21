@@ -29,7 +29,14 @@ if ($SkipModel) {
 Write-Host "Preparing Pressay..."
 & $setupScript @setupParameters
 
-$spec = Get-PressayLauncherSpec -ProjectRoot $projectRoot
+$layout = Get-PressayInstallLayout
+if (
+    -not (Test-Path -LiteralPath $layout.LauncherPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $layout.CurrentFile -PathType Leaf)
+) {
+    throw "Pressay setup completed without an active installed launcher."
+}
+$spec = Get-PressayLauncherSpec
 $programsDirectory = [Environment]::GetFolderPath("Programs")
 if ([string]::IsNullOrWhiteSpace($programsDirectory)) {
     throw "Windows Start Menu directory is unavailable."
