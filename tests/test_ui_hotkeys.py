@@ -19,6 +19,7 @@ def _make_window(settings: dict) -> SettingsWindow:
         UiSignals(),
         settings,
         [MicrophoneChoice(None, "Системный микрофон")],
+        macos=False,
     )
 
 

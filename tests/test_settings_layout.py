@@ -24,6 +24,7 @@ def _window(
         signals,
         _settings_dict(config or AppConfig()),
         [MicrophoneChoice(None, "Системный микрофон")],
+        macos=False,
     )
     return app, signals, window
 

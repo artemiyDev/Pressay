@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 
 from . import hotkey_bindings
 from .audio import SILENCE_RMS_THRESHOLD
-from .platform_support import platform_label
+from .platform_support import hotkey_hint, is_macos, platform_label
 from .text import replacement_key
 
 
@@ -98,6 +98,9 @@ LIGHT_THEME = {
     "subtitle_text": "#64748b",
     "privacy_bg": "#ecfdf5",
     "privacy_text": "#475569",
+    "warning_bg": "#fffbeb",
+    "warning_border": "#f59e0b",
+    "warning_text": "#92400e",
 }
 DARK_THEME = {
     "status_bg": "#1e293b",
@@ -105,6 +108,9 @@ DARK_THEME = {
     "subtitle_text": "#94a3b8",
     "privacy_bg": "#0f172a",
     "privacy_text": "#e2e8f0",
+    "warning_bg": "#451a03",
+    "warning_border": "#f59e0b",
+    "warning_text": "#fde68a",
 }
 
 
@@ -405,9 +411,12 @@ class SettingsWindow(QMainWindow):
         signals: UiSignals,
         settings: dict[str, Any],
         microphones: list[MicrophoneChoice],
+        *,
+        macos: bool | None = None,
     ) -> None:
         super().__init__()
         self.signals = signals
+        self._is_macos = is_macos() if macos is None else macos
         self.setWindowTitle("Pressay")
         self.setWindowIcon(make_icon())
         self.setMinimumSize(440, 320)
@@ -480,6 +489,13 @@ class SettingsWindow(QMainWindow):
         self.status_label.setObjectName("statusCard")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        self.runtime_warning_label = QLabel()
+        self.runtime_warning_label.setObjectName("runtimeWarning")
+        self.runtime_warning_label.setAccessibleName("Предупреждение Pressay")
+        self.runtime_warning_label.setWordWrap(True)
+        self.runtime_warning_label.setVisible(False)
+        layout.addWidget(self.runtime_warning_label)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -642,84 +658,152 @@ class SettingsWindow(QMainWindow):
 
         hotkeys_defaults = hotkey_bindings.HotkeyBindings().to_mapping()
         hotkeys_settings = settings.get("hotkeys", hotkeys_defaults)
+        self._initial_hotkeys = (
+            hotkey_bindings.from_mapping(hotkeys_settings).to_mapping()
+            if self._is_macos
+            else {}
+        )
 
-        hotkeys_label = QLabel("Горячие клавиши")
+        hotkeys_label = QLabel(
+            "Горячие клавиши macOS" if self._is_macos else "Горячие клавиши"
+        )
         hotkeys_label.setStyleSheet("font-weight: 600;")
         layout.addWidget(hotkeys_label)
 
-        hotkeys_form = QFormLayout()
-        hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        hotkeys_form.setVerticalSpacing(12)
-        hotkeys_form.setFieldGrowthPolicy(
-            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
-        )
-        hotkeys_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.macos_hotkeys_panel: QWidget | None = None
+        self.hotkeys_editor: QWidget | None = None
+        if self._is_macos:
+            self.macos_hotkeys_panel = QWidget()
+            self.macos_hotkeys_panel.setObjectName("macosFixedHotkeys")
+            macos_hotkeys_form = QFormLayout(self.macos_hotkeys_panel)
+            macos_hotkeys_form.setContentsMargins(0, 0, 0, 0)
+            macos_hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+            macos_hotkeys_form.setVerticalSpacing(10)
+            macos_hotkeys_form.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            macos_hotkeys_form.setRowWrapPolicy(
+                QFormLayout.RowWrapPolicy.WrapLongRows
+            )
+            self.macos_shortcut_labels: dict[str, QLabel] = {}
+            for action_label, action in (
+                ("Диктовка при удержании", "hold"),
+                ("Включить / выключить запись", "toggle"),
+                ("Отмена", "cancel"),
+                ("Вставить последнюю", "paste"),
+                ("Скопировать", "copy"),
+            ):
+                shortcut = hotkey_hint(action)
+                value = QLabel(shortcut or "—")
+                value.setWordWrap(True)
+                value.setAccessibleName(f"{action_label}: {shortcut or 'не назначено'}")
+                self.macos_shortcut_labels[action] = value
+                macos_hotkeys_form.addRow(action_label, value)
+            layout.addWidget(self.macos_hotkeys_panel)
 
-        self.hold_modifiers_combo = QComboBox()
-        self._make_combo_responsive(self.hold_modifiers_combo)
-        for pair in hotkey_bindings.HOLD_MODIFIER_PAIRS:
-            canonical = "+".join(pair)
-            label = "+".join(part.capitalize() for part in pair)
-            self.hold_modifiers_combo.addItem(label, canonical)
-        hold_index = self.hold_modifiers_combo.findData(
-            hotkeys_settings.get("hold_modifiers", hotkeys_defaults["hold_modifiers"])
-        )
-        self.hold_modifiers_combo.setCurrentIndex(max(0, hold_index))
-        hotkeys_form.addRow("Комбинация удержания", self.hold_modifiers_combo)
+            macos_hotkeys_hint = QLabel(
+                "Сочетания macOS фиксированы. Для глобальных клавиш нужны "
+                "разрешения Accessibility и Input Monitoring."
+            )
+            macos_hotkeys_hint.setWordWrap(True)
+            self._hint_labels.append(macos_hotkeys_hint)
+            layout.addWidget(macos_hotkeys_hint)
+        else:
+            self.hotkeys_editor = QWidget()
+            windows_hotkeys_layout = QVBoxLayout(self.hotkeys_editor)
+            windows_hotkeys_layout.setContentsMargins(0, 0, 0, 0)
+            windows_hotkeys_layout.setSpacing(12)
 
-        self.push_to_talk_checkbox = QCheckBox(
-            "Push-to-talk"
-        )
-        self.push_to_talk_checkbox.setToolTip(
-            "Удерживать сочетание горячих клавиш во время речи"
-        )
-        self.push_to_talk_checkbox.setChecked(
-            bool(hotkeys_settings.get("push_to_talk", hotkeys_defaults["push_to_talk"]))
-        )
-        hotkeys_form.addRow(self.push_to_talk_checkbox)
-        push_to_talk_hint = QLabel(
-            "Если выключено, сочетание с клавишей переключения запускает и "
-            "останавливает запись без удержания."
-        )
-        push_to_talk_hint.setWordWrap(True)
-        self._hint_labels.append(push_to_talk_hint)
-        hotkeys_form.addRow("", push_to_talk_hint)
+            hotkeys_form = QFormLayout()
+            hotkeys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+            hotkeys_form.setVerticalSpacing(12)
+            hotkeys_form.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            hotkeys_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
-        self.toggle_key_edit = QLineEdit(
-            str(hotkeys_settings.get("toggle_key", hotkeys_defaults["toggle_key"]))
-        )
-        hotkeys_form.addRow("Клавиша переключения", self.toggle_key_edit)
+            self.hold_modifiers_combo = QComboBox()
+            self._make_combo_responsive(self.hold_modifiers_combo)
+            for pair in hotkey_bindings.HOLD_MODIFIER_PAIRS:
+                canonical = "+".join(pair)
+                label = "+".join(part.capitalize() for part in pair)
+                self.hold_modifiers_combo.addItem(label, canonical)
+            hold_index = self.hold_modifiers_combo.findData(
+                hotkeys_settings.get(
+                    "hold_modifiers", hotkeys_defaults["hold_modifiers"]
+                )
+            )
+            self.hold_modifiers_combo.setCurrentIndex(max(0, hold_index))
+            hotkeys_form.addRow("Комбинация удержания", self.hold_modifiers_combo)
 
-        self.paste_last_edit = QLineEdit(
-            str(hotkeys_settings.get("paste_last", hotkeys_defaults["paste_last"]))
-        )
-        hotkeys_form.addRow("Вставить последнюю", self.paste_last_edit)
+            self.push_to_talk_checkbox = QCheckBox("Push-to-talk")
+            self.push_to_talk_checkbox.setToolTip(
+                "Удерживать сочетание горячих клавиш во время речи"
+            )
+            self.push_to_talk_checkbox.setChecked(
+                bool(
+                    hotkeys_settings.get(
+                        "push_to_talk", hotkeys_defaults["push_to_talk"]
+                    )
+                )
+            )
+            hotkeys_form.addRow(self.push_to_talk_checkbox)
+            push_to_talk_hint = QLabel(
+                "Если выключено, сочетание с клавишей переключения запускает и "
+                "останавливает запись без удержания."
+            )
+            push_to_talk_hint.setWordWrap(True)
+            self._hint_labels.append(push_to_talk_hint)
+            hotkeys_form.addRow("", push_to_talk_hint)
 
-        self.copy_last_edit = QLineEdit(
-            str(hotkeys_settings.get("copy_last", hotkeys_defaults["copy_last"]))
-        )
-        hotkeys_form.addRow("Скопировать", self.copy_last_edit)
-        layout.addLayout(hotkeys_form)
+            self.toggle_key_edit = QLineEdit(
+                str(
+                    hotkeys_settings.get(
+                        "toggle_key", hotkeys_defaults["toggle_key"]
+                    )
+                )
+            )
+            hotkeys_form.addRow("Клавиша переключения", self.toggle_key_edit)
 
-        hotkeys_format_label = QLabel(
-            "Части сочетания пишутся через «+»: модификаторы ctrl, win, shift, alt "
-            "и одна обычная клавиша — буква, цифра, space или f1–f12. Слово none "
-            "отключает действие."
-        )
-        hotkeys_format_label.setWordWrap(True)
-        self._hint_labels.append(hotkeys_format_label)
-        layout.addWidget(hotkeys_format_label)
+            self.paste_last_edit = QLineEdit(
+                str(
+                    hotkeys_settings.get(
+                        "paste_last", hotkeys_defaults["paste_last"]
+                    )
+                )
+            )
+            hotkeys_form.addRow("Вставить последнюю", self.paste_last_edit)
 
-        self.hotkeys_conflict_label = QLabel(
-            "Внимание, возможные конфликты: Ctrl+Alt на многих раскладках равносилен "
-            "AltGr и используется для ввода символов; Ctrl+Shift и Shift+Alt — "
-            "стандартные сочетания переключения раскладки Windows; Ctrl+Win тоже "
-            "может пересекаться с системными или приложенческими сочетаниями. "
-            "Универсально бесконфликтной пары нет."
-        )
-        self.hotkeys_conflict_label.setWordWrap(True)
-        self._hint_labels.append(self.hotkeys_conflict_label)
-        layout.addWidget(self.hotkeys_conflict_label)
+            self.copy_last_edit = QLineEdit(
+                str(
+                    hotkeys_settings.get(
+                        "copy_last", hotkeys_defaults["copy_last"]
+                    )
+                )
+            )
+            hotkeys_form.addRow("Скопировать", self.copy_last_edit)
+            windows_hotkeys_layout.addLayout(hotkeys_form)
+
+            hotkeys_format_label = QLabel(
+                "Части сочетания пишутся через «+»: модификаторы ctrl, win, "
+                "shift, alt и одна обычная клавиша — буква, цифра, space или "
+                "f1–f12. Слово none отключает действие."
+            )
+            hotkeys_format_label.setWordWrap(True)
+            self._hint_labels.append(hotkeys_format_label)
+            windows_hotkeys_layout.addWidget(hotkeys_format_label)
+
+            self.hotkeys_conflict_label = QLabel(
+                "Внимание, возможные конфликты: Ctrl+Alt на многих раскладках "
+                "равносилен AltGr и используется для ввода символов; Ctrl+Shift "
+                "и Shift+Alt — стандартные сочетания переключения раскладки "
+                "Windows; Ctrl+Win тоже может пересекаться с системными или "
+                "приложенческими сочетаниями. Универсально бесконфликтной пары нет."
+            )
+            self.hotkeys_conflict_label.setWordWrap(True)
+            self._hint_labels.append(self.hotkeys_conflict_label)
+            windows_hotkeys_layout.addWidget(self.hotkeys_conflict_label)
+            layout.addWidget(self.hotkeys_editor)
 
         dictionary_label = QLabel("Личный словарь")
         dictionary_label.setToolTip(
@@ -897,6 +981,8 @@ class SettingsWindow(QMainWindow):
         }
 
     def _current_hotkeys(self) -> dict[str, Any]:
+        if self._is_macos:
+            return dict(self._initial_hotkeys)
         raw = {
             "hold_modifiers": self.hold_modifiers_combo.currentData(),
             "toggle_key": self.toggle_key_edit.text(),
@@ -924,6 +1010,13 @@ class SettingsWindow(QMainWindow):
         self.status_label.setText(text)
         self._restyle_status()
         self.toggle_button.setText("Завершить тест" if state == "recording" else "Тестовая диктовка")
+
+    def set_runtime_warning(self, text: str | None) -> None:
+        """Show a persistent warning independently from transient status updates."""
+
+        message = "" if text is None else text.strip()
+        self.runtime_warning_label.setText(message)
+        self.runtime_warning_label.setVisible(bool(message))
 
     def update_active_model(self, model: str, device: str, compute_type: str) -> None:
         """Show the backend that successfully completed model warmup."""
@@ -966,6 +1059,11 @@ class SettingsWindow(QMainWindow):
         self._privacy_label.setStyleSheet(
             f"color: {tokens['privacy_text']}; background: {tokens['privacy_bg']};"
             " padding: 10px; border-radius: 8px;"
+        )
+        self.runtime_warning_label.setStyleSheet(
+            f"color: {tokens['warning_text']}; background: {tokens['warning_bg']};"
+            f" border: 1px solid {tokens['warning_border']};"
+            " padding: 10px; border-radius: 8px; font-weight: 600;"
         )
         self._restyle_status()
 
