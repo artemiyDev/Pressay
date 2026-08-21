@@ -6,7 +6,8 @@
 - Windows application launches with the supplied Pressay icon.
 - macOS modules are importable without loading native frameworks on Windows.
 - macOS hotkey disambiguation and focus-change zero-injection rules have pure tests.
-- GitHub Actions runs the full suite on `windows-2022` and Apple Silicon `macos-14`.
+- GitHub Actions runs the pytest suite on `windows-2022` and a GitHub-hosted
+  `macos-14` runner.
 - macOS CI validates PyObjC framework imports and every `*-macos.sh` script with `bash -n`.
 
 ## Not proven without a real Mac / Без реального Mac не доказано
@@ -19,9 +20,11 @@
 - latency, thermals and model choice on each Apple Silicon generation;
 - signed/notarized `.app` and `.dmg` distribution.
 
-CI success means the macOS dependency graph, imports, pure state machines,
-package assets and scripts are coherent. It does **not** replace the following
-hardware acceptance run.
+CI installs an explicit test dependency set and then installs Pressay package
+metadata with `pip install --no-deps .`. Success checks imports, pure state
+machines, package assets, scripts, and the pytest suite; it does **not** prove
+that a clean full runtime dependency installation succeeds. It also does
+**not** replace the following hardware acceptance run.
 
 ## Real-Mac acceptance checklist / Чек-лист на реальном Mac
 

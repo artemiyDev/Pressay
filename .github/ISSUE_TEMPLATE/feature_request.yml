@@ -1,0 +1,47 @@
+name: Feature request / Предложить функцию
+description: Describe a user problem and a focused improvement / Опишите проблему и улучшение
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Pressay is local-first and privacy-first. Proposals should preserve local recognition, no telemetry, and fail-closed insertion.
+
+        Pressay работает локально и сохраняет приватность. Предложение должно сохранять локальное распознавание, отсутствие телеметрии и безопасный отказ вставки.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem / Пользовательская проблема
+      description: What is difficult today, and for whom? / Что сейчас трудно и для кого?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / Предлагаемое поведение
+      description: Describe the smallest useful outcome. / Опишите минимальный полезный результат.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / Альтернативы
+      description: What workarounds or alternatives have you tried? / Какие обходные пути или альтернативы вы пробовали?
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform / Платформа
+      options:
+        - Windows
+        - macOS
+        - Both / Обе
+        - Platform-independent / Не зависит от платформы
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy / Приватность
+      options:
+        - label: This report contains no audio, transcripts, credentials, configuration, local paths, or other private data. / В отчёте нет аудио, расшифровок, учётных данных, конфига, локальных путей и других личных данных.
+          required: true
