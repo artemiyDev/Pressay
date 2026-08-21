@@ -1679,21 +1679,46 @@ class DictationController:
             self.notification_callback("Pressay", reason, True)
 
     @staticmethod
-    def _copy_text(text: str) -> None:
-        try:
-            input_adapter().copy_text(text)
-        except Exception:
-            LOGGER.exception("clipboard_copy_failed")
+    def _copy_text(text: str) -> Any:
+        return input_adapter().copy_text(text)
+
+    def _report_last_transcript_feedback(
+        self,
+        text: str,
+        status_text: str,
+        status: str,
+        *,
+        notification_text: str | None = None,
+        warning: bool = False,
+    ) -> None:
+        """Publish recovery feedback only while its transcript is still current."""
+
+        if not self._last_transcript_is_current(text):
+            return
+        self.status_callback(status_text, status)
+        if (
+            notification_text is not None
+            and self._last_transcript_is_current(text)
+        ):
+            self.notification_callback(
+                "Pressay",
+                notification_text,
+                warning,
+            )
 
     def paste_last(self) -> bool:
         with self._lock:
             if self._closed or not self.last_transcript:
                 return False
             text = self.last_transcript
+            strict_editable_check = self.config.strict_editable_check
+            bindings = self.config.hotkeys
+        if not self._last_transcript_is_current(text):
+            return False
         try:
             outcome = input_adapter().paste_last(
                 text,
-                strict_editable_check=self.config.strict_editable_check,
+                strict_editable_check=strict_editable_check,
                 cancelled=lambda: not self._last_transcript_is_current(text),
             )
         except Exception as exc:
@@ -1701,20 +1726,47 @@ class DictationController:
             # backend/COM failure must not turn it into a destructive implicit
             # copy; copying is exclusively the explicit copy_last action.
             LOGGER.warning("paste_last_failed: %s", type(exc).__name__)
-            if self._last_transcript_is_current(text):
-                self.status_callback(
-                    "Не вставлено — текст сохранён ниже",
-                    "warning",
-                )
-            if self._last_transcript_is_current(text):
-                self.notification_callback(
-                    "Pressay",
+            self._report_last_transcript_feedback(
+                text,
+                "Не вставлено — текст сохранён ниже",
+                "warning",
+                notification_text=(
                     "Не удалось вставить последнюю расшифровку. "
-                    "Текст сохранён в окне Pressay. " + self._copy_hint_sentence(),
-                    True,
-                )
+                    "Текст сохранён в окне Pressay. " + self._copy_hint_sentence()
+                ),
+                warning=True,
+            )
             return False
-        return bool(getattr(outcome, "success", False))
+        success = bool(getattr(outcome, "success", False))
+        if success:
+            self._report_last_transcript_feedback(text, "Вставлено", "success")
+            return True
+
+        copied = bool(getattr(outcome, "copied", False))
+        reason = str(getattr(outcome, "reason", "input_failed"))
+        if copied:
+            self._report_last_transcript_feedback(
+                text,
+                "Не вставлено — текст скопирован",
+                "warning",
+                notification_text=(
+                    "Не удалось вставить последнюю расшифровку, но текст "
+                    "скопирован в буфер обмена. Вставьте его вручную."
+                ),
+                warning=True,
+            )
+        else:
+            self._report_last_transcript_feedback(
+                text,
+                _insertion_status_text(reason, bindings),
+                "warning",
+                notification_text=(
+                    "Не удалось вставить последнюю расшифровку. "
+                    "Текст сохранён в окне Pressay. " + self._copy_hint_sentence()
+                ),
+                warning=True,
+            )
+        return False
 
     def copy_last(self) -> bool:
         with self._lock:
@@ -1723,8 +1775,36 @@ class DictationController:
             text = self.last_transcript
         if not self._last_transcript_is_current(text):
             return False
-        self._copy_text(text)
-        return True
+        try:
+            outcome = self._copy_text(text)
+        except Exception as exc:
+            LOGGER.warning("copy_last_failed: %s", type(exc).__name__)
+            self._report_last_transcript_feedback(
+                text,
+                "Не скопировано — текст сохранён ниже",
+                "warning",
+                notification_text=(
+                    "Не удалось скопировать последнюю расшифровку. "
+                    "Текст сохранён в окне Pressay."
+                ),
+                warning=True,
+            )
+            return False
+        success = bool(getattr(outcome, "success", False))
+        if success:
+            self._report_last_transcript_feedback(text, "Скопировано", "success")
+            return True
+        self._report_last_transcript_feedback(
+            text,
+            "Не скопировано — текст сохранён ниже",
+            "warning",
+            notification_text=(
+                "Не удалось скопировать последнюю расшифровку. "
+                "Текст сохранён в окне Pressay."
+            ),
+            warning=True,
+        )
+        return False
 
     def _last_transcript_is_current(self, text: str) -> bool:
         with self._lock:
