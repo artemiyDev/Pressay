@@ -2,6 +2,107 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$launcherMode = if ($args -contains "--background") { "background" } else { "foreground" }
+$launcherFailureExitCode = 1
+
+function Write-PressayLauncherFailureLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Mode
+    )
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            return
+        }
+        $localRoot = [System.IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        $filesystemRoot = [System.IO.Path]::GetPathRoot($localRoot)
+        if ([string]::Equals($localRoot, $filesystemRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+        $logRoot = [System.IO.Path]::GetFullPath((Join-Path $localRoot "Pressay"))
+        $expectedPrefix = $localRoot + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $logRoot.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+
+        [System.IO.Directory]::CreateDirectory($logRoot) | Out-Null
+        $logPath = Join-Path $logRoot "launcher.log"
+        $maximumBytes = 204800
+        $retainedBytes = 153600
+        $singleLineMessage = ($Message -replace '[\r\n]+', ' ').Trim()
+        $timestamp = [System.DateTimeOffset]::Now.ToString(
+            "o",
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        $line = "$timestamp mode=$Mode error=$singleLineMessage$([Environment]::NewLine)"
+        $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+        $lineBytes = $utf8WithoutBom.GetByteCount($line)
+        if (
+            [System.IO.File]::Exists($logPath) -and
+            (([System.IO.FileInfo]$logPath).Length + $lineBytes) -gt $maximumBytes
+        ) {
+            $contents = [System.IO.File]::ReadAllBytes($logPath)
+            $bytesToKeep = [Math]::Min(
+                $retainedBytes,
+                [Math]::Max(0, $maximumBytes - $lineBytes)
+            )
+            $offset = [Math]::Max(0, $contents.Length - $bytesToKeep)
+            $trimmed = New-Object byte[] ($contents.Length - $offset)
+            [System.Array]::Copy($contents, $offset, $trimmed, 0, $trimmed.Length)
+            [System.IO.File]::WriteAllBytes($logPath, $trimmed)
+        }
+
+        [System.IO.File]::AppendAllText($logPath, $line, $utf8WithoutBom)
+    }
+    catch {
+        # Launcher diagnostics must never replace the original launch failure.
+    }
+}
+
+function Show-PressayLauncherFailure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    $nonInteractive = [System.Environment]::CommandLine -match '(?i)(?:^|\s)-NonInteractive(?:\s|$)'
+    if (
+        [string]::Equals(
+            $env:PRESSAY_LAUNCHER_NO_UI,
+            "1",
+            [System.StringComparison]::Ordinal
+        ) -or
+        $nonInteractive
+    ) {
+        return
+    }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $body = (
+            "Pressay не удалось запустить.`r`n`r`n" +
+            "Причина: $Message`r`n`r`n" +
+            "Проверьте установку Pressay или переустановите приложение."
+        )
+        [System.Windows.Forms.MessageBox]::Show(
+            $body,
+            "Pressay",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    }
+    catch {
+        # The launcher still reports to stderr and launcher.log when UI is unavailable.
+    }
+}
+
+try {
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "LOCALAPPDATA is unavailable."
 }
@@ -295,8 +396,7 @@ if ($cudaBins.Count -gt 0) {
 $venvPythonw = Join-Path $runtimeRoot "Scripts\pythonw.exe"
 if ($args -contains "--background") {
     if (-not (Test-Path -LiteralPath $venvPythonw -PathType Leaf)) {
-        [Console]::Error.WriteLine("Background Python launcher is missing: $venvPythonw")
-        exit 1
+        throw "Background Python launcher is missing: $venvPythonw"
     }
     Assert-PressayLauncherPathIsNotReparsePoint -Path $venvPythonw | Out-Null
 
@@ -310,15 +410,14 @@ if ($args -contains "--background") {
             -ErrorAction Stop
     }
     catch {
-        [Console]::Error.WriteLine("Failed to launch Pressay in background: $($_.Exception.Message)")
-        exit 1
+        throw "Failed to launch Pressay in background: $($_.Exception.Message)"
     }
 
     if ($backgroundProcess.WaitForExit(1500)) {
         $backgroundExitCode = [int]$backgroundProcess.ExitCode
         if ($backgroundExitCode -ne 0) {
-            [Console]::Error.WriteLine("Pressay background process exited during startup (code $backgroundExitCode).")
-            exit $backgroundExitCode
+            $launcherFailureExitCode = $backgroundExitCode
+            throw "Pressay background process exited during startup (code $backgroundExitCode)."
         }
     }
     exit 0
@@ -327,3 +426,13 @@ if ($args -contains "--background") {
 & $venvPython -m pressay @args
 $foregroundExitCode = [int]$LASTEXITCODE
 exit $foregroundExitCode
+}
+catch {
+    $failureMessage = $_.Exception.Message
+    Write-PressayLauncherFailureLog -Message $failureMessage -Mode $launcherMode
+    [Console]::Error.WriteLine($failureMessage)
+    if ($launcherMode -ceq "background") {
+        Show-PressayLauncherFailure -Message $failureMessage
+    }
+    exit $launcherFailureExitCode
+}
