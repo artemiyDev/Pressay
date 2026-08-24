@@ -673,11 +673,20 @@ class DictationController:
             self._prepared_timeout = None
 
     def prepare_capture(self) -> bool:
-        """Open a bounded, silent prearmed capture without changing UI state."""
+        """Open a bounded, silent prearmed capture without changing UI state.
+
+        Disabled by default: live telemetry showed the pre-opened WASAPI
+        stream still delivered its first frame ~0.4s after the gesture (no
+        real head-start), while opening a device stream on every Ctrl+Win
+        touch - including Windows' own Ctrl+Win shortcuts - multiplied
+        open/close churn on the system audio engine. Suspected of degrading
+        the audio stack over time (system-wide crackling until reboot).
+        """
 
         with self._lock:
             if (
-                self._closed
+                not self.config.prearm_capture
+                or self._closed
                 or self.state.active
                 or self._capture_intent is not _CaptureIntent.IDLE
             ):

@@ -127,6 +127,7 @@ class AppConfig:
     voice_press_enter: bool = False
     voice_formatting: bool = False
     voice_translate: bool = False
+    prearm_capture: bool = False
     translate_model: str = "large-v3"
     strict_editable_check: bool = False
     resource_mode: str = "instant"
@@ -199,6 +200,9 @@ class AppConfig:
             voice_formatting=_bool(
                 raw.get("voice_formatting", defaults.voice_formatting),
                 "voice_formatting",
+            ),
+            prearm_capture=_bool(
+                raw.get("prearm_capture", defaults.prearm_capture), "prearm_capture"
             ),
             voice_translate=_bool(
                 raw.get("voice_translate", defaults.voice_translate),

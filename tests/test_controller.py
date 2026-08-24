@@ -583,7 +583,7 @@ def test_pipeline_log_reports_full_delay_breakdown(monkeypatch, caplog) -> None:
 
 def test_prepared_capture_is_reused_and_reported_in_pipeline_log(caplog) -> None:
     controller = DictationController(
-        AppConfig(auto_insert=False),
+        AppConfig(auto_insert=False, prearm_capture=True),
         status_callback=lambda *_args: None,
         result_callback=lambda *_args: None,
         notification_callback=lambda *_args: None,
@@ -613,7 +613,7 @@ def test_prepared_capture_is_reused_and_reported_in_pipeline_log(caplog) -> None
 
 def test_abandoned_prepared_capture_closes_then_allows_a_new_prepare_cycle() -> None:
     controller = DictationController(
-        AppConfig(),
+        AppConfig(prearm_capture=True),
         status_callback=lambda *_args: None,
         result_callback=lambda *_args: None,
         notification_callback=lambda *_args: None,
@@ -1500,3 +1500,16 @@ def test_transcription_log_records_language_choice(caplog, language_choice: str)
     )
     controller.close()
     assert controller.wait_closed(2)
+
+def test_prepare_capture_is_a_noop_while_prearm_is_disabled() -> None:
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    calls = []
+    controller._new_recorder = lambda: calls.append(1)  # type: ignore[method-assign]
+
+    assert controller.prepare_capture() is False
+    assert calls == []
