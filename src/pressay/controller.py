@@ -1543,7 +1543,7 @@ class DictationController:
         LOGGER.info(
             "transcription_completed language=%s device=%s compute=%s "
             "audio_seconds=%.3f vad_used=%s load_seconds=%.3f inference_seconds=%.3f "
-            "total_seconds=%.3f characters=%d task=%s",
+            "total_seconds=%.3f characters=%d task=%s language_choice=%s",
             getattr(result, "language", "unknown"),
             getattr(result, "device", "unknown"),
             getattr(result, "compute_type", "unknown"),
@@ -1554,6 +1554,7 @@ class DictationController:
             float(getattr(timings, "total_seconds", 0.0) or 0.0),
             len(processed.text),
             task,
+            getattr(result, "language_choice", "unknown"),
         )
 
         if processed.translation_mode is not None:

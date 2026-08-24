@@ -1457,4 +1457,46 @@ def test_missing_local_model_reports_actionable_warmup_error(monkeypatch) -> Non
     assert notifications
     assert _setup_command("large-v3") in str(notifications[-1][1])
     controller.close()
+
+
+@pytest.mark.parametrize("language_choice", ["posterior", "dual", "forced"])
+def test_transcription_log_records_language_choice(caplog, language_choice: str) -> None:
+    class LanguageChoiceTranscriber(FakeTranscriber):
+        def transcribe(self, *_args, **_kwargs) -> TranscriptionResult:
+            result = super().transcribe(*_args, **_kwargs)
+            return TranscriptionResult(
+                text=result.text,
+                language=result.language,
+                language_probability=result.language_probability,
+                segments=result.segments,
+                audio_duration_seconds=result.audio_duration_seconds,
+                timings=result.timings,
+                device=result.device,
+                compute_type=result.compute_type,
+                language_choice=language_choice,
+            )
+
+    controller = DictationController(
+        AppConfig(auto_insert=False),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    controller._new_recorder = lambda: DurationRecorder(0.5)  # type: ignore[method-assign]
+    controller._transcriber = LanguageChoiceTranscriber(  # type: ignore[assignment]
+        controller.config.model
+    )
+    caplog.set_level(logging.INFO, logger="pressay.controller")
+
+    assert controller.start_recording(target="window") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert any(
+        record.message.startswith("transcription_completed")
+        and f"language_choice={language_choice}" in record.message
+        for record in caplog.records
+    )
+    controller.close()
     assert controller.wait_closed(2)

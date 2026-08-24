@@ -59,6 +59,7 @@ class TranscriptionResult:
     timings: TranscriptionTimings
     device: str
     compute_type: str
+    language_choice: str = "posterior"
 
     @property
     def transcription_seconds(self) -> float:
@@ -82,6 +83,10 @@ DownloadProgressCallback = Callable[[int], None]
 _DLL_DIRECTORY_HANDLES: list[Any] = []
 _NVIDIA_DLL_HANDLES: list[Any] = []
 _LOADED_NVIDIA_DLL_PATHS: set[str] = set()
+
+# Below 10%, the posterior mass left for either supported language is too
+# small to rank RU versus EN reliably after detection chose another language.
+INFORMATIVE_POSTERIOR = 0.10
 
 
 def _prepare_windows_nvidia_dlls() -> None:
@@ -509,7 +514,22 @@ class FasterWhisperTranscriber:
         return list(segments), info
 
     @staticmethod
-    def _supported_languages_by_preference(info: Any) -> tuple[str, ...]:
+    def _supported_language_probabilities(info: Any) -> dict[str, float]:
+        """Return finite RU/EN posterior values, defaulting to zero."""
+
+        probabilities = _field(info, "all_language_probs", None) or ()
+        table: dict[str, float] = {}
+        try:
+            for code, value in probabilities:
+                probability = float(value)
+                if np.isfinite(probability):
+                    table[str(code).casefold().strip()] = probability
+        except (TypeError, ValueError):
+            table = {}
+        return {code: table.get(code, 0.0) for code in ("ru", "en")}
+
+    @classmethod
+    def _supported_languages_by_preference(cls, info: Any) -> tuple[str, ...]:
         """Order RU and EN by the model's own posterior for this audio.
 
         Auto-detection ranges over every language Whisper knows, but only these
@@ -520,13 +540,7 @@ class FasterWhisperTranscriber:
         historical RU-then-EN order.
         """
 
-        probabilities = _field(info, "all_language_probs", None) or ()
-        table: dict[str, float] = {}
-        try:
-            for code, value in probabilities:
-                table[str(code).casefold().strip()] = float(value)
-        except (TypeError, ValueError):
-            table = {}
+        table = cls._supported_language_probabilities(info)
         return tuple(
             sorted(("ru", "en"), key=lambda code: table.get(code, 0.0), reverse=True)
         )
@@ -679,6 +693,7 @@ class FasterWhisperTranscriber:
         load_seconds = 0.0
         inference_seconds = 0.0
         candidate: _TranscriptionCandidate
+        language_choice = "forced" if language != "auto" else "posterior"
         with self._lock:
             was_loaded = self._model is not None
             model = self.load()
@@ -736,8 +751,17 @@ class FasterWhisperTranscriber:
                 )
             else:
                 # Detection wandered outside the two supported languages. Ask
-                # the model which of them it actually prefers and stop at the
-                # first trustworthy transcript instead of always running both.
+                # the model which of them it actually prefers. When neither
+                # supported posterior is informative, compare both transcripts.
+                supported_probabilities = self._supported_language_probabilities(info)
+                posterior_available = (
+                    _field(info, "all_language_probs", None) is not None
+                )
+                informative_posterior = (
+                    not posterior_available
+                    or max(supported_probabilities.values()) >= INFORMATIVE_POSTERIOR
+                )
+                language_choice = "posterior" if informative_posterior else "dual"
                 fixed_candidates: list[_TranscriptionCandidate] = []
                 inference_errors: list[TranscriptionError] = []
                 for fixed_language in self._supported_languages_by_preference(info):
@@ -761,10 +785,8 @@ class FasterWhisperTranscriber:
                     except TranscriptionError as exc:
                         inference_errors.append(exc)
                     else:
-                        # The model's preferred language produced a usable
-                        # transcript; transcribing the other one cannot improve
-                        # on a choice the model already made.
-                        break
+                        if informative_posterior:
+                            break
                 if not fixed_candidates:
                     if len(inference_errors) == 2:
                         raise TranscriptionError(
@@ -790,6 +812,7 @@ class FasterWhisperTranscriber:
             ),
             device=str(self._active_device),
             compute_type=str(self._active_compute_type),
+            language_choice=language_choice,
         )
 
     def close(self) -> None:
