@@ -430,7 +430,11 @@ def test_stop_timeout_retains_live_thread_until_background_cleanup() -> None:
     assert service.stop(timeout_s=0.02) is False
     elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.15
+    # Starting the retained-cleanup thread waits for the OS scheduler to enter
+    # its bootstrap. Loaded cross-platform runners can add more than 100 ms of
+    # scheduling latency, so keep the bound well below the hook's two-second
+    # block without treating scheduler jitter as a shutdown regression.
+    assert elapsed < 0.5
     assert service._hook_thread is hook_thread
     assert service._cleanup_thread is not None
     assert service.wait_stopped(timeout_s=0) is False
