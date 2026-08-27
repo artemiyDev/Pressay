@@ -43,12 +43,15 @@ menu-bar and application-insertion acceptance checklist.
 On Windows, installation publishes a versioned app payload under
 `%LOCALAPPDATA%\Pressay\app\<version>` and points every managed shortcut at the
 stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher. The installed app no
-longer depends on the cloned repository. Each release uses a matching runtime
-under `%LOCALAPPDATA%\Pressay\runtime\<version>`, while configuration, logs,
-and the model cache remain shared. Upgrades retain the active release and one
-previous app/runtime pair; older verified pairs are removed to avoid
-accumulating multi-gigabyte runtimes. A stable `Uninstall-Pressay.ps1` is
-installed beside the launcher.
+longer depends on the cloned repository. Each payload contains a validated
+reference to a versioned runtime under
+`%LOCALAPPDATA%\Pressay\runtime\<runtime-version>`. When the dependency contract
+is unchanged, an upgrade reuses the active runtime instead of rebuilding its
+multi-gigabyte environment; changed dependencies get a new immutable-by-policy
+runtime. Configuration, logs, and the model cache remain shared. Upgrades retain
+the active and previous app payloads plus every runtime they reference, then
+remove only older verified payloads and unreferenced runtimes. A stable
+`Uninstall-Pressay.ps1` is installed beside the launcher.
 
 The macOS developer beta still runs from its repository checkout; keep that
 checkout in place.

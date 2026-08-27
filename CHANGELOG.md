@@ -5,8 +5,8 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.6` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.6` указана в текущем исходном коде,
+`0.5.7` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.7` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
@@ -32,13 +32,17 @@ have a matching tagged release. Версия `0.5.6` указана в теку�
   uses the stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher for start-menu,
   desktop, and autostart shortcuts. Installing or upgrading requires Pressay to
   be fully exited.
-- Windows releases now pair each payload with a versioned runtime and activate
-  both through the same atomic pointer. Failed dependency installation cannot
-  mutate the active release, and a source-independent uninstaller is installed.
-- After validating a new Windows release, the installer retains the active
-  release and one previous app/runtime pair, then removes older verified pairs.
-  Unpaired, modified, or unsafe directories are reported and left untouched;
-  shared models, configuration, and logs are never part of this cleanup.
+- Windows payloads now contain a validated reference to a versioned runtime. An
+  unchanged dependency contract reuses the active multi-gigabyte runtime; a
+  changed contract builds a new immutable-by-policy runtime. Schema 1 payloads
+  remain supported during upgrades. Failed dependency installation cannot
+  mutate or recreate the active runtime, and a source-independent uninstaller
+  is installed.
+- After validating a new Windows release, the installer retains the active and
+  previous app payloads plus every runtime they reference. It removes only older
+  verified payloads and now-unreferenced runtimes. Unpaired, modified, or unsafe
+  directories are reported and left untouched; shared models, configuration,
+  and logs are never part of this cleanup.
 - Windows uninstall now removes only Pressay-owned shortcuts by default. The
   explicit `-RemoveApp`, `-RemoveRuntime`, `-RemoveUserData`, and
   `-RemoveInstaller` flags remove installed payloads, versioned/legacy runtimes,
@@ -52,11 +56,15 @@ have a matching tagged release. Версия `0.5.6` указана в теку�
   стабильный `%LOCALAPPDATA%\Pressay\Pressay.ps1` для ярлыков меню «Пуск»,
   рабочего стола и автозапуска. Перед установкой или обновлением Pressay нужно
   полностью завершить.
-- Каждый Windows payload теперь связан со своим версионным runtime и
-  активируется тем же атомарным указателем. Неудачная установка зависимостей не
-  изменяет активную версию; uninstaller устанавливается независимо от исходников.
-- После проверки новой Windows-версии установщик сохраняет активную и одну
-  предыдущую пару app/runtime, а более старые проверенные пары удаляет.
+- Windows payload теперь содержит проверенную ссылку на версионный runtime. При
+  неизменном контракте зависимостей обновление повторно использует активный
+  многогигабайтный runtime; при изменении контракта создаёт новый неизменяемый
+  runtime. Payload схемы 1 поддерживаются при обновлении. Неудачная установка
+  зависимостей не может изменить или пересоздать активный runtime; uninstaller
+  устанавливается независимо от исходников.
+- После проверки новой Windows-версии установщик сохраняет активный и предыдущий
+  payload приложения вместе со всеми runtime, на которые они ссылаются. Он
+  удаляет только старые проверенные payload и больше не используемые runtime.
   Непарные, изменённые или небезопасные каталоги остаются нетронутыми с
   предупреждением; общие модели, настройки и логи в очистку не входят.
 - По умолчанию удаление Windows теперь убирает только принадлежащие Pressay

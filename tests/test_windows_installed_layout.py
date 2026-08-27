@@ -335,11 +335,14 @@ def test_explicit_uninstall_flags_remove_only_owned_install_targets(tmp_path: Pa
 def test_versioned_runtime_ready_marker_reuse_and_active_cleanup_guard(
     tmp_path: Path,
 ) -> None:
+    current_project = _make_project(tmp_path, "2.0.0", "current")
+    candidate_project = _make_project(tmp_path, "3.0.0", "candidate")
     local_appdata = tmp_path / "Runtime Local AppData"
     command = (
         "$ErrorActionPreference = 'Stop'; "
         f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
         f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(current_project)} -Layout $layout -Version '2.0.0' -RuntimeVersion '2.0.0' | Out-Null; "
         "$first = Initialize-PressayRuntimeBuild -Layout $layout -Version '2.0.0'; "
         "$marker = Join-Path $first.RuntimeVersionRoot '.pressay-runtime.json'; "
         "$markerBefore = Test-Path -LiteralPath $marker; "
@@ -348,16 +351,19 @@ def test_versioned_runtime_ready_marker_reuse_and_active_cleanup_guard(
         "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
         "Complete-PressayRuntimeBuild -Layout $layout -Version '2.0.0' | Out-Null; "
         "$second = Initialize-PressayRuntimeBuild -Layout $layout -Version '2.0.0'; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(candidate_project)} -Layout $layout -Version '3.0.0' -RuntimeVersion '3.0.0' | Out-Null; "
         "$inactive = Get-PressayRuntimeVersionRoot -Layout $layout -Version '3.0.0'; "
+        "Set-PressayFileAtomically -Path $layout.CurrentFile -Content \"3.0.0`n\" | Out-Null; "
+        "$missingRefused = $false; try { Initialize-PressayRuntimeBuild -Layout $layout -Version '3.0.0' | Out-Null } catch { $missingRefused = $true }; "
+        "$missingStayedAbsent = -not (Test-Path -LiteralPath $inactive); "
         "New-Item -ItemType Directory -Path $inactive -Force | Out-Null; "
         "Set-Content -LiteralPath (Join-Path $inactive 'partial.txt') -Value 'partial'; "
-        "Set-PressayFileAtomically -Path $layout.CurrentFile -Content \"3.0.0`n\" | Out-Null; "
         "$refused = $false; try { Initialize-PressayRuntimeBuild -Layout $layout -Version '3.0.0' | Out-Null } catch { $refused = $true }; "
         "$partialKept = Test-Path -LiteralPath (Join-Path $inactive 'partial.txt'); "
         "Set-PressayFileAtomically -Path $layout.CurrentFile -Content \"2.0.0`n\" | Out-Null; "
         "$rebuilt = Initialize-PressayRuntimeBuild -Layout $layout -Version '3.0.0'; "
         "$partialRemoved = -not (Test-Path -LiteralPath (Join-Path $inactive 'partial.txt')); "
-        "[pscustomobject]@{ MarkerBefore = $markerBefore; MarkerAfter = (Test-Path -LiteralPath $marker); Reused = $second.Reused; Refused = $refused; PartialKept = $partialKept; Rebuilt = (-not $rebuilt.Reused); PartialRemoved = $partialRemoved } | ConvertTo-Json -Compress"
+        "[pscustomobject]@{ MarkerBefore = $markerBefore; MarkerAfter = (Test-Path -LiteralPath $marker); Reused = $second.Reused; MissingRefused = $missingRefused; MissingStayedAbsent = $missingStayedAbsent; Refused = $refused; PartialKept = $partialKept; Rebuilt = (-not $rebuilt.Reused); PartialRemoved = $partialRemoved } | ConvertTo-Json -Compress"
     )
     result = _run_powershell(command)
 
@@ -366,11 +372,140 @@ def test_versioned_runtime_ready_marker_reuse_and_active_cleanup_guard(
         "MarkerBefore": False,
         "MarkerAfter": True,
         "Reused": True,
+        "MissingRefused": True,
+        "MissingStayedAbsent": True,
         "Refused": True,
         "PartialKept": True,
         "Rebuilt": True,
         "PartialRemoved": True,
     }
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_three_releases_reuse_one_unchanged_runtime_and_keep_it_referenced(
+    tmp_path: Path,
+) -> None:
+    projects = {
+        version: _make_project(tmp_path, version, version.replace(".", "-"))
+        for version in ("3.0.0", "3.1.0", "3.2.0")
+    }
+    local_appdata = tmp_path / "Shared Runtime Local AppData"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        "function Complete-TestRuntime($layout, $runtimeVersion) { "
+        "$build = Initialize-PressayRuntimeBuild -Layout $layout -Version $runtimeVersion; "
+        "if (-not $build.Reused) { "
+        "$scripts = Join-Path $build.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $scripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version $runtimeVersion | Out-Null }; "
+        "return $build.Reused }; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        "$runtime30 = Get-PressayRuntimeVersionForInstall -Layout $layout -ReleaseVersion '3.0.0'; "
+        f"$payload30 = Install-PressayPayload -ProjectRoot {_ps_quote(projects['3.0.0'])} -Layout $layout -Version '3.0.0' -RuntimeVersion $runtime30; "
+        "$legacyContract = Join-Path $payload30 '.pressay-runtime.json'; "
+        "Set-PressayFileAtomically -Path $legacyContract -Content (ConvertTo-PressayRuntimeContractJson -Version '3.0.0') | Out-Null; "
+        "Write-PressayPayloadManifest -PayloadRoot $payload30 -Version '3.0.0' | Out-Null; "
+        "$reused30 = Complete-TestRuntime $layout $runtime30; "
+        f"Complete-PressayActivation -Layout $layout -Version '3.0.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
+        "$runtime31 = Get-PressayRuntimeVersionForInstall -Layout $layout -ReleaseVersion '3.1.0'; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(projects['3.1.0'])} -Layout $layout -Version '3.1.0' -RuntimeVersion $runtime31 | Out-Null; "
+        "$reused31 = Complete-TestRuntime $layout $runtime31; "
+        f"Complete-PressayActivation -Layout $layout -Version '3.1.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
+        "$runtime32 = Get-PressayRuntimeVersionForInstall -Layout $layout -ReleaseVersion '3.2.0'; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(projects['3.2.0'])} -Layout $layout -Version '3.2.0' -RuntimeVersion $runtime32 | Out-Null; "
+        "$reused32 = Complete-TestRuntime $layout $runtime32; "
+        f"Complete-PressayActivation -Layout $layout -Version '3.2.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
+        "$apps = @(Get-ChildItem -LiteralPath $layout.VersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "$runtimes = @(Get-ChildItem -LiteralPath $layout.RuntimeVersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "$contract31 = Get-Content -LiteralPath (Join-Path $layout.VersionsRoot '3.1.0\\.pressay-runtime.json') -Raw | ConvertFrom-Json; "
+        "$contract32 = Get-Content -LiteralPath (Join-Path $layout.VersionsRoot '3.2.0\\.pressay-runtime.json') -Raw | ConvertFrom-Json; "
+        "$activeRuntime = Get-PressayActiveRuntimeRoot -Layout $layout; "
+        "[pscustomobject]@{ Selected = @($runtime30, $runtime31, $runtime32); Reused = @($reused30, $reused31, $reused32); Apps = $apps; Runtimes = $runtimes; Current = (Get-PressayCurrentVersion -Layout $layout); Schemas = @($contract31.schema, $contract32.schema); References = @($contract31.runtime_version, $contract32.runtime_version); ActiveRuntime = $activeRuntime } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["Selected"] == ["3.0.0", "3.0.0", "3.0.0"]
+    assert payload["Reused"] == [False, True, True]
+    assert payload["Apps"] == ["3.1.0", "3.2.0"]
+    assert payload["Runtimes"] == ["3.0.0"]
+    assert payload["Current"] == "3.2.0"
+    assert payload["Schemas"] == [2, 2]
+    assert payload["References"] == ["3.0.0", "3.0.0"]
+    assert Path(payload["ActiveRuntime"]) == (
+        local_appdata / "Pressay" / "runtime" / "3.0.0" / "venv"
+    )
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_changed_dependency_contract_builds_a_new_runtime(tmp_path: Path) -> None:
+    first_project = _make_project(tmp_path, "4.0.0", "first-contract")
+    second_project = _make_project(tmp_path, "4.1.0", "second-contract")
+    local_appdata = tmp_path / "Changed Contract Local AppData"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        "$script:TestRuntimeHash = (('a' * 64) -join ''); "
+        "function Get-PressayWindowsRuntimeContractHash { return $script:TestRuntimeHash }; "
+        "function Complete-TestRuntime($layout, $runtimeVersion) { "
+        "$build = Initialize-PressayRuntimeBuild -Layout $layout -Version $runtimeVersion; "
+        "$scripts = Join-Path $build.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $scripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version $runtimeVersion | Out-Null }; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        "$firstRuntime = Get-PressayRuntimeVersionForInstall -Layout $layout -ReleaseVersion '4.0.0'; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(first_project)} -Layout $layout -Version '4.0.0' -RuntimeVersion $firstRuntime | Out-Null; "
+        "Complete-TestRuntime $layout $firstRuntime; "
+        f"Complete-PressayActivation -Layout $layout -Version '4.0.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
+        "$script:TestRuntimeHash = (('b' * 64) -join ''); "
+        "$secondRuntime = Get-PressayRuntimeVersionForInstall -Layout $layout -ReleaseVersion '4.1.0'; "
+        f"Install-PressayPayload -ProjectRoot {_ps_quote(second_project)} -Layout $layout -Version '4.1.0' -RuntimeVersion $secondRuntime | Out-Null; "
+        "Complete-TestRuntime $layout $secondRuntime; "
+        f"Complete-PressayActivation -Layout $layout -Version '4.1.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
+        "$runtimes = @(Get-ChildItem -LiteralPath $layout.RuntimeVersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "[pscustomobject]@{ Selected = @($firstRuntime, $secondRuntime); Runtimes = $runtimes; Current = (Get-PressayCurrentVersion -Layout $layout) } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "Selected": ["4.0.0", "4.1.0"],
+        "Runtimes": ["4.0.0", "4.1.0"],
+        "Current": "4.1.0",
+    }
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_payload_runtime_contract_rejects_unsafe_runtime_version(tmp_path: Path) -> None:
+    contract_path = tmp_path / ".pressay-runtime.json"
+    contract_path.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "version": "6.0.0",
+                "runtime_version": "../outside",
+                "dependency_contract_sha256": "a" * 64,
+                "python_tag": "cp311-win_amd64",
+            }
+        ),
+        encoding="utf-8",
+    )
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        "$rejected = $false; "
+        f"try {{ Read-PressayPayloadRuntimeContract -Path {_ps_quote(contract_path)} -Version '6.0.0' -AllowAnyContractHash | Out-Null }} catch {{ $rejected = $true }}; "
+        "[pscustomobject]@{ Rejected = $rejected } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {"Rejected": True}
 
 
 @pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")

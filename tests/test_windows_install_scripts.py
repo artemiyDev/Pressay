@@ -72,6 +72,7 @@ def _isolated_run_script(
     *,
     use_current_python: bool = True,
     versioned_runtime: bool = False,
+    runtime_version: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     local_appdata = tmp_path / "owner's isolated local appdata"
     install_root = local_appdata / "Pressay"
@@ -104,20 +105,32 @@ def _isolated_run_script(
     )
     payload_root = install_root / "app" / version
     if versioned_runtime:
-        contract = {
+        selected_runtime = runtime_version or version
+        runtime_contract = {
             "schema": 1,
-            "version": version,
+            "version": selected_runtime,
             "dependency_contract_sha256": "a" * 64,
             "python_tag": "cp311-win_amd64",
         }
+        payload_contract = (
+            {
+                "schema": 2,
+                "version": version,
+                "runtime_version": selected_runtime,
+                "dependency_contract_sha256": "a" * 64,
+                "python_tag": "cp311-win_amd64",
+            }
+            if runtime_version is not None
+            else runtime_contract
+        )
         (payload_root / ".pressay-runtime.json").write_text(
-            json.dumps(contract),
+            json.dumps(payload_contract),
             encoding="utf-8",
         )
-        runtime_root = install_root / "runtime" / version
+        runtime_root = install_root / "runtime" / selected_runtime
         runtime_root.mkdir(parents=True)
         (runtime_root / ".pressay-runtime.json").write_text(
-            json.dumps(contract),
+            json.dumps(runtime_contract),
             encoding="utf-8",
         )
     manifest_files = []
@@ -217,6 +230,11 @@ def test_setup_passes_icon_paths_as_arguments_and_validates_runtime() -> None:
     assert setup.index("$versionRoot = Install-PressayPayload") < setup.index(
         "$runtimeBuild = Initialize-PressayRuntimeBuild"
     )
+    assert setup.index("$runtimeVersion = Get-PressayRuntimeVersionForInstall") < (
+        setup.index("$versionRoot = Install-PressayPayload")
+    )
+    assert "-RuntimeVersion $runtimeVersion" in setup
+    assert "-Version $runtimeVersion" in setup
     assert "$venvRoot = $layout.RuntimeRoot" not in setup
     assert "-UninstallerSource" in setup
 
@@ -284,6 +302,48 @@ def test_run_script_uses_matching_versioned_runtime(tmp_path: Path) -> None:
     result = _run_powershell_file(run_script, env=env)
 
     assert result.returncode == 17, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
+def test_run_script_uses_referenced_shared_runtime(tmp_path: Path) -> None:
+    run_script, env = _isolated_run_script(
+        tmp_path,
+        versioned_runtime=True,
+        runtime_version="9.7.0",
+    )
+    env["PRESSAY_TEST_EXIT_CODE"] = "19"
+
+    result = _run_powershell_file(run_script, env=env)
+
+    assert result.returncode == 19, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
+def test_run_script_rejects_unsafe_shared_runtime_reference(tmp_path: Path) -> None:
+    run_script, env = _isolated_run_script(
+        tmp_path,
+        versioned_runtime=True,
+        runtime_version="9.7.0",
+    )
+    payload_root = Path(env["LOCALAPPDATA"]) / "Pressay" / "app" / "9.8.7"
+    contract_path = payload_root / ".pressay-runtime.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["runtime_version"] = "../outside"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    manifest_path = payload_root / ".pressay-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest["files"]:
+        if entry["path"] == ".pressay-runtime.json":
+            entry["sha256"] = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            break
+    else:
+        raise AssertionError("runtime contract is absent from the test manifest")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = _run_powershell_file(run_script, env=env)
+
+    assert result.returncode != 0
+    assert "payload runtime contract is invalid" in result.stderr
 
 
 @pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")

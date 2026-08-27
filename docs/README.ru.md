@@ -56,7 +56,9 @@ cd Pressay
   `%LOCALAPPDATA%\Pressay\app\<version>`;
 - переключает маленький указатель `%LOCALAPPDATA%\Pressay\current` и
   устанавливает стабильный launcher `%LOCALAPPDATA%\Pressay\Pressay.ps1`;
-- создаёт runtime `%LOCALAPPDATA%\Pressay\runtime\<version>\venv`;
+- создаёт runtime `%LOCALAPPDATA%\Pressay\runtime\<версия-runtime>\venv` или
+  повторно использует проверенный активный runtime, если контракт зависимостей
+  не изменился;
 - устанавливает независимый от репозитория `Uninstall-Pressay.ps1`;
 - устанавливает зависимости и загружает модель `turbo`;
 - создаёт Pressay в меню «Пуск» и, по запросу, на рабочем столе;
@@ -66,9 +68,12 @@ cd Pressay
 Ярлыки меню «Пуск», рабочего стола и автозапуска указывают на стабильный
 launcher. Поэтому после успешной установки Windows-версия продолжает работать,
 даже если клонированную папку переместить или удалить. Для будущего обновления
-снова получите исходный код Pressay; для удаления он не нужен. При обновлении
-сохраняются активная и одна предыдущая пара app/runtime. Более старые пары
-удаляются только после проверки manifest, dependency contract и дерева файлов.
+снова получите исходный код Pressay; для удаления он не нужен. При неизменном
+контракте зависимостей обновление пропускает повторную сборку многогигабайтного
+runtime; для изменившихся зависимостей создаётся новый runtime. Установщик
+сохраняет активную и предыдущую копии приложения вместе со всеми runtime, на
+которые они ссылаются. Старые payload и больше не используемые runtime удаляются
+только после проверки manifest, dependency contract, ссылок и дерева файлов.
 Изменённые, непарные или небезопасные каталоги остаются нетронутыми.
 Конфигурация, логи и общий кэш моделей в эту очистку не входят.
 
@@ -215,7 +220,7 @@ bash scripts/uninstall-macos.sh --remove-user-data
 | Стабильный launcher | `%LOCALAPPDATA%\Pressay\Pressay.ps1` | `~/Applications/Pressay.app` (зависит от репозитория) |
 | Установленный uninstaller | `%LOCALAPPDATA%\Pressay\Uninstall-Pressay.ps1` | — |
 | Конфигурация | `%LOCALAPPDATA%\Pressay\config.json` | `~/Library/Application Support/Pressay/config.json` |
-| Runtime | `%LOCALAPPDATA%\Pressay\runtime\<version>\venv` | `~/Library/Application Support/Pressay/venv` |
+| Runtime | `%LOCALAPPDATA%\Pressay\runtime\<версия-runtime>\venv` | `~/Library/Application Support/Pressay/venv` |
 | Логи | `%LOCALAPPDATA%\Pressay\pressay.log` | `~/Library/Application Support/Pressay/pressay.log` |
 | Модели | Hugging Face cache | Hugging Face cache |
 

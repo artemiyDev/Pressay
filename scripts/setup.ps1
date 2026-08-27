@@ -21,17 +21,29 @@ try {
     $layout = Get-PressayInstallLayout
     Assert-PressayInstallLayoutSafety -Layout $layout | Out-Null
     $version = Get-PressayProjectVersion -ProjectRoot $projectRoot
+    $runtimeVersion = Get-PressayRuntimeVersionForInstall `
+        -Layout $layout `
+        -ReleaseVersion $version
     # Publish or reject the immutable payload before constructing its inactive
     # versioned runtime. The current release is never mutated.
     $versionRoot = Install-PressayPayload `
         -ProjectRoot $projectRoot `
         -Layout $layout `
-        -Version $version
+        -Version $version `
+        -RuntimeVersion $runtimeVersion
     $installedSource = Join-Path $versionRoot "src"
-    $runtimeBuild = Initialize-PressayRuntimeBuild -Layout $layout -Version $version
+    $runtimeBuild = Initialize-PressayRuntimeBuild `
+        -Layout $layout `
+        -Version $runtimeVersion
     $venvRoot = $runtimeBuild.VenvRoot
     $venvPython = Join-Path $venvRoot "Scripts\python.exe"
     $runtimeCreated = -not [bool]$runtimeBuild.Reused
+    if ($runtimeCreated) {
+        Write-Host "Preparing Pressay runtime $runtimeVersion"
+    }
+    else {
+        Write-Host "Reusing validated Pressay runtime $runtimeVersion"
+    }
 
     try {
         if ($runtimeCreated) {
@@ -63,7 +75,9 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Pressay runtime validation failed." }
 
         if ($runtimeCreated) {
-            Complete-PressayRuntimeBuild -Layout $layout -Version $version | Out-Null
+            Complete-PressayRuntimeBuild `
+                -Layout $layout `
+                -Version $runtimeVersion | Out-Null
         }
 
         $iconSource = Join-Path $installedSource "pressay\assets\app-icon.svg"
@@ -100,7 +114,9 @@ try {
     catch {
         if ($runtimeCreated) {
             try {
-                Remove-PressayIncompleteRuntimeBuild -Layout $layout -Version $version
+                Remove-PressayIncompleteRuntimeBuild `
+                    -Layout $layout `
+                    -Version $runtimeVersion
             }
             catch {
                 Write-Warning "Incomplete Pressay runtime cleanup was refused or failed."

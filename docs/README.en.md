@@ -52,17 +52,20 @@ the app while it is running.
 The non-admin installer publishes a versioned application payload under
 `%LOCALAPPDATA%\Pressay\app\<version>`, activates it through the small `current`
 pointer, and installs the stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher.
-It builds a matching immutable-by-policy runtime under
-`%LOCALAPPDATA%\Pressay\runtime\<version>`, installs a stable
-`Uninstall-Pressay.ps1`, downloads the `turbo` model, creates managed shortcuts,
-and starts Pressay in the system tray. Start-menu, desktop, and autostart
-shortcuts point to the stable launcher, so a successful Windows installation
-keeps working after the cloned repository is moved or deleted. A fresh source
-tree is needed for upgrades, but not for removal. Upgrades retain the active
-release and one previous app/runtime pair, then remove older pairs only after
-validating their manifests, dependency contracts, and filesystem trees.
-Modified, unpaired, or unsafe directories are retained. Configuration, logs,
-and the shared model cache are never pruned.
+The payload references a validated immutable-by-policy runtime under
+`%LOCALAPPDATA%\Pressay\runtime\<runtime-version>`. If the dependency contract is
+unchanged, an upgrade reuses the active runtime and skips rebuilding its
+multi-gigabyte environment; a changed contract creates a new runtime. The
+installer also installs a stable `Uninstall-Pressay.ps1`, downloads the `turbo`
+model, creates managed shortcuts, and starts Pressay in the system tray.
+Start-menu, desktop, and autostart shortcuts point to the stable launcher, so a
+successful Windows installation keeps working after the cloned repository is
+moved or deleted. A fresh source tree is needed for upgrades, but not for
+removal. Upgrades retain the active and previous app payloads and every runtime
+they reference. Older payloads and now-unreferenced runtimes are removed only
+after validating their manifests, dependency contracts, references, and
+filesystem trees. Modified, unpaired, or unsafe directories are retained.
+Configuration, logs, and the shared model cache are never pruned.
 
 ```powershell
 .\scripts\install.ps1 -NoLaunch
@@ -192,7 +195,7 @@ See the scripts' help output for details.
 | Stable launcher | `%LOCALAPPDATA%\Pressay\Pressay.ps1` | `~/Applications/Pressay.app` (repository-backed) |
 | Installed uninstaller | `%LOCALAPPDATA%\Pressay\Uninstall-Pressay.ps1` | — |
 | Configuration | `%LOCALAPPDATA%\Pressay\config.json` | `~/Library/Application Support/Pressay/config.json` |
-| Runtime | `%LOCALAPPDATA%\Pressay\runtime\<version>\venv` | `~/Library/Application Support/Pressay/venv` |
+| Runtime | `%LOCALAPPDATA%\Pressay\runtime\<runtime-version>\venv` | `~/Library/Application Support/Pressay/venv` |
 | Logs | `%LOCALAPPDATA%\Pressay\pressay.log` | `~/Library/Application Support/Pressay/pressay.log` |
 | Models | Shared Hugging Face cache | Shared Hugging Face cache |
 

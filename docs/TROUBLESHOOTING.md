@@ -23,9 +23,9 @@ paths and device details. Review and redact them before sharing.
 
 On Windows, installed shortcuts launch
 `%LOCALAPPDATA%\Pressay\Pressay.ps1`, which follows the `current` pointer to a
-versioned payload under `%LOCALAPPDATA%\Pressay\app`. The installed Windows app
-and its matching `%LOCALAPPDATA%\Pressay\runtime\<version>` are selected by the
-same pointer. The installed Windows app and
+versioned payload under `%LOCALAPPDATA%\Pressay\app`. That payload contains a
+validated reference to `%LOCALAPPDATA%\Pressay\runtime\<runtime-version>`; more
+than one app release may safely share that runtime. The installed Windows app and
 `%LOCALAPPDATA%\Pressay\Uninstall-Pressay.ps1` do not depend on the cloned
 repository. The macOS developer beta still runs from its checkout; if that
 directory was moved or deleted, install the beta again from its new permanent
@@ -155,8 +155,9 @@ bash scripts/doctor-macos.sh
 На Windows установленные ярлыки запускают стабильный
 `%LOCALAPPDATA%\Pressay\Pressay.ps1`. Он читает указатель `current` и открывает
 версионную копию приложения из `%LOCALAPPDATA%\Pressay\app`; клонированный
-репозиторий для запуска больше не нужен. Тот же указатель выбирает runtime из
-`%LOCALAPPDATA%\Pressay\runtime\<version>`, а установленный
+репозиторий для запуска больше не нужен. Payload содержит проверенную ссылку на
+`%LOCALAPPDATA%\Pressay\runtime\<версия-runtime>`; один runtime может безопасно
+использоваться несколькими версиями приложения. Установленный
 `Uninstall-Pressay.ps1` работает без репозитория. Developer beta для macOS по-прежнему
 работает из копии репозитория: если её переместили или удалили, установите beta
 заново из нового постоянного расположения.

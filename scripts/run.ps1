@@ -232,6 +232,60 @@ function Read-PressayLauncherRuntimeContract {
     return $contract
 }
 
+function Read-PressayLauncherPayloadRuntimeContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $resolved = Assert-PressayLauncherPathIsNotReparsePoint -Path $Path
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Pressay payload runtime contract is missing: $resolved"
+    }
+    try {
+        $contract = [System.IO.File]::ReadAllText($resolved) | ConvertFrom-Json
+        $schema = [int]$contract.schema
+    }
+    catch {
+        throw "Pressay payload runtime contract is unreadable: $resolved"
+    }
+
+    $runtimeVersion = $Version
+    if ($schema -eq 1) {
+        if ([string]$contract.version -cne $Version) {
+            throw "Pressay payload runtime contract is invalid for release $Version."
+        }
+    }
+    elseif ($schema -eq 2) {
+        $runtimeVersion = [string]$contract.runtime_version
+        if (
+            [string]$contract.version -cne $Version -or
+            $runtimeVersion -notmatch '^[0-9][0-9A-Za-z]*(?:[._-][0-9A-Za-z]+)*$'
+        ) {
+            throw "Pressay payload runtime contract is invalid for release $Version."
+        }
+    }
+    else {
+        throw "Pressay payload runtime contract schema is unsupported for release $Version."
+    }
+    if (
+        [string]$contract.dependency_contract_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$contract.python_tag -cne "cp311-win_amd64"
+    ) {
+        throw "Pressay payload runtime contract is invalid for release $Version."
+    }
+    return [pscustomobject]@{
+        schema = $schema
+        version = $Version
+        runtime_version = $runtimeVersion
+        dependency_contract_sha256 = [string]$contract.dependency_contract_sha256
+        python_tag = "cp311-win_amd64"
+    }
+}
+
 function Assert-PressayLauncherPayloadManifest {
     param(
         [Parameter(Mandatory = $true)]
@@ -340,13 +394,14 @@ Assert-PressayLauncherPayloadManifest -PayloadRoot $payloadRoot -Version $versio
 
 $payloadContractPath = Join-Path $payloadRoot ".pressay-runtime.json"
 if (Test-Path -LiteralPath $payloadContractPath -PathType Leaf) {
-    $payloadContract = Read-PressayLauncherRuntimeContract `
+    $payloadContract = Read-PressayLauncherPayloadRuntimeContract `
         -Path $payloadContractPath `
         -Version $version
+    $runtimeVersion = [string]$payloadContract.runtime_version
     $runtimeVersionsRoot = Assert-PressayLauncherPathIsNotReparsePoint `
         -Path (Join-Path $installRoot "runtime")
     $runtimeVersionRoot = [System.IO.Path]::GetFullPath(
-        (Join-Path $runtimeVersionsRoot $version)
+        (Join-Path $runtimeVersionsRoot $runtimeVersion)
     )
     $runtimeParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $runtimeVersionRoot))
     if (-not [string]::Equals(
@@ -354,17 +409,17 @@ if (Test-Path -LiteralPath $payloadContractPath -PathType Leaf) {
         $runtimeVersionsRoot,
         [System.StringComparison]::OrdinalIgnoreCase
     )) {
-        throw "Pressay current-version pointer escaped the runtime directory."
+        throw "Pressay runtime reference escaped the runtime directory."
     }
     $runtimeVersionRoot = Assert-PressayLauncherPathIsNotReparsePoint -Path $runtimeVersionRoot
     $runtimeContract = Read-PressayLauncherRuntimeContract `
         -Path (Join-Path $runtimeVersionRoot ".pressay-runtime.json") `
-        -Version $version
+        -Version $runtimeVersion
     if (
         [string]$runtimeContract.dependency_contract_sha256 -cne
             [string]$payloadContract.dependency_contract_sha256
     ) {
-        throw "Pressay payload and runtime contracts do not match release $version."
+        throw "Pressay payload for $version does not match runtime $runtimeVersion."
     }
     $runtimeRoot = Join-Path $runtimeVersionRoot "venv"
 }
