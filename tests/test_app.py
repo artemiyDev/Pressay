@@ -593,6 +593,42 @@ def test_microphone_probe_presentation_is_actionable_and_sanitized(
     assert notification == text
 
 
+@pytest.mark.parametrize(
+    ("result", "state", "fragment", "notifies"),
+    (
+        (
+            MicrophoneProbeResult(True, 48_000, 0.02, 0.2, 0.02),
+            "success",
+            "нормальный (-34 dBFS, 48 кГц)",
+            False,
+        ),
+        (
+            MicrophoneProbeResult(True, 44_100, 0.001, 0.02, 0.001),
+            "warning",
+            "слишком тихий (-60 dBFS, 44100 Гц)",
+            True,
+        ),
+        (
+            MicrophoneProbeResult(True, 48_000, 0.1, 0.99, 0.1),
+            "warning",
+            "перегружается (пик -0.1 dBFS)",
+            True,
+        ),
+    ),
+)
+def test_microphone_probe_presentation_classifies_useful_signal_level(
+    result: MicrophoneProbeResult,
+    state: str,
+    fragment: str,
+    notifies: bool,
+) -> None:
+    text, actual_state, notification = _microphone_probe_presentation(result)
+
+    assert actual_state == state
+    assert fragment in text
+    assert (notification is not None) is notifies
+
+
 class _FakeMicTestWindow:
     def __init__(self, settings: dict | None = None, *, error: str | None = None) -> None:
         self._settings = settings or {}
@@ -600,7 +636,7 @@ class _FakeMicTestWindow:
         self.status_calls: list[tuple[str, str]] = []
         self.begin_calls = 0
         self.levels: list[tuple[float, float]] = []
-        self.finish_calls: list[tuple[str, str]] = []
+        self.finish_calls: list[tuple[str, str, float, float]] = []
 
     def current_settings(self) -> dict:
         if self._error is not None:
@@ -616,8 +652,15 @@ class _FakeMicTestWindow:
     def update_microphone_test_level(self, rms: float, peak: float) -> None:
         self.levels.append((rms, peak))
 
-    def finish_microphone_test(self, text: str, state: str) -> None:
-        self.finish_calls.append((text, state))
+    def finish_microphone_test(
+        self,
+        text: str,
+        state: str,
+        *,
+        rms: float = 0.0,
+        peak: float = 0.0,
+    ) -> None:
+        self.finish_calls.append((text, state, rms, peak))
 
 
 class _FakeMicProbe:
@@ -683,7 +726,14 @@ def test_microphone_test_handler_never_saves_settings(monkeypatch) -> None:
 
     assert window.begin_calls == 1
     assert window.levels == [(0.01, 0.02)]
-    assert window.finish_calls == [("Сигнал микрофона обнаружен", "success")]
+    assert window.finish_calls == [
+        (
+            "Уровень микрофона нормальный (-40 dBFS, 48 кГц)",
+            "success",
+            0.01,
+            0.02,
+        )
+    ]
     assert tray.notifications == []
 
 
@@ -738,9 +788,11 @@ def test_microphone_test_handler_reports_actionable_silent_result() -> None:
     handler()
 
     assert window.finish_calls
-    text, state = window.finish_calls[-1]
+    text, state, rms, peak = window.finish_calls[-1]
     assert state == "warning"
     assert "уровень входа" in text
+    assert rms == 0.0
+    assert peak == 0.0
     assert tray.notifications == [("Pressay", text, True)]
 
 

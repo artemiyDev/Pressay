@@ -1058,8 +1058,15 @@ class SettingsWindow(QMainWindow):
             f"RMS {max(0.0, rms):.5f}; пик {max(0.0, peak):.5f}"
         )
 
-    def finish_microphone_test(self, text: str, state: str) -> None:
-        """Restore controls and clear transient meter state after a probe."""
+    def finish_microphone_test(
+        self,
+        text: str,
+        state: str,
+        *,
+        rms: float = 0.0,
+        peak: float = 0.0,
+    ) -> None:
+        """Restore controls and retain the scalar result of the last probe."""
 
         if not self._microphone_test_active:
             return
@@ -1067,9 +1074,12 @@ class SettingsWindow(QMainWindow):
         self.microphone_combo.setEnabled(True)
         self.test_button.setEnabled(True)
         self.test_button.setText("Проверить микрофон")
-        self.microphone_test_meter.setValue(0)
+        fraction = max(recording_level_fraction(rms), recording_level_fraction(peak))
+        self.microphone_test_meter.setValue(round(fraction * 1000))
         self.microphone_test_meter.setAccessibleDescription(
-            "Проверка завершена; шкала сброшена"
+            "Проверка завершена; "
+            f"RMS {max(0.0, rms) if math.isfinite(rms) else 0.0:.5f}; "
+            f"пик {max(0.0, peak) if math.isfinite(peak) else 0.0:.5f}"
         )
         self.update_status(text, state)
 

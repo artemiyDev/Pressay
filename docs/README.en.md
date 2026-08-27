@@ -12,6 +12,8 @@ cloud API. Russian and English are the only supported languages.
 - configurable Windows push-to-talk and hands-free global hotkeys, plus fixed
   shortcuts in the macOS beta, with conflict guidance for keyboard layouts;
 - local faster-whisper recognition;
+- a bounded microphone check that distinguishes silence, a weak level, a
+  healthy level, and clipping without running recognition or saving audio;
 - personal vocabulary and deterministic term replacements;
 - optional voice commands when enabled: “press Enter”, Russian “с новой строки” (“new line”) and “абзац” (“paragraph”);
 - optional voice-controlled translation of subsequent RU/EN dictation to

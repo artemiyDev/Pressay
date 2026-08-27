@@ -5,14 +5,20 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.8` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.8` указана в текущем исходном коде,
+`0.5.9` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.9` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
 
 ### Added / Добавлено
 
+- The bounded microphone check now distinguishes silence, a weak level, a
+  healthy level, and clipping, reports the measured dBFS and sample rate, and
+  retains the final scalar meter without saving audio or running recognition.
+- Ограниченная проверка микрофона теперь различает тишину, слишком тихий
+  сигнал, нормальный уровень и перегрузку, показывает dBFS и частоту и оставляет
+  итоговую скалярную шкалу видимой без сохранения аудио и запуска распознавания.
 - Added an opt-in voice-controlled session mode that translates subsequent
   RU/EN dictation to English with a local translation-capable model.
 - Добавлен необязательный голосовой режим сессии, переводящий следующую

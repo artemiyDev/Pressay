@@ -162,14 +162,23 @@ def test_microphone_probe_ui_resets_controls_and_meter(
         assert window.microphone_test_meter.value() > 0
         assert "RMS" in window.microphone_test_meter.accessibleDescription()
 
-        window.finish_microphone_test("Сигнал микрофона обнаружен", "success")
+        window.finish_microphone_test(
+            "Уровень микрофона нормальный",
+            "success",
+            rms=0.02,
+            peak=0.08,
+        )
         assert window.microphone_combo.isEnabled() is True
         assert window.test_button.isEnabled() is True
         assert window.test_button.text() == "Проверить микрофон"
-        assert window.microphone_test_meter.value() == 0
-        assert window.status_label.text() == "Сигнал микрофона обнаружен"
+        final_level = window.microphone_test_meter.value()
+        assert final_level > 0
+        assert "Проверка завершена" in (
+            window.microphone_test_meter.accessibleDescription()
+        )
+        assert window.status_label.text() == "Уровень микрофона нормальный"
         window.update_microphone_test_level(0.5, 0.8)
-        assert window.microphone_test_meter.value() == 0
+        assert window.microphone_test_meter.value() == final_level
     finally:
         _close(app, window)
 

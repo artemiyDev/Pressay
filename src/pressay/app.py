@@ -8,6 +8,7 @@ import ctypes
 from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 from pathlib import Path
 import sys
@@ -44,6 +45,8 @@ from .platform_support import input_adapter, is_macos, is_windows, user_data_dir
 
 
 LOGGER = logging.getLogger(__name__)
+_MICROPHONE_QUIET_RMS = 0.003
+_MICROPHONE_CLIPPING_PEAK = 0.98
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,7 +597,22 @@ def _build_microphone_test_handler(
 
         def complete(result: MicrophoneProbeResult) -> None:
             text, state, notification = _microphone_probe_presentation(result)
-            window.finish_microphone_test(text, state)
+            outcome = _microphone_probe_outcome(result)
+            LOGGER.info(
+                "microphone_probe_completed outcome=%s sample_rate=%s "
+                "rms_dbfs=%s peak_rms_dbfs=%s peak_dbfs=%s",
+                outcome,
+                result.sample_rate,
+                _format_dbfs_for_log(result.rms),
+                _format_dbfs_for_log(result.peak_rms),
+                _format_dbfs_for_log(result.peak),
+            )
+            window.finish_microphone_test(
+                text,
+                state,
+                rms=result.peak_rms,
+                peak=result.peak,
+            )
             if notification is not None:
                 tray.notify("Pressay", notification, warning=True)
 
@@ -614,12 +632,70 @@ def _build_microphone_test_handler(
     return test_microphone
 
 
+def _amplitude_dbfs(value: float) -> float | None:
+    """Convert a finite positive full-scale amplitude to bounded dBFS."""
+
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return max(-120.0, min(0.0, 20.0 * math.log10(min(value, 1.0))))
+
+
+def _format_dbfs_for_log(value: float) -> str:
+    decibels = _amplitude_dbfs(value)
+    return "none" if decibels is None else f"{decibels:.1f}"
+
+
+def _microphone_probe_outcome(result: MicrophoneProbeResult) -> str:
+    if result.error_kind is not None:
+        return result.error_kind
+    if not result.signal_detected:
+        return "silent"
+    if math.isfinite(result.peak) and result.peak >= _MICROPHONE_CLIPPING_PEAK:
+        return "clipping"
+    if (
+        not math.isfinite(result.peak_rms)
+        or result.peak_rms < _MICROPHONE_QUIET_RMS
+    ):
+        return "quiet"
+    return "normal"
+
+
+def _microphone_probe_level_text(result: MicrophoneProbeResult) -> str:
+    decibels = _amplitude_dbfs(result.peak_rms)
+    level = "не измерен" if decibels is None else f"{decibels:.0f} dBFS"
+    rate = result.sample_rate
+    if rate is None or rate <= 0:
+        return level
+    frequency = f"{rate // 1000} кГц" if rate % 1000 == 0 else f"{rate} Гц"
+    return f"{level}, {frequency}"
+
+
 def _microphone_probe_presentation(
     result: MicrophoneProbeResult,
 ) -> tuple[str, str, str | None]:
-    if result.signal_detected:
-        return "Сигнал микрофона обнаружен", "success", None
-    if result.error_kind == "silent":
+    outcome = _microphone_probe_outcome(result)
+    if outcome == "normal":
+        return (
+            f"Уровень микрофона нормальный ({_microphone_probe_level_text(result)})",
+            "success",
+            None,
+        )
+    if outcome == "quiet":
+        message = (
+            "Сигнал есть, но уровень слишком тихий "
+            f"({_microphone_probe_level_text(result)}). Подойдите ближе к "
+            "микрофону или увеличьте уровень входа."
+        )
+        return message, "warning", message
+    if outcome == "clipping":
+        peak = _amplitude_dbfs(result.peak)
+        peak_text = "0 dBFS" if peak is None else f"{peak:.1f} dBFS"
+        message = (
+            f"Микрофон перегружается (пик {peak_text}). Уменьшите уровень "
+            "входа или отодвиньтесь от микрофона."
+        )
+        return message, "warning", message
+    if outcome == "silent":
         message = (
             "Сигнал не обнаружен. Проверьте выбранный микрофон, уровень входа "
             "и разрешение на доступ."

@@ -43,7 +43,9 @@ the installer will refuse to continue.
    WASAPI variant is marked as recommended.
 2. Use **Проверить микрофон**. This confirms that Pressay can open the selected
    device and receive a signal above its silence floor; it does not run speech
-   recognition.
+   recognition. The final result remains visible and distinguishes silence, a
+   weak input level, a healthy level, and clipping. Follow its gain/distance
+   recommendation before changing the recognition model.
 3. On Windows, allow microphone access for desktop apps under
    **Settings → Privacy & security → Microphone**.
 4. On macOS, allow Microphone access under
@@ -181,7 +183,9 @@ bash scripts/doctor-macos.sh
    помечается как рекомендуемый.
 2. Нажмите **Проверить микрофон**. Проверка подтверждает, что выбранное
    устройство открывается и передаёт сигнал выше порога тишины; распознавание
-   речи при этом не запускается.
+   речи при этом не запускается. Итоговая шкала остаётся видимой и различает
+   тишину, слишком тихий сигнал, нормальный уровень и перегрузку. Сначала
+   выполните рекомендацию по расстоянию или gain, а потом меняйте модель.
 3. На Windows разрешите микрофон для классических приложений в
    **Параметры → Конфиденциальность и безопасность → Микрофон**.
 4. На macOS разрешите Microphone в **System Settings → Privacy & Security** и
