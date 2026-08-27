@@ -121,6 +121,7 @@ def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
         "text_editable": None,
         "caret_active": None,
         "win32_caret": None,
+        "refetched": None,
     }
 
 

@@ -48,6 +48,10 @@ PHYSICAL_MODIFIER_KEYS = (
     VK_RMENU,
 )
 
+_UIA_TEXT_CONTROL_TYPES = frozenset({50004, 50030, 50025})
+_UIA_REFETCH_DELAY_S = 0.06
+_UIA_REFETCH_TAG = "refetched"
+
 
 class InputStatus(str, Enum):
     """Stable, machine-readable status values for input operations."""
@@ -196,7 +200,9 @@ def targets_match(expected: ForegroundTarget, current: ForegroundTarget) -> bool
         return False
     if expected.focused_control is None:
         return current.focused_control is None
-    return expected.focused_control == current.focused_control
+    return _without_refetch_metadata(
+        expected.focused_control
+    ) == _without_refetch_metadata(current.focused_control)
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +298,9 @@ class _UIAFingerprintWorker:
                 self._pending = False
 
     @staticmethod
-    def _read_fingerprint(automation: object, process_id: int) -> tuple[object, ...]:
+    def _read_fingerprint_once(
+        automation: object, process_id: int
+    ) -> tuple[object, ...]:
         control = automation.GetFocusedControl()  # type: ignore[attr-defined]
         if int(getattr(control, "ProcessId", 0) or 0) != process_id:
             return _FOCUS_UNAVAILABLE
@@ -343,6 +351,29 @@ class _UIAFingerprintWorker:
             caret_active,
             False,
         )
+
+    @staticmethod
+    def _read_fingerprint(
+        automation: object,
+        process_id: int,
+        *,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> tuple[object, ...]:
+        first = _UIAFingerprintWorker._read_fingerprint_once(automation, process_id)
+        if not _uia_fingerprint_is_uninformative(first):
+            return _with_refetch_metadata(first, refetched=False)
+
+        try:
+            sleeper(_UIA_REFETCH_DELAY_S)
+            second = _UIAFingerprintWorker._read_fingerprint_once(automation, process_id)
+        except Exception:
+            return _with_refetch_metadata(first, refetched=True)
+        if (
+            parse_focus_fingerprint(second) is None
+            or _uia_fingerprint_is_uninformative(second)
+        ):
+            return _with_refetch_metadata(first, refetched=True)
+        return _with_refetch_metadata(second, refetched=True)
 
     def _run(self) -> None:
         automation: object | None = None
@@ -412,6 +443,40 @@ class FocusFingerprint:
     class_name: str | None = None
     caret_active: bool = False
     win32_caret: bool = False
+    refetched: bool = False
+
+
+def _refetch_metadata(
+    fingerprint: tuple[object, ...],
+) -> tuple[tuple[object, ...], bool | None]:
+    if (
+        fingerprint
+        and fingerprint[0] == "uia"
+        and len(fingerprint) >= 4
+        and fingerprint[-4] == _UIA_REFETCH_TAG
+    ):
+        return (*fingerprint[:-4], *fingerprint[-2:]), bool(fingerprint[-3])
+    return fingerprint, None
+
+
+def _without_refetch_metadata(
+    fingerprint: tuple[object, ...],
+) -> tuple[object, ...]:
+    return _refetch_metadata(fingerprint)[0]
+
+
+def _with_refetch_metadata(
+    fingerprint: tuple[object, ...], *, refetched: bool
+) -> tuple[object, ...]:
+    if not fingerprint or fingerprint[0] != "uia" or len(fingerprint) < 2:
+        return fingerprint
+    fingerprint = _without_refetch_metadata(fingerprint)
+    return (
+        *fingerprint[:-2],
+        _UIA_REFETCH_TAG,
+        bool(refetched),
+        *fingerprint[-2:],
+    )
 
 
 def parse_focus_fingerprint(
@@ -427,6 +492,7 @@ def parse_focus_fingerprint(
 
     if not fingerprint or fingerprint == _FOCUS_UNAVAILABLE:
         return None
+    fingerprint, refetched = _refetch_metadata(fingerprint)
     kind = fingerprint[0]
     if kind == "win32_focus":
         return FocusFingerprint(
@@ -449,8 +515,24 @@ def parse_focus_fingerprint(
             class_name=str(fingerprint[-6 - evidence_offset]),
             caret_active=bool(fingerprint[-2]) if evidence_offset else False,
             win32_caret=bool(fingerprint[-1]) if evidence_offset else False,
+            refetched=bool(refetched),
         )
     return None
+
+
+def _uia_fingerprint_is_uninformative(fingerprint: tuple[object, ...]) -> bool:
+    """Identify a coarse first result from Chromium's lazy accessibility tree."""
+
+    parsed = parse_focus_fingerprint(fingerprint)
+    return bool(
+        parsed is not None
+        and parsed.kind == "uia"
+        and parsed.control_type not in _UIA_TEXT_CONTROL_TYPES
+        and not parsed.value_writable
+        and not parsed.text_editable
+        and not parsed.caret_active
+        and not parsed.keyboard_focusable
+    )
 
 
 def target_looks_editable(target: ForegroundTarget, *, strict: bool = False) -> bool:
@@ -471,7 +553,7 @@ def target_looks_editable(target: ForegroundTarget, *, strict: bool = False) -> 
     if parsed.text_editable:
         return True
     if (
-        parsed.control_type in {50004, 50030, 50025}
+        parsed.control_type in _UIA_TEXT_CONTROL_TYPES
         and parsed.keyboard_focusable
         and (parsed.value_writable or parsed.text_editable)
     ):
@@ -501,6 +583,7 @@ def describe_focus(target: ForegroundTarget | None) -> dict[str, object]:
         "text_editable": parsed.text_editable if parsed is not None else None,
         "caret_active": parsed.caret_active if parsed is not None else None,
         "win32_caret": parsed.win32_caret if parsed is not None else None,
+        "refetched": parsed.refetched if parsed is not None else None,
     }
 
 

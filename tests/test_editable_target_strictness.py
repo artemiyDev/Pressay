@@ -118,6 +118,7 @@ def test_describe_focus_exposes_uia_evidence_and_macos_uses_none() -> None:
         "text_editable": False,
         "caret_active": False,
         "win32_caret": False,
+        "refetched": False,
     }
     assert describe_macos_focus(None) == {
         "focus_kind": "none",
@@ -128,6 +129,7 @@ def test_describe_focus_exposes_uia_evidence_and_macos_uses_none() -> None:
         "text_editable": None,
         "caret_active": None,
         "win32_caret": None,
+        "refetched": None,
     }
 
 
@@ -148,6 +150,21 @@ def test_snapshot_log_appends_focus_evidence(monkeypatch, caplog) -> None:
         "focus_kind=uia control_type=50033 enabled=True focusable=True "
         "value_writable=False text_editable=False"
     ) in caplog.text
+
+
+def test_snapshot_log_appends_refetch_diagnostic(monkeypatch, caplog) -> None:
+    target = _uia_target(control_type=50033)
+    adapter = SimpleNamespace(
+        snapshot_foreground_target=lambda: target,
+        target_looks_editable=lambda _target, *, strict: not strict,
+        describe_focus=describe_focus,
+    )
+    monkeypatch.setattr("pressay.app.input_adapter", lambda: adapter)
+
+    with caplog.at_level("INFO"):
+        assert _snapshot_target(strict_editable_check=False) is target
+
+    assert "win32_caret=False refetched=False" in caplog.text
 
 
 def test_non_editable_status_names_the_reason_and_recovery_setting() -> None:

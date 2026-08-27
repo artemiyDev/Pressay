@@ -111,6 +111,7 @@ def test_describe_focus_has_same_shape_as_windows_input() -> None:
         "text_editable": None,
         "caret_active": None,
         "win32_caret": None,
+        "refetched": None,
     }
     assert describe_focus(None) == expected_none
 
@@ -127,6 +128,7 @@ def test_describe_focus_has_same_shape_as_windows_input() -> None:
         "text_editable": None,
         "caret_active": None,
         "win32_caret": None,
+        "refetched": None,
     }
 
 

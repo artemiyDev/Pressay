@@ -11,6 +11,7 @@ import pytest
 
 from pressay.windows_input import (
     _FOCUS_UNAVAILABLE,
+    _UIA_REFETCH_DELAY_S,
     _UIAFingerprintWorker,
     _load_win32_api,
     _native_focused_control_fingerprint,
@@ -152,6 +153,203 @@ class _FakeUIAutomation:
         if self.block:
             assert self.release.wait(timeout=2)
         return _FakeUIAControl()
+
+
+def _configurable_uia_control(
+    *,
+    automation_id: str,
+    control_type: int,
+    keyboard_focusable: bool = False,
+    value_writable: bool = False,
+    text_editable: bool = False,
+    caret_active: bool = False,
+) -> SimpleNamespace:
+    def get_pattern(pattern_id: int) -> object | None:
+        if pattern_id == 10002 and value_writable:
+            return SimpleNamespace(IsReadOnly=False)
+        if pattern_id == 10032 and text_editable:
+            return object()
+        if pattern_id == 10024 and caret_active:
+            return SimpleNamespace(GetCaretRange=lambda: (True, object()))
+        return None
+
+    return SimpleNamespace(
+        ProcessId=200,
+        AutomationId=automation_id,
+        ClassName="Edit" if control_type == 50004 else "Pane",
+        ControlType=control_type,
+        IsEnabled=True,
+        IsKeyboardFocusable=keyboard_focusable,
+        GetRuntimeId=lambda: (7, 11),
+        GetPattern=get_pattern,
+    )
+
+
+class _SequenceUIAutomation:
+    PatternId = SimpleNamespace(ValuePattern=10002, TextEditPattern=10032)
+
+    def __init__(self, *results: object) -> None:
+        self.results = list(results)
+        self.calls = 0
+
+    def GetFocusedControl(self) -> object:
+        self.calls += 1
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def test_uia_refetch_replaces_coarse_pane_with_informative_edit() -> None:
+    automation = _SequenceUIAutomation(
+        _configurable_uia_control(automation_id="coarse", control_type=50033),
+        _configurable_uia_control(
+            automation_id="editor",
+            control_type=50004,
+            keyboard_focusable=True,
+            value_writable=True,
+        ),
+    )
+    delays: list[float] = []
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(
+        automation, 200, sleeper=delays.append
+    )
+    target = ForegroundTarget(hwnd=100, pid=200, focused_control=fingerprint)
+
+    assert automation.calls == 2
+    assert delays == [_UIA_REFETCH_DELAY_S]
+    assert describe_focus(target)["control_type"] == 50004
+    assert describe_focus(target)["refetched"] is True
+    assert target_looks_editable(target) is True
+
+
+def test_uia_informative_first_read_skips_refetch_and_delay() -> None:
+    automation = _SequenceUIAutomation(
+        _configurable_uia_control(
+            automation_id="editor",
+            control_type=50004,
+            keyboard_focusable=True,
+            value_writable=True,
+        )
+    )
+    delays: list[float] = []
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(
+        automation, 200, sleeper=delays.append
+    )
+
+    assert automation.calls == 1
+    assert delays == []
+    assert describe_focus(
+        ForegroundTarget(hwnd=100, pid=200, focused_control=fingerprint)
+    )["refetched"] is False
+
+
+def test_uia_refetch_keeps_first_when_both_reads_are_uninformative() -> None:
+    automation = _SequenceUIAutomation(
+        _configurable_uia_control(automation_id="first", control_type=50033),
+        _configurable_uia_control(automation_id="second", control_type=50033),
+    )
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(
+        automation, 200, sleeper=lambda _delay: None
+    )
+    target = ForegroundTarget(hwnd=100, pid=200, focused_control=fingerprint)
+
+    assert fingerprint[4] == "first"
+    assert describe_focus(target)["refetched"] is True
+    assert target_looks_editable(target) is False
+
+
+@pytest.mark.parametrize(
+    ("value_writable", "text_editable", "caret_active"),
+    ((True, False, False), (False, True, False), (False, False, True)),
+)
+def test_uia_positive_evidence_skips_refetch(
+    value_writable: bool, text_editable: bool, caret_active: bool
+) -> None:
+    automation = _SequenceUIAutomation(
+        _configurable_uia_control(
+            automation_id="editor",
+            control_type=50033,
+            value_writable=value_writable,
+            text_editable=text_editable,
+            caret_active=caret_active,
+        )
+    )
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(
+        automation, 200, sleeper=lambda _delay: pytest.fail("unexpected refetch")
+    )
+
+    assert automation.calls == 1
+    assert describe_focus(
+        ForegroundTarget(hwnd=100, pid=200, focused_control=fingerprint)
+    )["refetched"] is False
+
+
+def test_uia_refetch_error_keeps_first_fingerprint() -> None:
+    automation = _SequenceUIAutomation(
+        _configurable_uia_control(automation_id="first", control_type=50033),
+        RuntimeError("provider failed"),
+    )
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(
+        automation, 200, sleeper=lambda _delay: None
+    )
+
+    assert fingerprint[4] == "first"
+    assert describe_focus(
+        ForegroundTarget(hwnd=100, pid=200, focused_control=fingerprint)
+    )["refetched"] is True
+
+
+def test_uia_refetch_unavailable_result_keeps_first_fingerprint() -> None:
+    unavailable = _configurable_uia_control(
+        automation_id="wrong-process", control_type=50004
+    )
+    unavailable.ProcessId = 201
+    automation = _SequenceUIAutomation(
+        _configurable_uia_control(automation_id="first", control_type=50033),
+        unavailable,
+    )
+
+    fingerprint = _UIAFingerprintWorker._read_fingerprint(
+        automation, 200, sleeper=lambda _delay: None
+    )
+
+    assert fingerprint[4] == "first"
+    assert describe_focus(
+        ForegroundTarget(hwnd=100, pid=200, focused_control=fingerprint)
+    )["refetched"] is True
+
+
+def test_target_match_ignores_refetch_diagnostic_metadata() -> None:
+    control = _configurable_uia_control(
+        automation_id="editor",
+        control_type=50004,
+        keyboard_focusable=True,
+        value_writable=True,
+    )
+    refetched = _UIAFingerprintWorker._read_fingerprint(
+        _SequenceUIAutomation(
+            _configurable_uia_control(automation_id="coarse", control_type=50033),
+            control,
+        ),
+        200,
+        sleeper=lambda _delay: None,
+    )
+    direct = _UIAFingerprintWorker._read_fingerprint(
+        _SequenceUIAutomation(control),
+        200,
+        sleeper=lambda _delay: pytest.fail("unexpected refetch"),
+    )
+
+    assert targets_match(
+        ForegroundTarget(hwnd=100, pid=200, focused_control=refetched),
+        ForegroundTarget(hwnd=100, pid=200, focused_control=direct),
+    ) is True
 
 
 def test_uia_import_and_all_queries_are_owned_by_one_worker_thread() -> None:
@@ -582,6 +780,7 @@ def test_describe_focus_reports_none_for_missing_fingerprint() -> None:
         "text_editable": None,
         "caret_active": None,
         "win32_caret": None,
+        "refetched": None,
     }
     assert describe_focus(target) == expected
     assert describe_focus(None) == expected
@@ -603,6 +802,7 @@ def test_describe_focus_reports_uia_control_type() -> None:
         "text_editable": False,
         "caret_active": False,
         "win32_caret": False,
+        "refetched": False,
     }
 
 
@@ -622,6 +822,7 @@ def test_describe_focus_reports_win32_focus_without_control_type() -> None:
         "text_editable": None,
         "caret_active": False,
         "win32_caret": False,
+        "refetched": False,
     }
 
 
@@ -639,6 +840,7 @@ def test_describe_focus_keeps_reporting_the_unavailable_sentinel_tag() -> None:
         "text_editable": None,
         "caret_active": None,
         "win32_caret": None,
+        "refetched": None,
     }
 
 
