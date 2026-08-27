@@ -8,7 +8,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from pressay.audio import AudioStreamError, AudioTooShortError, SilentAudioError
+from pressay.audio import (
+    AudioDeviceError,
+    AudioStreamError,
+    AudioTooShortError,
+    SilentAudioError,
+)
 from pressay.config import AppConfig
 from pressay.controller import (
     DictationController,
@@ -115,6 +120,28 @@ class FakeRecorder:
         was = self.is_recording
         self.is_recording = False
         return was
+
+
+class FailingStartRecorder(FakeRecorder):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+        self.start_calls = 0
+        self.cancel_calls = 0
+
+    def start(self) -> int:
+        self.start_calls += 1
+        raise self.error
+
+    def cancel(self) -> bool:
+        self.cancel_calls += 1
+        return super().cancel()
+
+
+class UnreleasedFailingStartRecorder(FailingStartRecorder):
+    def wait_closed(self, *, timeout: float) -> bool:
+        assert timeout > 0
+        return False
 
 
 class PrearmedRecorder(FakeRecorder):
@@ -407,6 +434,190 @@ def test_smart_spacing_only_changes_automatic_insertion(monkeypatch) -> None:
     assert results == ["тестовая фраза"]
     assert controller.last_transcript == "тестовая фраза"
     assert copied == []
+    controller.close()
+
+
+def test_transient_microphone_start_failure_retries_once(
+    monkeypatch,
+    caplog,
+) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[str, str, bool]] = []
+    first = FailingStartRecorder(AudioDeviceError("device busy"))
+    second = FakeRecorder()
+    recorders = iter((first, second))
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    controller._new_recorder = lambda: next(recorders)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "pressay.controller._MICROPHONE_START_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+    caplog.set_level(logging.INFO, logger="pressay.controller")
+
+    assert controller.start_recording(target="window") is True
+    assert first.start_calls == 1
+    assert first.cancel_calls == 1
+    assert second.is_recording is True
+    assert statuses[-1] == ("Слушаю…", "recording")
+    assert notifications == []
+    assert any(
+        record.message
+        == "microphone_start_retry attempt=2 reason=AudioDeviceError"
+        for record in caplog.records
+    )
+    assert any(
+        record.message == "microphone_start_recovered attempts=2"
+        for record in caplog.records
+    )
+
+    assert controller.cancel() is True
+    controller.close()
+
+
+def test_persistent_microphone_start_failure_stops_after_one_retry(
+    monkeypatch,
+    caplog,
+) -> None:
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[str, str, bool]] = []
+    first = FailingStartRecorder(AudioDeviceError("first failure"))
+    second = FailingStartRecorder(AudioDeviceError("second failure"))
+    recorders = iter((first, second))
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    controller._new_recorder = lambda: next(recorders)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "pressay.controller._MICROPHONE_START_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+    caplog.set_level(logging.WARNING, logger="pressay.controller")
+
+    assert controller.start_recording(target="window") is False
+    assert first.start_calls == second.start_calls == 1
+    assert first.cancel_calls == second.cancel_calls == 1
+    assert controller.is_recording is False
+    assert statuses[-1] == ("Микрофон недоступен", "error")
+    assert len(notifications) == 1
+    assert "после повторной попытки" in notifications[0][1]
+    assert any(
+        record.message == "microphone_start_failed: AudioDeviceError"
+        for record in caplog.records
+    )
+
+    controller.close()
+
+
+def test_non_device_start_failure_is_not_retried(monkeypatch) -> None:
+    notifications: list[tuple[str, str, bool]] = []
+    first = FailingStartRecorder(RuntimeError("backend contract failed"))
+    factory_calls = 0
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+
+    def new_recorder() -> FakeRecorder:
+        nonlocal factory_calls
+        factory_calls += 1
+        return first
+
+    controller._new_recorder = new_recorder  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "pressay.controller._MICROPHONE_START_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+
+    assert controller.start_recording(target="window") is False
+    assert factory_calls == 1
+    assert first.start_calls == 1
+    assert len(notifications) == 1
+    assert notifications[0][1] == (
+        "Не удалось запустить запись. Проверьте микрофон и повторите."
+    )
+
+    controller.close()
+
+
+def test_microphone_start_retry_is_suppressed_when_native_close_failed(
+    monkeypatch,
+    caplog,
+) -> None:
+    first = UnreleasedFailingStartRecorder(AudioDeviceError("device busy"))
+    factory_calls = 0
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+
+    def new_recorder() -> FakeRecorder:
+        nonlocal factory_calls
+        factory_calls += 1
+        return first
+
+    controller._new_recorder = new_recorder  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "pressay.controller._MICROPHONE_START_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+    caplog.set_level(logging.WARNING, logger="pressay.controller")
+
+    assert controller.start_recording(target="window") is False
+    assert factory_calls == 1
+    assert any(
+        record.message
+        == "microphone_start_retry_suppressed: native_close_failed"
+        for record in caplog.records
+    )
+    assert not any(
+        record.message.startswith("microphone_start_retry attempt=")
+        for record in caplog.records
+    )
+
+    controller.close()
+
+
+def test_microphone_start_retry_does_not_resurrect_cancelled_session(
+    monkeypatch,
+) -> None:
+    notifications: list[tuple[str, str, bool]] = []
+    first = FailingStartRecorder(AudioDeviceError("device busy"))
+    factory_calls = 0
+    controller = DictationController(
+        AppConfig(),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+
+    def new_recorder() -> FakeRecorder:
+        nonlocal factory_calls
+        factory_calls += 1
+        return first if factory_calls == 1 else FakeRecorder()
+
+    def cancel_during_retry(_seconds: float) -> None:
+        assert controller.request_cancel() is True
+
+    controller._new_recorder = new_recorder  # type: ignore[method-assign]
+    monkeypatch.setattr("pressay.controller.time.sleep", cancel_during_retry)
+
+    assert controller.start_recording(target="window") is False
+    assert factory_calls == 1
+    assert controller.is_recording is False
+    assert notifications == []
+
     controller.close()
 
 

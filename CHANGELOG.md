@@ -5,8 +5,8 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.0` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.0` указана в текущем исходном коде,
+`0.5.4` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.4` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
@@ -20,6 +20,13 @@ have a matching tagged release. Версия `0.5.0` указана в теку�
 
 ### Changed / Изменено
 
+- Automatic RU/EN recognition now compares both supported decodes when the
+  language detector returns an uninformative unsupported-language result.
+- Microphone pre-arm is disabled by default because live telemetry showed no
+  first-frame latency benefit and unnecessary audio-device open/close churn.
+- Background-launch failures are now written to a bounded local launcher log
+  and shown in a native error dialog instead of disappearing with the hidden
+  PowerShell window.
 - Windows installation now publishes versioned application payloads under
   `%LOCALAPPDATA%\Pressay\app`, activates them through a `current` pointer, and
   uses the stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher for start-menu,
@@ -52,11 +59,29 @@ have a matching tagged release. Версия `0.5.0` указана в теку�
 - Окно настроек теперь адаптируется к узким и небольшим экранам, оставляет
   основные действия видимыми, прокручивает к элементу с фокусом и поддерживает
   полную клавиатурную навигацию и accessibility.
+- Автоопределение RU/EN теперь сравнивает обе поддерживаемые расшифровки, если
+  детектор языка вернул неинформативный результат для постороннего языка.
+- Предварительное открытие микрофона выключено по умолчанию: живые метрики не
+  показали выигрыша первого аудиофрейма, а лишние циклы открытия нагружали
+  аудиодрайвер.
+- Ошибки фонового запуска теперь попадают в ограниченный локальный журнал и
+  показываются системным диалогом вместо исчезновения вместе со скрытым окном
+  PowerShell.
 
 ### Fixed / Исправлено
 
+- A transient microphone device-open failure is retried once with a fresh
+  recorder after a short pause. The capture token is rechecked before the
+  retry, so cancellation or shutdown cannot resurrect a stale recording.
+- Chromium/Electron focus snapshots that contain only an uninformative wrapper
+  are read once more before safe insertion is refused.
 - On macOS, `Esc` now passes through when Pressay has no cancellable dictation;
   its key-down and key-up are suppressed only for an accepted cancellation.
+- Временный сбой открытия микрофона повторяется один раз через новый recorder
+  после короткой паузы. Перед повтором проверяется токен записи, поэтому отмена
+  или завершение приложения не могут вернуть устаревшую сессию.
+- Неинформативный focus snapshot Chromium/Electron перечитывается один раз до
+  отказа в безопасной вставке.
 - На macOS `Esc` теперь проходит в активное приложение, если Pressay нечего
   отменять; обе фазы клавиши подавляются только при принятой отмене диктовки.
 

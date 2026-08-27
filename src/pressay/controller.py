@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from .audio import (
     AudioCaptureError,
+    AudioDeviceError,
     AudioRecorder,
     AudioTooShortError,
     SilentAudioError,
@@ -38,6 +39,9 @@ _SHORT_RECORDING_VAD_THRESHOLD_SECONDS = 15.0
 _TRANSLATION_INCAPABLE_MODELS = frozenset({"turbo"})
 _PREPARE_CAPTURE_TIMEOUT_SECONDS = 1.5
 _PREPARE_CAPTURE_BUFFER_SECONDS = 2.0
+_MICROPHONE_START_ATTEMPTS = 2
+_MICROPHONE_START_RETRY_DELAY_SECONDS = 0.15
+_MICROPHONE_RETRY_CLOSE_TIMEOUT_SECONDS = 0.5
 _MODEL_RETIRE_SECONDS: dict[str, float | None] = {
     "instant": None,
     "balanced": 300.0,
@@ -1023,19 +1027,13 @@ class DictationController:
                     return False
                 recorder = self._recorder
                 prearmed = self._recording_prearmed and recorder is not None
-            if recorder is None:
-                # Construction is also off the caller thread because third-party
-                # recorder fakes/backends are free to probe native state here.
-                recorder = self._new_recorder()
-                with self._lock:
-                    if not self._capture_is_current_locked(command.generation, session_id):
-                        return False
-                    self._recorder = recorder
             if prearmed:
                 if not recorder.activate_prepared_capture():
                     raise AudioCaptureError("Prepared microphone capture is unavailable")
             else:
-                recorder.start()
+                recorder = self._start_fresh_recorder(command, session_id)
+                if recorder is None:
+                    return False
         except Exception as exc:
             if recorder is not None:
                 self._audio_cancel(recorder)
@@ -1054,9 +1052,13 @@ class DictationController:
                     self._recording_prearmed = False
                     self.target = None
             if current and self._session_is_current(session_id):
-                self.status_callback("Ошибка микрофона", "error")
+                self.status_callback("Микрофон недоступен", "error")
             if current and self._session_is_current(session_id):
-                self.notification_callback("Pressay", str(exc), True)
+                self.notification_callback(
+                    "Pressay",
+                    self._microphone_start_failure_notification(exc),
+                    True,
+                )
             if current:
                 LOGGER.warning("microphone_start_failed: %s", type(exc).__name__)
             return False
@@ -1078,6 +1080,106 @@ class DictationController:
             self.status_callback("Слушаю…", "recording")
             self._start_stop_signal_monitor(command.generation, session_id, recorder)
         return True
+
+    def _start_fresh_recorder(
+        self,
+        command: _AudioCommand,
+        session_id: int,
+    ) -> Any | None:
+        """Open one fresh recorder, retrying one transient device failure.
+
+        The retry stays on the serialized audio worker. A cancelled, stopped,
+        superseded, or closed capture token is checked before every native
+        open, so the short recovery pause cannot resurrect stale dictation.
+        """
+
+        for attempt in range(1, _MICROPHONE_START_ATTEMPTS + 1):
+            with self._lock:
+                if not self._capture_is_current_locked(
+                    command.generation,
+                    session_id,
+                ):
+                    return None
+
+            # Construction is also off the caller thread because third-party
+            # recorder fakes/backends are free to probe native state here.
+            recorder = self._new_recorder()
+            with self._lock:
+                if not self._capture_is_current_locked(
+                    command.generation,
+                    session_id,
+                ):
+                    stale = True
+                else:
+                    self._recorder = recorder
+                    stale = False
+            if stale:
+                self._audio_cancel(recorder)
+                return None
+
+            try:
+                recorder.start()
+            except AudioDeviceError as exc:
+                self._audio_cancel(recorder)
+                native_close_ok = self._recorder_allows_start_retry(recorder)
+                with self._lock:
+                    current = self._capture_is_current_locked(
+                        command.generation,
+                        session_id,
+                        recorder=recorder,
+                    )
+                    if current:
+                        self._recorder = None
+                if (
+                    not current
+                    or not native_close_ok
+                    or attempt >= _MICROPHONE_START_ATTEMPTS
+                ):
+                    if current and not native_close_ok:
+                        LOGGER.warning(
+                            "microphone_start_retry_suppressed: native_close_failed"
+                        )
+                    raise
+                LOGGER.warning(
+                    "microphone_start_retry attempt=%d reason=%s",
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+                if _MICROPHONE_START_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(_MICROPHONE_START_RETRY_DELAY_SECONDS)
+                continue
+
+            if attempt > 1:
+                LOGGER.info("microphone_start_recovered attempts=%d", attempt)
+            return recorder
+
+        return None
+
+    @staticmethod
+    def _recorder_allows_start_retry(recorder: Any) -> bool:
+        """Fail closed when the rejected native stream did not release."""
+
+        waiter = getattr(recorder, "wait_closed", None)
+        if not callable(waiter):
+            return True
+        try:
+            return (
+                waiter(timeout=_MICROPHONE_RETRY_CLOSE_TIMEOUT_SECONDS)
+                is True
+            )
+        except Exception:
+            LOGGER.warning("microphone_start_retry_close_check_failed")
+            return False
+
+    @staticmethod
+    def _microphone_start_failure_notification(exc: Exception) -> str:
+        if isinstance(exc, AudioDeviceError):
+            return (
+                "Не удалось открыть микрофон после повторной попытки. "
+                "Проверьте выбранное устройство, разрешение на доступ и "
+                "закройте приложения с монопольным доступом к микрофону."
+            )
+        return "Не удалось запустить запись. Проверьте микрофон и повторите."
 
     def _start_stop_signal_monitor(
         self,

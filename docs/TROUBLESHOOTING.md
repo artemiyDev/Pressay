@@ -51,6 +51,15 @@ the installer will refuse to continue.
 If the device opens but the level never moves, verify the selected input and
 its mute/gain controls in the operating system or device software.
 
+### The microphone could not be opened
+
+Pressay retries one transient device-open failure after a short pause. If the
+second attempt also fails, select the intended input again, close applications
+that may hold the microphone in exclusive mode, and use **Проверить микрофон**.
+Restart Pressay after reconnecting a USB or Bluetooth microphone. A repeated
+failure after these checks usually belongs to the operating-system audio
+driver rather than the speech-recognition model.
+
 ### The text was recognized but not inserted
 
 Pressay records the focused editable control when dictation starts and checks
@@ -171,6 +180,15 @@ bash scripts/doctor-macos.sh
 
 Если устройство открывается, но уровень не меняется, проверьте выбранный вход,
 mute и gain в системе или программе самого устройства.
+
+### Микрофон не удалось открыть
+
+Pressay один раз повторяет временный сбой открытия устройства после короткой
+паузы. Если вторая попытка тоже не сработала, заново выберите нужный вход,
+закройте приложения с монопольным доступом к микрофону и нажмите **Проверить
+микрофон**. После переподключения USB- или Bluetooth-микрофона перезапустите
+Pressay. Повторяющийся отказ после этих проверок обычно связан с системным
+аудиодрайвером, а не с моделью распознавания.
 
 ### Текст распознан, но не вставлен
 
