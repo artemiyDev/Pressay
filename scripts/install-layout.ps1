@@ -963,6 +963,130 @@ function Remove-PressayIncompleteRuntimeBuild {
     Remove-Item -LiteralPath $runtimeVersionRoot -Recurse -Force
 }
 
+function Remove-PressayObsoleteInstallPairs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Layout,
+
+        [string[]]$KeepVersions = @()
+    )
+
+    Assert-PressayInstallLayoutSafety -Layout $Layout | Out-Null
+    $keep = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($version in @($KeepVersions)) {
+        if ([string]::IsNullOrWhiteSpace($version)) {
+            continue
+        }
+        $safeVersion = Assert-PressayVersion -Version $version
+        if (-not ($keep -ccontains $safeVersion)) {
+            $keep.Add($safeVersion)
+        }
+    }
+
+    if (Test-Path -LiteralPath $Layout.CurrentFile -PathType Leaf) {
+        $currentVersion = Get-PressayCurrentVersion -Layout $Layout
+        if (-not ($keep -ccontains $currentVersion)) {
+            $keep.Add($currentVersion)
+        }
+    }
+
+    $appVersions = @{}
+    $runtimeVersions = @{}
+    if (Test-Path -LiteralPath $Layout.VersionsRoot -PathType Container) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $Layout.VersionsRoot -Directory -Force)) {
+            try {
+                $version = Assert-PressayVersion -Version $item.Name
+            }
+            catch {
+                continue
+            }
+            $appVersions[$version] = $item.FullName
+        }
+    }
+    if (Test-Path -LiteralPath $Layout.RuntimeVersionsRoot -PathType Container) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $Layout.RuntimeVersionsRoot -Directory -Force)) {
+            try {
+                $version = Assert-PressayVersion -Version $item.Name
+            }
+            catch {
+                continue
+            }
+            $runtimeVersions[$version] = $item.FullName
+        }
+    }
+
+    $removed = New-Object 'System.Collections.Generic.List[string]'
+    $skipped = New-Object 'System.Collections.Generic.List[string]'
+    $installedVersions = @(
+        @($appVersions.Keys) + @($runtimeVersions.Keys) |
+            Sort-Object -Unique
+    )
+    foreach ($version in $installedVersions) {
+        if ($keep -ccontains $version) {
+            continue
+        }
+        if (-not $appVersions.ContainsKey($version) -or -not $runtimeVersions.ContainsKey($version)) {
+            $skipped.Add($version)
+            Write-Warning "Pressay release $version is unpaired and was left untouched."
+            continue
+        }
+
+        try {
+            $appRoot = Assert-PressayDirectChild `
+                -Path $appVersions[$version] `
+                -Parent $Layout.VersionsRoot
+            $runtimeRoot = Assert-PressayDirectChild `
+                -Path $runtimeVersions[$version] `
+                -Parent $Layout.RuntimeVersionsRoot
+            Assert-PressayPathIsNotReparsePoint -Path $appRoot | Out-Null
+            Assert-PressayPathIsNotReparsePoint -Path $runtimeRoot | Out-Null
+            Assert-PressayPayload `
+                -PayloadRoot $appRoot `
+                -Version $version `
+                -AllowAnyRuntimeContractHash | Out-Null
+            $payloadContract = Read-PressayRuntimeContract `
+                -Path (Join-Path $appRoot $script:PressayRuntimeContractName) `
+                -Version $version `
+                -AllowAnyContractHash
+            Assert-PressayRuntime `
+                -Layout $Layout `
+                -Version $version `
+                -InspectTree `
+                -AllowAnyContractHash | Out-Null
+            $runtimeContract = Read-PressayRuntimeContract `
+                -Path (Join-Path $runtimeRoot $script:PressayRuntimeContractName) `
+                -Version $version `
+                -AllowAnyContractHash
+            if (
+                [string]$payloadContract.dependency_contract_sha256 -cne
+                    [string]$runtimeContract.dependency_contract_sha256
+            ) {
+                throw "Pressay payload and runtime contracts do not match release $version."
+            }
+            if (Test-PressayVersionIsCurrent -Layout $Layout -Version $version) {
+                throw "Pressay refuses to remove the active release $version."
+            }
+
+            # Remove the large runtime first. If the following small payload
+            # removal fails, the active pointer still cannot select this pair.
+            Remove-Item -LiteralPath $runtimeRoot -Recurse -Force
+            Remove-Item -LiteralPath $appRoot -Recurse -Force
+            $removed.Add($version)
+        }
+        catch {
+            $skipped.Add($version)
+            Write-Warning "Pressay release $version was left untouched or partially retained because safe cleanup failed: $($_.Exception.Message)"
+        }
+    }
+
+    return [pscustomobject]@{
+        Removed = [string[]]$removed.ToArray()
+        Skipped = [string[]]$skipped.ToArray()
+        Kept = [string[]]$keep.ToArray()
+    }
+}
+
 function Get-PressayActiveRuntimeRoot {
     [CmdletBinding()]
     param(
@@ -1231,6 +1355,22 @@ function Complete-PressayActivation {
 
     $safeVersion = Assert-PressayVersion -Version $Version
     $candidate = Assert-PressayActivationCandidate -Layout $Layout -Version $safeVersion
+    $previousVersion = $null
+    if (Test-Path -LiteralPath $Layout.CurrentFile -PathType Leaf) {
+        $previousVersion = Get-PressayCurrentVersion -Layout $Layout
+    }
+    if ($null -eq $previousVersion -or $previousVersion -cne $safeVersion) {
+        $keepVersions = @($safeVersion)
+        if ($null -ne $previousVersion) {
+            $keepVersions += $previousVersion
+        }
+        $cleanup = Remove-PressayObsoleteInstallPairs `
+            -Layout $Layout `
+            -KeepVersions $keepVersions
+        if ($cleanup.Removed.Count -gt 0) {
+            Write-Host "Removed obsolete Pressay releases: $($cleanup.Removed -join ', ')"
+        }
+    }
     Publish-PressayInstalledLauncher `
         -LauncherSource $LauncherSource `
         -Layout $Layout | Out-Null

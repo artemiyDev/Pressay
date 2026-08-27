@@ -45,8 +45,11 @@ On Windows, installation publishes a versioned app payload under
 stable `%LOCALAPPDATA%\Pressay\Pressay.ps1` launcher. The installed app no
 longer depends on the cloned repository. Each release uses a matching runtime
 under `%LOCALAPPDATA%\Pressay\runtime\<version>`, while configuration, logs,
-and the model cache remain shared. A stable `Uninstall-Pressay.ps1` is installed
-beside the launcher.
+and the model cache remain shared. Upgrades retain the active release and one
+previous app/runtime pair; older verified pairs are removed to avoid
+accumulating multi-gigabyte runtimes. A stable `Uninstall-Pressay.ps1` is
+installed beside the launcher.
+
 The macOS developer beta still runs from its repository checkout; keep that
 checkout in place.
 

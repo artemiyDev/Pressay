@@ -58,8 +58,11 @@ It builds a matching immutable-by-policy runtime under
 and starts Pressay in the system tray. Start-menu, desktop, and autostart
 shortcuts point to the stable launcher, so a successful Windows installation
 keeps working after the cloned repository is moved or deleted. A fresh source
-tree is needed for upgrades, but not for removal. Upgrades preserve the prior
-app/runtime pair, configuration, logs, and the shared model cache.
+tree is needed for upgrades, but not for removal. Upgrades retain the active
+release and one previous app/runtime pair, then remove older pairs only after
+validating their manifests, dependency contracts, and filesystem trees.
+Modified, unpaired, or unsafe directories are retained. Configuration, logs,
+and the shared model cache are never pruned.
 
 ```powershell
 .\scripts\install.ps1 -NoLaunch

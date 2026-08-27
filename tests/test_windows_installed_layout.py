@@ -163,6 +163,101 @@ def test_failed_activation_keeps_current_and_reinstall_preserves_shared_data(
 
 
 @pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_activation_retains_only_current_and_one_previous_install_pair(
+    tmp_path: Path,
+) -> None:
+    projects = {
+        version: _make_project(tmp_path, version, version.replace(".", "-"))
+        for version in ("1.0.0", "1.1.0", "1.2.0")
+    }
+    local_appdata = tmp_path / "Retention Local AppData"
+    shared = [
+        local_appdata / "Pressay" / "config.json",
+        local_appdata / "Pressay" / "models" / "model.bin",
+    ]
+    for path in shared:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("keep", encoding="utf-8")
+
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        "function Install-TestRelease($layout, $project, $version) { "
+        "Install-PressayPayload -ProjectRoot $project -Layout $layout -Version $version | Out-Null; "
+        "$build = Initialize-PressayRuntimeBuild -Layout $layout -Version $version; "
+        "$scripts = Join-Path $build.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $scripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version $version | Out-Null; "
+        f"Complete-PressayActivation -Layout $layout -Version $version -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null }}; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        f"Install-TestRelease $layout {_ps_quote(projects['1.0.0'])} '1.0.0'; "
+        f"Install-TestRelease $layout {_ps_quote(projects['1.1.0'])} '1.1.0'; "
+        f"Install-TestRelease $layout {_ps_quote(projects['1.2.0'])} '1.2.0'; "
+        f"Complete-PressayActivation -Layout $layout -Version '1.2.0' -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null; "
+        "$apps = @(Get-ChildItem -LiteralPath $layout.VersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "$runtimes = @(Get-ChildItem -LiteralPath $layout.RuntimeVersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "[pscustomobject]@{ Apps = $apps; Runtimes = $runtimes; Current = (Get-PressayCurrentVersion -Layout $layout) } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "Apps": ["1.1.0", "1.2.0"],
+        "Runtimes": ["1.1.0", "1.2.0"],
+        "Current": "1.2.0",
+    }
+    assert all(path.read_text(encoding="utf-8") == "keep" for path in shared)
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
+def test_obsolete_cleanup_leaves_unpaired_and_tampered_releases_untouched(
+    tmp_path: Path,
+) -> None:
+    projects = {
+        version: _make_project(tmp_path, version, version.replace(".", "-"))
+        for version in ("2.0.0", "2.1.0", "2.2.0")
+    }
+    local_appdata = tmp_path / "Fail Closed Retention Local AppData"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+        "function Install-TestRelease($layout, $project, $version) { "
+        "Install-PressayPayload -ProjectRoot $project -Layout $layout -Version $version | Out-Null; "
+        "$build = Initialize-PressayRuntimeBuild -Layout $layout -Version $version; "
+        "$scripts = Join-Path $build.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $scripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $scripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version $version | Out-Null; "
+        f"Complete-PressayActivation -Layout $layout -Version $version -LauncherSource {_ps_quote(SCRIPTS / 'run.ps1')} -UninstallerSource {_ps_quote(SCRIPTS / 'uninstall.ps1')} | Out-Null }}; "
+        f"$layout = Get-PressayInstallLayout -LocalAppData {_ps_quote(local_appdata)}; "
+        f"Install-TestRelease $layout {_ps_quote(projects['2.0.0'])} '2.0.0'; "
+        f"Install-TestRelease $layout {_ps_quote(projects['2.1.0'])} '2.1.0'; "
+        "$tampered = Join-Path $layout.VersionsRoot '2.0.0\\src\\pressay\\__main__.py'; Add-Content -LiteralPath $tampered -Value 'changed'; "
+        "$orphan = Initialize-PressayRuntimeBuild -Layout $layout -Version '1.9.0'; "
+        "$orphanScripts = Join-Path $orphan.VenvRoot 'Scripts'; New-Item -ItemType Directory -Path $orphanScripts -Force | Out-Null; "
+        "Set-Content -LiteralPath (Join-Path $orphanScripts 'python.exe') -Value 'fake'; "
+        "Set-Content -LiteralPath (Join-Path $orphanScripts 'pythonw.exe') -Value 'fake'; "
+        "Complete-PressayRuntimeBuild -Layout $layout -Version '1.9.0' | Out-Null; "
+        f"Install-TestRelease $layout {_ps_quote(projects['2.2.0'])} '2.2.0'; "
+        "$apps = @(Get-ChildItem -LiteralPath $layout.VersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "$runtimes = @(Get-ChildItem -LiteralPath $layout.RuntimeVersionsRoot -Directory | Sort-Object Name | ForEach-Object Name); "
+        "[pscustomobject]@{ Apps = $apps; Runtimes = $runtimes; Current = (Get-PressayCurrentVersion -Layout $layout); Tampered = (Test-Path -LiteralPath $tampered) } | ConvertTo-Json -Compress"
+    )
+    result = _run_powershell(command)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "Apps": ["2.0.0", "2.1.0", "2.2.0"],
+        "Runtimes": ["1.9.0", "2.0.0", "2.1.0", "2.2.0"],
+        "Current": "2.2.0",
+        "Tampered": True,
+    }
+
+
+@pytest.mark.skipif(not POWERSHELL.exists(), reason="Windows PowerShell required")
 def test_explicit_uninstall_flags_remove_only_owned_install_targets(tmp_path: Path) -> None:
     fixture = tmp_path / "Uninstall fixture"
     scripts = fixture / "scripts"

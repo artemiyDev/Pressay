@@ -5,8 +5,8 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.4` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.4` указана в текущем исходном коде,
+`0.5.5` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.5` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
@@ -35,6 +35,10 @@ have a matching tagged release. Версия `0.5.4` указана в теку�
 - Windows releases now pair each payload with a versioned runtime and activate
   both through the same atomic pointer. Failed dependency installation cannot
   mutate the active release, and a source-independent uninstaller is installed.
+- After validating a new Windows release, the installer retains the active
+  release and one previous app/runtime pair, then removes older verified pairs.
+  Unpaired, modified, or unsafe directories are reported and left untouched;
+  shared models, configuration, and logs are never part of this cleanup.
 - Windows uninstall now removes only Pressay-owned shortcuts by default. The
   explicit `-RemoveApp`, `-RemoveRuntime`, `-RemoveUserData`, and
   `-RemoveInstaller` flags remove installed payloads, versioned/legacy runtimes,
@@ -51,6 +55,10 @@ have a matching tagged release. Версия `0.5.4` указана в теку�
 - Каждый Windows payload теперь связан со своим версионным runtime и
   активируется тем же атомарным указателем. Неудачная установка зависимостей не
   изменяет активную версию; uninstaller устанавливается независимо от исходников.
+- После проверки новой Windows-версии установщик сохраняет активную и одну
+  предыдущую пару app/runtime, а более старые проверенные пары удаляет.
+  Непарные, изменённые или небезопасные каталоги остаются нетронутыми с
+  предупреждением; общие модели, настройки и логи в очистку не входят.
 - По умолчанию удаление Windows теперь убирает только принадлежащие Pressay
   ярлыки. Флаги `-RemoveApp`, `-RemoveRuntime`, `-RemoveUserData` и
   `-RemoveInstaller` отдельно удаляют копии приложения, версионные/legacy
