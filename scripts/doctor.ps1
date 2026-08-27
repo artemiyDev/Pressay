@@ -1,4 +1,11 @@
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5 otherwise decodes native UTF-8 output using the active
+# legacy console code page, corrupting Cyrillic device names and JSON values.
+$utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8WithoutBom
+$OutputEncoding = $utf8WithoutBom
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "install-layout.ps1")
 $layout = Get-PressayInstallLayout

@@ -5,8 +5,8 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.5` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.5` указана в текущем исходном коде,
+`0.5.6` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.6` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
@@ -78,6 +78,8 @@ have a matching tagged release. Версия `0.5.5` указана в теку�
 
 ### Fixed / Исправлено
 
+- Windows doctor now establishes an explicit UTF-8 native-output contract, so
+  Cyrillic microphone names and JSON remain readable in Windows PowerShell 5.
 - A transient microphone device-open failure is retried once with a fresh
   recorder after a short pause. The capture token is rechecked before the
   retry, so cancellation or shutdown cannot resurrect a stale recording.
@@ -85,6 +87,8 @@ have a matching tagged release. Версия `0.5.5` указана в теку�
   are read once more before safe insertion is refused.
 - On macOS, `Esc` now passes through when Pressay has no cancellable dictation;
   its key-down and key-up are suppressed only for an accepted cancellation.
+- Windows doctor теперь явно использует UTF-8 для нативного вывода, поэтому
+  кириллические имена микрофонов и JSON читаемы в Windows PowerShell 5.
 - Временный сбой открытия микрофона повторяется один раз через новый recorder
   после короткой паузы. Перед повтором проверяется токен записи, поэтому отмена
   или завершение приложения не могут вернуть устаревшую сессию.

@@ -229,6 +229,41 @@ def test_local_maintenance_scripts_resolve_the_active_runtime() -> None:
 
 
 @pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
+def test_doctor_wrapper_preserves_utf8_native_output(tmp_path: Path) -> None:
+    source = (SCRIPTS / "doctor.ps1").read_text(encoding="utf-8")
+    runtime_block = (
+        "$projectRoot = Split-Path -Parent $PSScriptRoot\n"
+        '. (Join-Path $PSScriptRoot "install-layout.ps1")\n'
+        "$layout = Get-PressayInstallLayout\n"
+        "$runtimeRoot = Get-PressayActiveRuntimeRoot -Layout $layout\n"
+        '$venvPython = Join-Path $runtimeRoot "Scripts\\python.exe"\n'
+    )
+    isolated_runtime = tmp_path / "isolated runtime"
+    replacement = (
+        f"$projectRoot = {_ps_quote(PROJECT_ROOT)}\n"
+        f"$runtimeRoot = {_ps_quote(isolated_runtime)}\n"
+        f"$venvPython = {_ps_quote(Path(sys.executable))}\n"
+    )
+    assert runtime_block in source
+    source = source.replace(runtime_block, replacement, 1)
+    invocation = "& $venvPython -m pressay.doctor @args"
+    assert invocation in source
+    source = source.replace(
+        invocation,
+        "& $venvPython -c \"import sys; "
+        "sys.stdout.buffer.write(('\\u041c\\u0438\\u043a\\u0440\\u043e\\u0444\\u043e\\u043d \\u2713\\n').encode('utf-8'))\"",
+        1,
+    )
+    script = tmp_path / "doctor-utf8.ps1"
+    script.write_text(source, encoding="utf-8")
+
+    result = _run_powershell_file(script)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "Микрофон ✓\n"
+
+
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
 def test_run_script_preserves_foreground_native_exit_code(tmp_path: Path) -> None:
     run_script, env = _isolated_run_script(tmp_path)
     env["PRESSAY_TEST_EXIT_CODE"] = "23"
