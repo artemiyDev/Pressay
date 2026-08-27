@@ -38,9 +38,12 @@ the installer will refuse to continue.
 ### “Speech not detected”
 
 1. Open Pressay settings and select the microphone you are actually speaking
-   into. “System default” follows the operating-system default input.
+   into. On Windows, “System default” prefers the operating-system default
+   WASAPI input. Driver variants of one physical microphone are grouped; the
+   WASAPI variant is marked as recommended.
 2. Use **Проверить микрофон**. This confirms that Pressay can open the selected
-   device; it is not a full speech-recognition or loudness test.
+   device and receive a signal above its silence floor; it does not run speech
+   recognition.
 3. On Windows, allow microphone access for desktop apps under
    **Settings → Privacy & security → Microphone**.
 4. On macOS, allow Microphone access under
@@ -59,6 +62,10 @@ that may hold the microphone in exclusive mode, and use **Проверить м�
 Restart Pressay after reconnecting a USB or Bluetooth microphone. A repeated
 failure after these checks usually belongs to the operating-system audio
 driver rather than the speech-recognition model.
+
+The Windows settings picker intentionally shows physical inputs rather than
+every PortAudio driver view. `scripts/doctor.ps1` still lists all raw MME,
+DirectSound, WASAPI, and WDM-KS entries for diagnostics.
 
 ### The text was recognized but not inserted
 
@@ -169,9 +176,12 @@ bash scripts/doctor-macos.sh
 ### «Речь не обнаружена»
 
 1. В настройках Pressay выберите микрофон, в который говорите. «Системный
-   микрофон по умолчанию» следует системному устройству ввода.
+   микрофон по умолчанию» на Windows предпочитает системный WASAPI-вход.
+   Драйверные варианты одного физического устройства объединяются, а WASAPI
+   помечается как рекомендуемый.
 2. Нажмите **Проверить микрофон**. Проверка подтверждает, что выбранное
-   устройство открывается; это не полный тест громкости или распознавания.
+   устройство открывается и передаёт сигнал выше порога тишины; распознавание
+   речи при этом не запускается.
 3. На Windows разрешите микрофон для классических приложений в
    **Параметры → Конфиденциальность и безопасность → Микрофон**.
 4. На macOS разрешите Microphone в **System Settings → Privacy & Security** и
@@ -190,6 +200,10 @@ Pressay один раз повторяет временный сбой откр�
 микрофон**. После переподключения USB- или Bluetooth-микрофона перезапустите
 Pressay. Повторяющийся отказ после этих проверок обычно связан с системным
 аудиодрайвером, а не с моделью распознавания.
+
+Список в настройках Windows намеренно показывает физические входы, а не каждое
+представление PortAudio. Для диагностики `scripts/doctor.ps1` по-прежнему
+выводит все исходные записи MME, DirectSound, WASAPI и WDM-KS.
 
 ### Текст распознан, но не вставлен
 

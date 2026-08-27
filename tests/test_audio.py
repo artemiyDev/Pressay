@@ -8,6 +8,7 @@ import pytest
 import pressay.audio as audio_module
 from pressay.audio import (
     MICROPHONE_SELECTOR_PREFIX,
+    AudioDevice,
     AudioDeviceError,
     AudioDurationLimitError,
     AudioRecorder,
@@ -16,6 +17,7 @@ from pressay.audio import (
     SilentAudioError,
     audio_rms,
     build_microphone_selector,
+    collapse_input_device_variants,
     parse_microphone_selector,
     resample_audio,
 )
@@ -192,6 +194,68 @@ def test_previous_product_microphone_selector_remains_loadable() -> None:
     )
 
 
+def test_windows_picker_collapses_driver_variants_and_default_aliases() -> None:
+    devices = [
+        AudioDevice(0, "Переназначение звуковых устр. - Input", 44_100, 2, False, "MME"),
+        AudioDevice(1, "Набор микрофонов (Технология In", 44_100, 4, True, "MME"),
+        AudioDevice(5, "Первичный драйвер записи звука", 44_100, 2, False, "Windows DirectSound"),
+        AudioDevice(6, "Набор микрофонов (Технология Intel® Smart Sound)", 44_100, 4, False, "Windows DirectSound"),
+        AudioDevice(12, "Набор микрофонов (Технология Intel® Smart Sound)", 48_000, 2, False, "Windows WASAPI"),
+        AudioDevice(13, "Набор микрофонов 1 (Технология Intel® Smart Sound – микрофон)", 48_000, 2, False, "Windows WDM-KS"),
+        AudioDevice(14, "Набор микрофонов 2 (Технология Intel® Smart Sound – микрофон)", 16_000, 4, False, "Windows WDM-KS"),
+        AudioDevice(15, "Набор микрофонов 3 (Технология Intel® Smart Sound – микрофон)", 16_000, 4, False, "Windows WDM-KS"),
+        AudioDevice(16, "Mic in at front panel (Pink) (Mic in at front panel (Pink))", 44_100, 2, False, "Windows WDM-KS"),
+        AudioDevice(19, "Mic in at front panel (black) (Mic in at front panel (black))", 44_100, 2, False, "Windows WDM-KS"),
+        AudioDevice(22, "Input (Steam Streaming Speakers Wave)", 44_100, 8, False, "Windows WDM-KS"),
+    ]
+
+    collapsed = collapse_input_device_variants(devices)
+
+    assert len(collapsed) == 4
+    microphone = next(item for item in collapsed if item.index == 12)
+    assert microphone.host_api == "Windows WASAPI"
+    assert microphone.default_sample_rate == 48_000
+    assert microphone.is_default is True
+    assert microphone.variant_count == 6
+    assert microphone.variant_host_apis == (
+        "Windows WASAPI",
+        "Windows DirectSound",
+        "MME",
+        "Windows WDM-KS",
+    )
+    assert all(item.index not in {0, 5} for item in collapsed)
+
+
+def test_windows_picker_preserves_an_explicit_saved_driver_variant() -> None:
+    direct_sound = AudioDevice(
+        4,
+        "USB Microphone",
+        44_100,
+        1,
+        False,
+        "Windows DirectSound",
+    )
+    wasapi = AudioDevice(
+        7,
+        "USB Microphone",
+        48_000,
+        1,
+        True,
+        "Windows WASAPI",
+    )
+
+    collapsed = collapse_input_device_variants(
+        [direct_sound, wasapi],
+        direct_sound.stable_selector,
+    )
+
+    assert len(collapsed) == 1
+    assert collapsed[0].stable_selector == direct_sound.stable_selector
+    assert collapsed[0].index == direct_sound.index
+    assert collapsed[0].variant_count == 2
+    assert collapsed[0].is_default is True
+
+
 def test_lists_devices_with_sounddevice_input_output_pair(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeSoundDevice()
     class Pair:
@@ -320,6 +384,187 @@ def test_device_none_is_the_only_selection_that_uses_system_default(
     assert recorder.prepare() == 48_000
     assert fake.checked is not None
     assert fake.checked["device"] is None
+
+
+def _windows_default_backend_fake() -> FakeSoundDevice:
+    fake = FakeSoundDevice()
+    fake.devices = [
+        {
+            "name": "Built-in Microphone",
+            "max_input_channels": 2,
+            "default_samplerate": 44_100.0,
+            "hostapi": 0,
+        },
+        {
+            "name": "Built-in Microphone",
+            "max_input_channels": 2,
+            "default_samplerate": 48_000.0,
+            "hostapi": 1,
+        },
+    ]
+    fake.hostapis = [
+        {
+            "name": "MME",
+            "default_input_device": 0,
+        },
+        {
+            "name": "Windows WASAPI",
+            "default_input_device": 1,
+        },
+    ]
+    fake.default.device = (0, 0)
+    return fake
+
+
+def test_implicit_windows_default_prefers_wasapi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _windows_default_backend_fake()
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+
+    recorder = AudioRecorder(device=None)
+
+    assert recorder.prepare() == 48_000
+    assert fake.checked is not None
+    assert fake.checked["device"] == 1
+
+
+def test_non_windows_default_retains_native_portaudio_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _windows_default_backend_fake()
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "darwin")
+
+    recorder = AudioRecorder(device=None)
+
+    assert recorder.prepare() == 44_100
+    assert fake.checked is not None
+    assert fake.checked["device"] is None
+
+
+def test_implicit_wasapi_prepare_failure_falls_back_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    fake = _windows_default_backend_fake()
+    checked_devices: list[object] = []
+
+    def check_input_settings(**kwargs: object) -> None:
+        checked_devices.append(kwargs["device"])
+        if kwargs["device"] == 1:
+            raise RuntimeError("private driver detail")
+
+    fake.check_input_settings = check_input_settings  # type: ignore[method-assign]
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+    caplog.set_level(logging.WARNING, logger="pressay.audio")
+
+    recorder = AudioRecorder(device=None)
+
+    assert recorder.prepare() == 44_100
+    assert checked_devices == [1, None]
+    assert any(
+        "preferred_default_audio_backend_failed stage=prepare" in record.message
+        and "fallback=portaudio_default" in record.message
+        and "RuntimeError" in record.message
+        and "private driver detail" not in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("operation", ["warmup", "start", "prepare_capture"])
+def test_implicit_wasapi_open_failure_falls_back_for_every_capture_path(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    fake = _windows_default_backend_fake()
+    opened_devices: list[object] = []
+
+    def input_stream(**kwargs: object) -> FakeStream:
+        opened_devices.append(kwargs["device"])
+        if kwargs["device"] == 1:
+            raise RuntimeError("WASAPI open failed")
+        return FakeStream(fake, **kwargs)
+
+    fake.InputStream = input_stream  # type: ignore[method-assign]
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+    recorder = AudioRecorder(
+        device=None,
+        min_duration_seconds=0,
+        silence_rms_threshold=0,
+    )
+
+    if operation == "warmup":
+        rate = recorder.warmup(0)
+    elif operation == "prepare_capture":
+        rate = recorder.prepare_capture()
+        recorder.cancel()
+    else:
+        rate = recorder.start()
+        recorder.cancel()
+
+    assert rate == 44_100
+    assert opened_devices == [1, None]
+    assert recorder.wait_closed(timeout=1) is True
+
+
+def test_explicit_wasapi_never_falls_back_to_another_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _windows_default_backend_fake()
+    opened_devices: list[object] = []
+
+    def input_stream(**kwargs: object) -> FakeStream:
+        opened_devices.append(kwargs["device"])
+        raise RuntimeError("explicit backend failed")
+
+    fake.InputStream = input_stream  # type: ignore[method-assign]
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+    selected = build_microphone_selector(
+        name="Built-in Microphone",
+        host_api="Windows WASAPI",
+        sample_rate=48_000,
+    )
+
+    with pytest.raises(AudioDeviceError, match="start microphone"):
+        AudioRecorder(selected).start()
+
+    assert opened_devices == [1]
+
+
+def test_implicit_wasapi_does_not_fallback_until_failed_stream_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedOpenStream(FakeStream):
+        def start(self) -> None:
+            raise RuntimeError("WASAPI start failed")
+
+        def close(self) -> None:
+            raise RuntimeError("WASAPI close failed")
+
+    fake = _windows_default_backend_fake()
+    opened_devices: list[object] = []
+
+    def input_stream(**kwargs: object) -> FakeStream:
+        opened_devices.append(kwargs["device"])
+        return FailedOpenStream(fake, **kwargs)
+
+    fake.InputStream = input_stream  # type: ignore[method-assign]
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+    recorder = AudioRecorder(device=None)
+
+    with pytest.raises(AudioDeviceError, match="start microphone"):
+        recorder.start()
+
+    assert opened_devices == [1]
+    assert recorder.wait_closed(timeout=0) is False
 
 
 def test_prepare_warmup_and_capture_at_native_rate(monkeypatch: pytest.MonkeyPatch) -> None:

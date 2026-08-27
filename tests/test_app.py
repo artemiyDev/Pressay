@@ -111,6 +111,41 @@ def test_microphone_picker_persists_stable_selector(monkeypatch) -> None:
     assert "Windows WASAPI" in choices[1].name
 
 
+def test_microphone_picker_groups_driver_variants_and_labels_recommended(
+    monkeypatch,
+) -> None:
+    devices = [
+        AudioDevice(
+            index=2,
+            name="USB Microphone",
+            default_sample_rate=44_100,
+            max_input_channels=1,
+            is_default=True,
+            host_api="MME",
+        ),
+        AudioDevice(
+            index=8,
+            name="USB Microphone",
+            default_sample_rate=48_000,
+            max_input_channels=1,
+            host_api="Windows WASAPI",
+        ),
+    ]
+    monkeypatch.setattr(
+        "pressay.app.AudioRecorder.list_input_devices",
+        lambda: devices,
+    )
+
+    choices = _microphones()
+
+    assert len(choices) == 2
+    assert choices[1].value == devices[1].stable_selector
+    assert choices[1].legacy_index == 8
+    assert "вариантов драйвера: 2" in choices[1].name
+    assert "рекомендуется" in choices[1].name
+    assert "по умолчанию" in choices[1].name
+
+
 def test_picker_resolves_legacy_index_and_name_to_stable_choice() -> None:
     choices = [
         MicrophoneChoice(None, "Default"),

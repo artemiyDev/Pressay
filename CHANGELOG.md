@@ -5,8 +5,8 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.7` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.7` указана в текущем исходном коде,
+`0.5.8` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.5.8` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
@@ -20,6 +20,18 @@ have a matching tagged release. Версия `0.5.7` указана в теку�
 
 ### Changed / Изменено
 
+- On Windows, the implicit system-default microphone now prefers the default
+  WASAPI endpoint. If that endpoint fails before capture starts, Pressay closes
+  the partial stream and falls back once to PortAudio's native default.
+- The Windows microphone picker now groups MME, DirectSound, WASAPI, and WDM-KS
+  views of the same physical input, preserves an explicitly saved driver
+  variant, and labels WASAPI as recommended.
+- На Windows системный микрофон по умолчанию теперь предпочитает default
+  WASAPI-вход. Если он отказал до начала захвата, Pressay закрывает частично
+  открытый поток и один раз возвращается к штатному default PortAudio.
+- Список микрофонов Windows теперь объединяет MME-, DirectSound-, WASAPI- и
+  WDM-KS-представления одного физического входа, сохраняет явно выбранный
+  драйверный вариант и помечает WASAPI как рекомендуемый.
 - Automatic RU/EN recognition now compares both supported decodes when the
   language detector returns an uninformative unsupported-language result.
 - Microphone pre-arm is disabled by default because live telemetry showed no

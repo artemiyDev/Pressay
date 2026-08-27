@@ -24,6 +24,7 @@ from .audio import (
     AudioRecorder,
     LEGACY_MICROPHONE_SELECTOR_PREFIX,
     MICROPHONE_SELECTOR_PREFIX,
+    collapse_input_device_variants,
     normalize_device_selector,
     parse_microphone_selector,
 )
@@ -489,7 +490,14 @@ def _unavailable_microphone_name(value: object) -> str:
 def _microphones(selected: object = None) -> list[MicrophoneChoice]:
     result = [MicrophoneChoice(None, "Системный микрофон по умолчанию")]
     try:
-        devices = AudioRecorder.list_input_devices()
+        enumerated_devices = AudioRecorder.list_input_devices()
+        devices = collapse_input_device_variants(enumerated_devices, selected)
+        if len(devices) != len(enumerated_devices):
+            LOGGER.info(
+                "microphone_driver_variants_collapsed enumerated=%d displayed=%d",
+                len(enumerated_devices),
+                len(devices),
+            )
     except AudioCaptureError:
         devices = []
     seen: set[str] = set()
@@ -498,12 +506,25 @@ def _microphones(selected: object = None) -> list[MicrophoneChoice]:
         if selector in seen:
             continue
         seen.add(selector)
-        suffix = " — по умолчанию" if device.is_default else ""
+        suffix_parts: list[str] = []
+        if device.host_api.strip().casefold() == "windows wasapi":
+            suffix_parts.append("рекомендуется")
+        if device.is_default:
+            suffix_parts.append("по умолчанию")
+        suffix = f" — {', '.join(suffix_parts)}" if suffix_parts else ""
         host_api = f", {device.host_api}" if device.host_api else ""
+        variants = (
+            f"; вариантов драйвера: {device.variant_count}"
+            if device.variant_count > 1
+            else ""
+        )
         result.append(
             MicrophoneChoice(
                 selector,
-                f"{device.name} ({device.default_sample_rate} Hz{host_api}){suffix}",
+                (
+                    f"{device.name} ({device.default_sample_rate} Hz{host_api}"
+                    f"{variants}){suffix}"
+                ),
                 legacy_index=device.index,
                 device_name=device.name,
                 is_default=device.is_default,

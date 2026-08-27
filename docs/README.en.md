@@ -67,6 +67,13 @@ after validating their manifests, dependency contracts, references, and
 filesystem trees. Modified, unpaired, or unsafe directories are retained.
 Configuration, logs, and the shared model cache are never pruned.
 
+On Windows, **System default** prefers the default WASAPI capture endpoint and
+falls back once to PortAudio's native default if that endpoint cannot be
+opened. The microphone picker groups the MME, DirectSound, WASAPI, and WDM-KS
+views of one physical input and labels WASAPI as recommended. Selecting an
+explicit device remains fail-closed: Pressay will not silently switch an
+explicit choice to a different microphone.
+
 ```powershell
 .\scripts\install.ps1 -NoLaunch
 .\scripts\install.ps1 -Model small

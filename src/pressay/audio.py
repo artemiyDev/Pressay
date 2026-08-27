@@ -8,8 +8,10 @@ therefore possible on machines without PortAudio installed.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
+import re
+import sys
 import threading
 import time
 from typing import Any
@@ -94,6 +96,8 @@ class AudioDevice:
     max_input_channels: int
     is_default: bool = False
     host_api: str = ""
+    variant_count: int = 1
+    variant_host_apis: tuple[str, ...] = ()
 
     @property
     def stable_selector(self) -> str:
@@ -167,6 +171,174 @@ def normalize_device_selector(value: object) -> int | str | None:
 
 def _match_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).strip().casefold()
+
+
+_WINDOWS_HOST_API_ORDER = {
+    "windows wasapi": 0,
+    "windows directsound": 1,
+    "mme": 2,
+    "windows wdm-ks": 3,
+}
+
+
+def _windows_host_api_rank(value: object) -> int:
+    return _WINDOWS_HOST_API_ORDER.get(_match_text(value), 10)
+
+
+def _device_matches_selection(device: AudioDevice, selected: object) -> bool:
+    if selected is None:
+        return False
+    if device.stable_selector == selected:
+        return True
+    if type(selected) is int:
+        return device.index == selected
+    if isinstance(selected, str):
+        if selected.isdecimal() and device.index == int(selected):
+            return True
+        if parse_microphone_selector(selected) is None:
+            return _match_text(device.name) == _match_text(selected)
+    return False
+
+
+def _windows_physical_device_key(device: AudioDevice) -> str:
+    """Build a display-only identity across PortAudio driver variants.
+
+    PortAudio commonly exposes one Windows endpoint through MME, DirectSound,
+    WASAPI and several WDM-KS pins. The persisted selector remains tied to one
+    exact variant; this key is used only to make the picker understandable.
+    """
+
+    host_api = _match_text(device.host_api)
+    normalized = _match_text(device.name).replace("®", "")
+    normalized = re.sub(r"[–—−]", "-", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if host_api not in _WINDOWS_HOST_API_ORDER:
+        return f"{host_api}|{normalized}|{device.default_sample_rate}"
+
+    match = re.match(r"^(.*?)\s*\(([^()]*)\)", normalized)
+    if match is None:
+        return normalized
+    base = re.sub(r"\s+\d+$", "", match.group(1).strip())
+    hardware = match.group(2).strip()
+    hardware = re.sub(
+        r"\s*-\s*(?:microphone|микрофон)\s*$",
+        "",
+        hardware,
+    ).strip()
+    return f"{base}|{hardware}"
+
+
+def collapse_input_device_variants(
+    devices: list[AudioDevice],
+    selected: object = None,
+) -> list[AudioDevice]:
+    """Collapse duplicate Windows driver views while preserving a saved choice.
+
+    The representative prefers the Windows WASAPI endpoint. If the user already
+    saved an exact driver variant, that variant remains the representative so a
+    no-op settings save never changes the capture backend behind their back.
+    System-default pseudo devices are omitted because the picker already has a
+    dedicated system-default choice; an explicitly saved pseudo device remains.
+    """
+
+    if not devices:
+        return []
+    by_host: dict[str, list[AudioDevice]] = {}
+    for device in devices:
+        by_host.setdefault(_match_text(device.host_api), []).append(device)
+
+    ordered = sorted(
+        devices,
+        key=lambda item: (
+            _windows_host_api_rank(item.host_api),
+            not item.is_default,
+            item.index,
+        ),
+    )
+    groups: list[list[AudioDevice]] = []
+    group_keys: list[str] = []
+    for device in ordered:
+        host = _match_text(device.host_api)
+        host_devices = by_host.get(host, [])
+        is_default_alias = (
+            host in {"mme", "windows directsound"}
+            and len(host_devices) > 1
+            and device.index == min(item.index for item in host_devices)
+            and (
+                host == "windows directsound"
+                or not device.is_default
+            )
+        )
+        if is_default_alias and not _device_matches_selection(device, selected):
+            continue
+
+        key = _windows_physical_device_key(device)
+        normalized_name = _match_text(device.name)
+        group_index = next(
+            (index for index, existing in enumerate(group_keys) if existing == key),
+            None,
+        )
+        if group_index is None and host in _WINDOWS_HOST_API_ORDER:
+            for index, members in enumerate(groups):
+                if any(
+                    min(len(normalized_name), len(_match_text(member.name))) >= 20
+                    and (
+                        normalized_name.startswith(_match_text(member.name))
+                        or _match_text(member.name).startswith(normalized_name)
+                    )
+                    for member in members
+                ):
+                    group_index = index
+                    break
+        if group_index is None:
+            groups.append([device])
+            group_keys.append(key)
+        else:
+            groups[group_index].append(device)
+
+    result: list[AudioDevice] = []
+    for members in groups:
+        selected_members = [
+            item for item in members if _device_matches_selection(item, selected)
+        ]
+        representative = min(
+            selected_members or members,
+            key=lambda item: (
+                _windows_host_api_rank(item.host_api),
+                not item.is_default,
+                item.index,
+            ),
+        )
+        host_apis = tuple(
+            dict.fromkeys(
+                item.host_api
+                for item in sorted(
+                    members,
+                    key=lambda item: (
+                        _windows_host_api_rank(item.host_api),
+                        item.index,
+                    ),
+                )
+                if item.host_api
+            )
+        )
+        result.append(
+            replace(
+                representative,
+                is_default=any(item.is_default for item in members),
+                variant_count=len(members),
+                variant_host_apis=host_apis,
+            )
+        )
+    return sorted(
+        result,
+        key=lambda item: (
+            not item.is_default,
+            _windows_host_api_rank(item.host_api),
+            _match_text(item.name),
+            item.index,
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +532,7 @@ class AudioRecorder:
         self._stream_generation = 0
         self._active_stream_generation: int | None = None
         self._resolved_device: object | int | None = _UNRESOLVED_DEVICE
+        self._preferred_default_backend = False
         self._prearmed = False
         self._first_frame_origin: float | None = None
         self._first_frame_at: float | None = None
@@ -395,6 +568,36 @@ class AudioRecorder:
             except (AttributeError, TypeError):
                 result[index] = ""
         return result
+
+    @staticmethod
+    def _preferred_windows_default_input_index(sd: Any) -> int | None:
+        """Return the Windows default capture endpoint through WASAPI.
+
+        PortAudio's process-wide default host API can still be legacy MME. The
+        WASAPI host API exposes the same Windows default endpoint with a shorter,
+        more stable shared-mode startup path. Non-Windows platforms and partial
+        PortAudio builds retain their native default unchanged.
+        """
+
+        if sys.platform != "win32":
+            return None
+        try:
+            host_apis = sd.query_hostapis()
+        except Exception:
+            return None
+        for details in host_apis:
+            try:
+                if _match_text(details.get("name", "")) != "windows wasapi":
+                    continue
+                index = int(details.get("default_input_device", -1))
+                device = sd.query_devices(index, "input")
+                if index >= 0 and int(device.get("max_input_channels", 0)) > 0:
+                    return index
+            except (AttributeError, KeyError, TypeError, ValueError, IndexError):
+                continue
+            except Exception:
+                return None
+        return None
 
     @classmethod
     def _list_input_devices(cls, sd: Any) -> list[AudioDevice]:
@@ -463,7 +666,9 @@ class AudioRecorder:
 
         selected = self.device
         if selected is None:
-            return None
+            preferred = self._preferred_windows_default_input_index(sd)
+            self._preferred_default_backend = preferred is not None
+            return preferred
 
         try:
             devices = self._list_input_devices(sd)
@@ -526,6 +731,21 @@ class AudioRecorder:
         if match is None:
             raise AudioDeviceError("The explicitly selected input device is unavailable")
         return match.index
+
+    def _fallback_to_portaudio_default(self, *, stage: str, error: Exception) -> bool:
+        """Fall back once when the implicit preferred WASAPI endpoint fails."""
+
+        if self.device is not None or not self._preferred_default_backend:
+            return False
+        self._preferred_default_backend = False
+        self._resolved_device = None
+        self._native_sample_rate = None
+        LOGGER.warning(
+            "preferred_default_audio_backend_failed stage=%s fallback=portaudio_default error=%s",
+            stage,
+            type(error).__name__,
+        )
+        return True
 
     @property
     def is_recording(self) -> bool:
@@ -606,20 +826,28 @@ class AudioRecorder:
         """Resolve and validate the device format without beginning capture."""
 
         sd = _import_sounddevice()
-        rate = self._resolve_native_sample_rate(sd)
-        resolved_device = self._resolve_device(sd)
-        try:
-            sd.check_input_settings(
-                device=resolved_device,
-                channels=1,
-                dtype="float32",
-                samplerate=rate,
-            )
-        except Exception as exc:
-            raise AudioDeviceError(
-                f"The selected input device cannot record mono float32 at {rate} Hz"
-            ) from exc
-        return rate
+        while True:
+            try:
+                rate = self._resolve_native_sample_rate(sd)
+                resolved_device = self._resolve_device(sd)
+                sd.check_input_settings(
+                    device=resolved_device,
+                    channels=1,
+                    dtype="float32",
+                    samplerate=rate,
+                )
+                return rate
+            except AudioDeviceError as exc:
+                if self._fallback_to_portaudio_default(stage="prepare", error=exc):
+                    continue
+                raise
+            except Exception as exc:
+                error = AudioDeviceError(
+                    "The selected input device cannot record mono float32"
+                )
+                if self._fallback_to_portaudio_default(stage="prepare", error=exc):
+                    continue
+                raise error from exc
 
     def _stream_kwargs(
         self,
@@ -653,25 +881,52 @@ class AudioRecorder:
                 raise AudioCaptureError("Cannot warm up while recording")
 
         sd = _import_sounddevice()
-        rate = self.prepare()
-        stream: Any | None = None
-        try:
-            stream = sd.InputStream(
-                **self._stream_kwargs(rate, lambda *_args: None, sd)
-            )
-            stream.start()
-            if duration_seconds:
-                time.sleep(duration_seconds)
-            stream.stop()
-            return rate
-        except Exception as exc:
-            raise AudioDeviceError("Could not open the selected input device") from exc
-        finally:
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+        while True:
+            rate = self.prepare()
+            stream: Any | None = None
+            started = False
+            retry = False
+            try:
+                stream = sd.InputStream(
+                    **self._stream_kwargs(rate, lambda *_args: None, sd)
+                )
+                stream.start()
+                started = True
+                if duration_seconds:
+                    time.sleep(duration_seconds)
+                stream.stop()
+                return rate
+            except Exception as exc:
+                close_ok = stream is None
+                if stream is not None:
+                    try:
+                        stream.close()
+                        close_ok = True
+                        stream = None
+                    except Exception:
+                        close_ok = False
+                        with self._lock:
+                            self._stream_close_failed = True
+                retry = (
+                    not started
+                    and close_ok
+                    and self._fallback_to_portaudio_default(
+                        stage="warmup",
+                        error=exc,
+                    )
+                )
+                if not retry:
+                    raise AudioDeviceError(
+                        "Could not open the selected input device"
+                    ) from exc
+            finally:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+            if retry:
+                continue
 
     def _audio_callback(
         self,
@@ -816,51 +1071,62 @@ class AudioRecorder:
 
         first_frame_origin = time.perf_counter()
         sd = _import_sounddevice()
-        rate = self.prepare()
-        stream: Any | None = None
-        with self._lock:
-            self._stream_generation += 1
-            generation = self._stream_generation
-        try:
-            stream = sd.InputStream(
-                **self._stream_kwargs(
-                    rate,
-                    lambda indata, frames, time_info, status: self._audio_callback(
-                        indata,
-                        frames,
-                        time_info,
-                        status,
-                        generation=generation,
-                    ),
-                    sd,
-                    finished_callback=lambda: self._stream_finished_callback(generation),
-                )
-            )
+        while True:
+            rate = self.prepare()
+            stream: Any | None = None
             with self._lock:
-                self._reset_capture_locked()
-                self._max_retained_samples = max(
-                    1,
-                    int(rate * self.max_duration_seconds),
+                self._stream_generation += 1
+                generation = self._stream_generation
+            try:
+                stream = sd.InputStream(
+                    **self._stream_kwargs(
+                        rate,
+                        lambda indata, frames, time_info, status: self._audio_callback(
+                            indata,
+                            frames,
+                            time_info,
+                            status,
+                            generation=generation,
+                        ),
+                        sd,
+                        finished_callback=lambda: self._stream_finished_callback(
+                            generation
+                        ),
+                    )
                 )
-                self._stream = stream
-                self._active_stream_generation = generation
-                self._recording = True
-                self._first_frame_origin = first_frame_origin
-            stream.start()
-            return rate
-        except Exception as exc:
-            with self._lock:
-                self._finishing = True
-                self._stream = None
-                self._recording = False
-                self._reset_capture_locked()
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    with self._lock:
-                        self._stream_close_failed = True
-            raise AudioDeviceError("Could not start microphone capture") from exc
+                with self._lock:
+                    self._reset_capture_locked()
+                    self._max_retained_samples = max(
+                        1,
+                        int(rate * self.max_duration_seconds),
+                    )
+                    self._stream = stream
+                    self._active_stream_generation = generation
+                    self._recording = True
+                    self._first_frame_origin = first_frame_origin
+                stream.start()
+                return rate
+            except Exception as exc:
+                with self._lock:
+                    self._finishing = True
+                    self._stream = None
+                    self._recording = False
+                    self._reset_capture_locked()
+                close_ok = stream is None
+                if stream is not None:
+                    try:
+                        stream.close()
+                        close_ok = True
+                    except Exception:
+                        close_ok = False
+                        with self._lock:
+                            self._stream_close_failed = True
+                if close_ok and self._fallback_to_portaudio_default(
+                    stage="start",
+                    error=exc,
+                ):
+                    continue
+                raise AudioDeviceError("Could not start microphone capture") from exc
 
     def prepare_capture(self, buffer_seconds: float = 2.0) -> int:
         """Open the microphone into a bounded in-memory ring before a gesture resolves.
@@ -878,49 +1144,60 @@ class AudioRecorder:
 
         first_frame_origin = time.perf_counter()
         sd = _import_sounddevice()
-        rate = self.prepare()
-        stream: Any | None = None
-        with self._lock:
-            self._stream_generation += 1
-            generation = self._stream_generation
-        try:
-            stream = sd.InputStream(
-                **self._stream_kwargs(
-                    rate,
-                    lambda indata, frames, time_info, status: self._audio_callback(
-                        indata,
-                        frames,
-                        time_info,
-                        status,
-                        generation=generation,
-                    ),
-                    sd,
-                    finished_callback=lambda: self._stream_finished_callback(generation),
+        while True:
+            rate = self.prepare()
+            stream: Any | None = None
+            with self._lock:
+                self._stream_generation += 1
+                generation = self._stream_generation
+            try:
+                stream = sd.InputStream(
+                    **self._stream_kwargs(
+                        rate,
+                        lambda indata, frames, time_info, status: self._audio_callback(
+                            indata,
+                            frames,
+                            time_info,
+                            status,
+                            generation=generation,
+                        ),
+                        sd,
+                        finished_callback=lambda: self._stream_finished_callback(
+                            generation
+                        ),
+                    )
                 )
-            )
-            with self._lock:
-                self._reset_capture_locked()
-                self._max_retained_samples = max(1, int(rate * buffer_seconds))
-                self._stream = stream
-                self._active_stream_generation = generation
-                self._recording = True
-                self._prearmed = True
-                self._first_frame_origin = first_frame_origin
-            stream.start()
-            return rate
-        except Exception as exc:
-            with self._lock:
-                self._finishing = True
-                self._stream = None
-                self._recording = False
-                self._reset_capture_locked()
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    with self._lock:
-                        self._stream_close_failed = True
-            raise AudioDeviceError("Could not prepare microphone capture") from exc
+                with self._lock:
+                    self._reset_capture_locked()
+                    self._max_retained_samples = max(1, int(rate * buffer_seconds))
+                    self._stream = stream
+                    self._active_stream_generation = generation
+                    self._recording = True
+                    self._prearmed = True
+                    self._first_frame_origin = first_frame_origin
+                stream.start()
+                return rate
+            except Exception as exc:
+                with self._lock:
+                    self._finishing = True
+                    self._stream = None
+                    self._recording = False
+                    self._reset_capture_locked()
+                close_ok = stream is None
+                if stream is not None:
+                    try:
+                        stream.close()
+                        close_ok = True
+                    except Exception:
+                        close_ok = False
+                        with self._lock:
+                            self._stream_close_failed = True
+                if close_ok and self._fallback_to_portaudio_default(
+                    stage="prepare_capture",
+                    error=exc,
+                ):
+                    continue
+                raise AudioDeviceError("Could not prepare microphone capture") from exc
 
     def activate_prepared_capture(self) -> bool:
         """Turn a prearmed stream into a recording while retaining its prefix."""

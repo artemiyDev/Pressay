@@ -56,6 +56,12 @@ remove only older verified payloads and unreferenced runtimes. A stable
 The macOS developer beta still runs from its repository checkout; keep that
 checkout in place.
 
+On Windows, the system-default microphone is opened through its WASAPI endpoint
+when available, with one safe fallback to PortAudio's native default. The
+settings picker groups MME, DirectSound, WASAPI, and WDM-KS views of the same
+physical microphone and recommends the WASAPI variant instead of presenting
+every driver entry as a different device.
+
 ## Quick start
 
 ### Windows
