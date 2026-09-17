@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -18,6 +19,8 @@ from . import hotkey_bindings
 from .platform_support import is_windows, user_data_directory
 from .text import replacement_key, snippet_key
 
+
+LOGGER = logging.getLogger(__name__)
 
 APP_DIRECTORY = "Pressay"
 LEGACY_APP_DIRECTORY = "WhisperFlow"
@@ -31,9 +34,15 @@ SUPPORTED_TRANSLATE_MODELS = frozenset({"small", "medium", "large-v3"})
 #: punctuation natively; Whisper stays the fallback and owns English.
 SUPPORTED_RUSSIAN_ENGINES = frozenset({"whisper", "gigaam"})
 
-#: Only the end-to-end heads are offered: the plain CTC/RNN-T ones return
-#: lowercase text with no punctuation, which dictation would have to undo.
-SUPPORTED_GIGAAM_MODELS = frozenset({"gigaam-v3-e2e-rnnt", "gigaam-v3-e2e-ctc"})
+#: Only the end-to-end RNN-T head is offered. The plain CTC/RNN-T heads return
+#: lowercase text with no punctuation, which dictation would have to undo, and
+#: ``gigaam-v3-e2e-ctc`` is additionally broken at the source (INVALID_PROTOBUF).
+SUPPORTED_GIGAAM_MODELS = frozenset({"gigaam-v3-e2e-rnnt"})
+
+#: Superseded values from old config files that must still load, mapped to
+#: their replacement. ``gigaam-v3-e2e-ctc`` was dropped because the upstream
+#: export is a broken protobuf (INVALID_PROTOBUF), not because of a preference.
+_LEGACY_GIGAAM_MODELS = {"gigaam-v3-e2e-ctc": "gigaam-v3-e2e-rnnt"}
 
 
 class ConfigError(ValueError):
@@ -199,6 +208,14 @@ class AppConfig:
         gigaam_model = _non_empty_string(
             raw.get("gigaam_model", defaults.gigaam_model), "gigaam_model"
         )
+        if gigaam_model in _LEGACY_GIGAAM_MODELS:
+            replacement = _LEGACY_GIGAAM_MODELS[gigaam_model]
+            LOGGER.warning(
+                "gigaam_model %r is no longer supported; using %r instead",
+                gigaam_model,
+                replacement,
+            )
+            gigaam_model = replacement
         if gigaam_model not in SUPPORTED_GIGAAM_MODELS:
             raise ConfigError(
                 "gigaam_model должен быть одной из моделей: "

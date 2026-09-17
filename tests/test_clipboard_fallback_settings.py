@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 
 import pytest
@@ -46,13 +45,16 @@ def test_checkbox_reflects_and_reports_the_setting(monkeypatch) -> None:
 
 
 def test_settings_save_applies_the_checkbox_value() -> None:
-    """Чекбокс без проводки в save_settings молча игнорировался бы.
+    """Значение чекбокса из values должно попасть в сохранённый AppConfig."""
 
-    save_settings — замыкание внутри сборки приложения, вызвать его отдельно
-    нельзя, поэтому проверяется сам вызов.
-    """
+    config_on = AppConfig(copy_on_insertion_failure=True)
+    updated_off = app_module._build_updated_config(
+        config_on, {"copy_on_insertion_failure": False}, config_on.microphone
+    )
+    assert updated_off.copy_on_insertion_failure is False
 
-    source = inspect.getsource(app_module)
-    body = source[source.index("def save_settings"):]
-    body = body[: body.index("signals.save_requested.connect(save_settings)")]
-    assert 'values.get("copy_on_insertion_failure"' in body
+    config_off = AppConfig(copy_on_insertion_failure=False)
+    updated_on = app_module._build_updated_config(
+        config_off, {"copy_on_insertion_failure": True}, config_off.microphone
+    )
+    assert updated_on.copy_on_insertion_failure is True

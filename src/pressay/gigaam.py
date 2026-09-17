@@ -275,7 +275,7 @@ class GigaAmTranscriber:
         if not text:
             raise NoSpeechDetected("GigaAM returned an empty transcript")
         if is_probable_hallucination(text):
-            raise HallucinationDetected(f"Rejected likely hallucination: {text!r}")
+            raise HallucinationDetected("Model output looks like a silence hallucination")
 
         LOGGER.debug(
             "gigaam_transcribed seconds=%.2f gain=%.2f inference=%.3f chars=%d",

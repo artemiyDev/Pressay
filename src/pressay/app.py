@@ -544,6 +544,50 @@ def _microphones(selected: object = None) -> list[MicrophoneChoice]:
     return result
 
 
+def _build_updated_config(
+    config: AppConfig, values: dict[str, Any], microphone: Any
+) -> AppConfig:
+    """Merge settings-window ``values`` onto ``config``, field by field.
+
+    ``replace()`` rather than ``AppConfig(...)``: a hand-listed constructor
+    silently resets every field the settings window does not know about, so
+    building one that way once reverted ``russian_engine`` to its default and
+    undid the documented way back to Whisper.  Anything absent from
+    ``values`` -- ``russian_engine`` and ``gigaam_model`` are not settings-window
+    fields -- is carried over from ``config`` unchanged.
+
+    Raises ``hotkey_bindings.HotkeyBindingError`` if ``values["hotkeys"]`` does
+    not parse; the caller is expected to report that to the user.
+    """
+
+    hotkeys = hotkey_bindings.from_mapping(
+        values.get("hotkeys", config.hotkeys.to_mapping())
+    )
+    return replace(
+        config,
+        model=str(values.get("model", config.model)),
+        language=str(values.get("language", config.language)),
+        microphone=microphone,
+        auto_insert=bool(values.get("auto_insert", config.auto_insert)),
+        smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
+        copy_on_insertion_failure=bool(
+            values.get("copy_on_insertion_failure", config.copy_on_insertion_failure)
+        ),
+        remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
+        voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
+        voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
+        voice_translate=bool(values.get("voice_translate", config.voice_translate)),
+        translate_model=str(values.get("translate_model", config.translate_model)),
+        strict_editable_check=bool(
+            values.get("strict_editable_check", config.strict_editable_check)
+        ),
+        resource_mode=str(values.get("resource_mode", config.resource_mode)),
+        snippets=dict(config.snippets),
+        replacements=dict(values.get("replacements", config.replacements)),
+        hotkeys=hotkeys,
+    )
+
+
 def _settings_dict(config: AppConfig) -> dict[str, Any]:
     return {
         "microphone": config.microphone,
@@ -891,41 +935,12 @@ def main(argv: list[str] | None = None) -> int:
     def save_settings(values: dict[str, Any]) -> None:
         microphone = values.get("microphone")
         try:
-            hotkeys = hotkey_bindings.from_mapping(
-                values.get("hotkeys", config.hotkeys.to_mapping())
-            )
+            updated = _build_updated_config(config, values, microphone)
         except hotkey_bindings.HotkeyBindingError as exc:
             message = f"Горячие клавиши: {exc}"
             window.update_status(message, "error")
             tray.notify("Pressay", message, warning=True)
             return
-        # replace() rather than AppConfig(): a hand-listed constructor silently
-        # resets every field the settings window does not know about, so saving
-        # settings once reverted russian_engine to its default and undid the
-        # documented way back to Whisper.  Anything absent here is carried over.
-        updated = replace(
-            config,
-            model=str(values.get("model", config.model)),
-            language=str(values.get("language", config.language)),
-            microphone=microphone,
-            auto_insert=bool(values.get("auto_insert", config.auto_insert)),
-            smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
-            copy_on_insertion_failure=bool(
-                values.get("copy_on_insertion_failure", config.copy_on_insertion_failure)
-            ),
-            remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
-            voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
-            voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
-            voice_translate=bool(values.get("voice_translate", config.voice_translate)),
-            translate_model=str(values.get("translate_model", config.translate_model)),
-            strict_editable_check=bool(
-                values.get("strict_editable_check", config.strict_editable_check)
-            ),
-            resource_mode=str(values.get("resource_mode", config.resource_mode)),
-            snippets=dict(config.snippets),
-            replacements=dict(values.get("replacements", config.replacements)),
-            hotkeys=hotkeys,
-        )
         if hotkey_coordinator is not None:
             window.update_status("Применяю настройки…", "processing")
         _save_settings_transaction(

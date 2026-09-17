@@ -1076,9 +1076,118 @@ def test_auto_insert_failure_keeps_result_without_copying(monkeypatch) -> None:
     # уходил прямо в трей. Теперь в уведомлении человеческая фраза.
     assert notifications
     assert "foreground_target_changed" not in str(notifications[-1][1])
-    assert "сменилось активное окно" in str(notifications[-1][1])
+    assert "Активное окно сменилось" in str(notifications[-1][1])
     assert hotkey_hint("copy") in str(notifications[-1][1])
     controller.close()
+
+
+# --- D1: characters_sent decides whether the clipboard is touched ---------
+
+
+def _run_delivery_with_outcome(monkeypatch, outcome):
+    """Drive one auto-insert dictation whose adapter call returns ``outcome``."""
+
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    copied: list[str] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True, copy_on_insertion_failure=True),
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", lambda text: copied.append(text) or SimpleNamespace(success=True))
+    monkeypatch.setattr("pressay.windows_input.send_text", lambda *_a, **_k: outcome)
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+    controller.close()
+    return statuses, notifications, copied
+
+
+def test_insertion_failure_fully_typed_does_not_touch_clipboard(monkeypatch) -> None:
+    """D1a: enter_send_failed with the full text already typed -- no copy."""
+
+    insertion_length = len(_prepare_insertion_text(
+        "тестовая фраза", press_enter=False, smart_spacing=True
+    ))
+    outcome = SimpleNamespace(
+        success=False,
+        reason="enter_send_failed",
+        characters_sent=insertion_length,
+    )
+    statuses, notifications, copied = _run_delivery_with_outcome(monkeypatch, outcome)
+
+    assert copied == [], "the text is already on screen; copying it would duplicate it"
+    assert "Enter" in statuses[-1][0]
+    assert notifications
+    message = str(notifications[-1][1])
+    assert "вставьте его вручную" not in message
+    assert "Enter" in message
+
+
+def test_insertion_failure_target_changed_before_enter_does_not_touch_clipboard(
+    monkeypatch,
+) -> None:
+    """D1a, second reason code: focus moved right before Enter, text already typed."""
+
+    insertion_length = len(_prepare_insertion_text(
+        "тестовая фраза", press_enter=False, smart_spacing=True
+    ))
+    outcome = SimpleNamespace(
+        success=False,
+        reason="foreground_target_changed_before_enter",
+        characters_sent=insertion_length,
+    )
+    statuses, notifications, copied = _run_delivery_with_outcome(monkeypatch, outcome)
+
+    assert copied == []
+    assert notifications
+    assert "активное окно" in str(notifications[-1][1])
+
+
+def test_insertion_failure_partial_typing_copies_and_warns_to_delete_first(
+    monkeypatch,
+) -> None:
+    """D1b: only part of the text landed -- copy the full text, warn to delete first."""
+
+    insertion_length = len(_prepare_insertion_text(
+        "тестовая фраза", press_enter=False, smart_spacing=True
+    ))
+    assert insertion_length > 1
+    outcome = SimpleNamespace(
+        success=False,
+        reason="foreground_target_changed",
+        characters_sent=insertion_length // 2,
+    )
+    statuses, notifications, copied = _run_delivery_with_outcome(monkeypatch, outcome)
+
+    assert copied == ["тестовая фраза"]
+    assert "часть" in statuses[-1][0]
+    assert notifications
+    message = str(notifications[-1][1])
+    assert "удали" in message.lower()
+
+
+def test_insertion_failure_nothing_sent_copies_full_text_as_before(monkeypatch) -> None:
+    """D1c: characters_sent == 0 keeps the pre-existing clipboard-fallback path."""
+
+    outcome = SimpleNamespace(
+        success=False,
+        reason="foreground_target_changed",
+        characters_sent=0,
+    )
+    statuses, notifications, copied = _run_delivery_with_outcome(monkeypatch, outcome)
+
+    assert copied == ["тестовая фраза"]
+    assert "скопирован" in statuses[-1][0]
+    assert notifications
+    assert "вставьте его вручную" in str(notifications[-1][1])
 
 
 def test_auto_insert_exception_keeps_result_without_copying(monkeypatch) -> None:

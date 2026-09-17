@@ -462,8 +462,10 @@ class LevelReport:
 DEFAULT_TARGET_PEAK = 0.5
 
 #: Below this peak a capture is treated as silence rather than amplified --
-#: normalising pure noise by 60 dB only invents hallucinations.
-MIN_NORMALISABLE_PEAK = 1e-4
+#: normalising pure noise by 60 dB only invents hallucinations.  Derived from
+#: ``SILENT_PEAK_DBFS`` so the two thresholds cannot drift apart: a peak this
+#: quiet is exactly what ``describe_level`` already calls "silent".
+MIN_NORMALISABLE_PEAK = 10.0 ** (SILENT_PEAK_DBFS / 20.0)
 
 
 def normalize_peak(
@@ -472,10 +474,13 @@ def normalize_peak(
     """Scale ``audio`` so its loudest sample sits at ``target_peak``.
 
     Returns the scaled waveform and the gain applied.  Silence is passed through
-    untouched (gain ``1.0``) so callers can still reject it as silence.
+    untouched (gain ``1.0``) so callers can still reject it as silence.  NaN/Inf
+    samples are cleaned the same way :func:`_mono_float32` cleans them, so a bad
+    input never produces a NaN gain or a NaN-filled array.
     """
 
     samples = np.asarray(audio, dtype=np.float32)
+    samples = np.nan_to_num(samples, copy=True, nan=0.0, posinf=1.0, neginf=-1.0)
     peak = float(np.abs(samples).max()) if samples.size else 0.0
     if peak < MIN_NORMALISABLE_PEAK or target_peak <= 0:
         return samples, 1.0

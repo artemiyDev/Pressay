@@ -64,6 +64,46 @@ def test_normalize_peak_leaves_silence_alone_instead_of_amplifying_noise() -> No
     assert np.array_equal(scaled, silence)
 
 
+def _at_peak_dbfs(dbfs: float, length: int = 256) -> np.ndarray:
+    peak = 10.0 ** (dbfs / 20.0)
+    return np.full(length, peak, dtype=np.float32)
+
+
+def test_normalize_peak_threshold_matches_describe_level_silent_boundary() -> None:
+    """D3: the amplification cutoff must be derived from SILENT_PEAK_DBFS.
+
+    A -60 dBFS capture (below the -55 dBFS 'silent' boundary) must not be
+    amplified; a -40 dBFS capture (above it) must reach the default target
+    peak of 0.5.
+    """
+
+    from pressay.audio import DEFAULT_TARGET_PEAK
+
+    quiet_noise = _at_peak_dbfs(-60.0)
+    scaled, gain = normalize_peak(quiet_noise)
+    assert gain == 1.0
+    assert np.array_equal(scaled, quiet_noise)
+
+    speech = _at_peak_dbfs(-40.0)
+    scaled, gain = normalize_peak(speech)
+    assert gain != 1.0
+    assert float(np.abs(scaled).max()) == pytest.approx(DEFAULT_TARGET_PEAK, abs=1e-3)
+
+
+def test_normalize_peak_threshold_is_derived_from_silent_peak_dbfs() -> None:
+    from pressay.audio import MIN_NORMALISABLE_PEAK, SILENT_PEAK_DBFS
+
+    assert MIN_NORMALISABLE_PEAK == pytest.approx(10.0 ** (SILENT_PEAK_DBFS / 20.0))
+
+
+def test_normalize_peak_cleans_nan_and_inf_instead_of_propagating_them() -> None:
+    dirty = np.array([np.nan, np.inf, -np.inf, 0.05], dtype=np.float32)
+    scaled, gain = normalize_peak(dirty, target_peak=0.5)
+    assert np.isfinite(scaled).all()
+    assert np.isfinite(gain)
+    assert not np.isnan(gain)
+
+
 def test_quiet_speech_reaches_the_model_at_the_target_peak() -> None:
     engine, model = _engine()
     engine.transcribe(_speech(peak=0.02), sample_rate=SAMPLE_RATE)
@@ -140,6 +180,18 @@ def test_hallucinated_transcript_is_rejected() -> None:
     engine, _ = _engine(text="Продолжение следует...")
     with pytest.raises(HallucinationDetected):
         engine.transcribe(_speech(), sample_rate=SAMPLE_RATE)
+
+
+def test_hallucination_exception_never_carries_the_transcript(caplog) -> None:
+    """D2: the exception message must not leak dictation text into a toast/log."""
+
+    secret = "Продолжение следует..."
+    engine, _ = _engine(text=secret)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(HallucinationDetected) as excinfo:
+            engine.transcribe(_speech(), sample_rate=SAMPLE_RATE)
+    assert secret not in str(excinfo.value)
+    assert all(secret not in r.getMessage() for r in caplog.records)
 
 
 def test_load_failure_surfaces_as_model_load_error() -> None:
@@ -220,11 +272,22 @@ def test_config_round_trips_the_new_engine_settings() -> None:
         {"russian_engine": "vosk"},
         {"gigaam_model": "gigaam-v2-rnnt"},
         {"russian_engine": ""},
+        {"gigaam_model": "garbage"},
     ],
 )
 def test_config_rejects_unsupported_engine_settings(raw) -> None:
     with pytest.raises(ConfigError):
         AppConfig.from_dict(raw)
+
+
+def test_config_migrates_the_broken_ctc_model_to_rnnt(caplog) -> None:
+    """D5: gigaam-v3-e2e-ctc is INVALID_PROTOBUF upstream, so old configs
+    carrying it must still load, silently corrected to the RNN-T head."""
+
+    with caplog.at_level("WARNING", logger="pressay.config"):
+        config = AppConfig.from_dict({"gigaam_model": "gigaam-v3-e2e-ctc"})
+    assert config.gigaam_model == "gigaam-v3-e2e-rnnt"
+    assert any("gigaam_model" in r.getMessage() for r in caplog.records)
 
 
 # --- регрессии по аудиту 2026-09-08 --------------------------------------
@@ -423,20 +486,157 @@ def test_capture_level_is_logged_even_when_the_take_fails(caplog):
     assert not any("transcription_completed" in r.getMessage() for r in caplog.records)
 
 
+def _whisper_stub(config: AppConfig, whisper_calls: list[dict]):
+    class _Whisper:
+        model_size = config.model
+
+        def transcribe(self, *_a, **kwargs):
+            whisper_calls.append(kwargs)
+            from pressay.transcriber import TranscriptionResult, TranscriptionTimings
+
+            return TranscriptionResult(
+                text="спасено виспером",
+                language="ru",
+                language_probability=0.9,
+                segments=(),
+                audio_duration_seconds=2.0,
+                timings=TranscriptionTimings(0.0, 0.01, 0.01),
+                device="cpu",
+                compute_type="int8",
+            )
+
+        def close(self) -> None:
+            pass
+
+    return _Whisper()
+
+
+def test_gigaam_engine_unavailable_falls_back_to_whisper_without_error(caplog) -> None:
+    """D7: EngineUnavailable is routine routing, not a malfunction -- no ERROR."""
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job = _worker_controller(config)
+
+    class _EnglishOnly:
+        model_name = DEFAULT_MODEL
+
+        def transcribe(self, *_a, **_k):
+            raise EngineUnavailable("GigaAM handles Russian only")
+
+        def close(self) -> None:
+            pass
+
+    controller._gigaam = _EnglishOnly()
+    whisper_calls: list[dict] = []
+    controller._transcriber = _whisper_stub(config, whisper_calls)
+    try:
+        with caplog.at_level("INFO", logger="pressay.controller"):
+            controller._transcribe_worker(job)
+    finally:
+        controller.close()
+
+    assert whisper_calls, "речь потеряна: Whisper даже не позвали"
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_gigaam_no_speech_verdict_does_not_fall_back_to_whisper() -> None:
+    """D7: a deliberate silence verdict must not re-run the take through Whisper."""
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job = _worker_controller(config)
+
+    class _AlwaysSilent:
+        model_name = DEFAULT_MODEL
+
+        def transcribe(self, *_a, **_k):
+            raise NoSpeechDetected("тишина")
+
+        def close(self) -> None:
+            pass
+
+    controller._gigaam = _AlwaysSilent()
+    whisper_calls: list[dict] = []
+
+    class _Whisper:
+        model_size = config.model
+
+        def transcribe(self, *_a, **kwargs):
+            whisper_calls.append(kwargs)
+            raise AssertionError("Whisper must not run after a GigaAM NoSpeechDetected verdict")
+
+        def close(self) -> None:
+            pass
+
+    controller._transcriber = _Whisper()
+    try:
+        controller._transcribe_worker(job)
+    finally:
+        controller.close()
+
+    assert whisper_calls == []
+
+
+def test_gigaam_load_error_falls_back_and_negatively_caches_the_model(monkeypatch) -> None:
+    """D4: after one ModelLoadError, a second dictation must not retry the load."""
+
+    from dataclasses import replace
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job1 = _worker_controller(config)
+
+    ensure_calls: list[str] = []
+
+    class _AlwaysBroken:
+        model_name = config.gigaam_model
+
+        def transcribe(self, *_a, **_k):
+            raise ModelLoadError("cache is cold, downloads are disabled")
+
+        def close(self) -> None:
+            pass
+
+    def fake_ensure_gigaam(model_name: str):
+        ensure_calls.append(model_name)
+        return _AlwaysBroken()
+
+    monkeypatch.setattr(controller, "_ensure_gigaam", fake_ensure_gigaam)
+    whisper_calls: list[dict] = []
+    controller._transcriber = _whisper_stub(config, whisper_calls)
+    notifications: list[tuple] = []
+    controller.notification_callback = lambda *args: notifications.append(args)
+
+    try:
+        controller._transcribe_worker(job1)
+
+        controller.state = controller.state.start()
+        session_id2 = controller.state.session_id
+        controller.state = controller.state.begin_transcription(session_id2)
+        controller._session_cancelled = job1.cancelled
+        job2 = replace(job1, session_id=session_id2)
+        controller._transcribe_worker(job2)
+    finally:
+        controller.close()
+
+    assert ensure_calls == [config.gigaam_model], "вторая диктовка снова попыталась загрузить модель"
+    assert len(whisper_calls) == 2, "обе диктовки должны были завершиться через Whisper"
+    assert len(notifications) == 1, "уведомление о недоступности GigaAM должно уйти один раз"
+
+
 def test_settings_save_path_preserves_unknown_fields_structurally() -> None:
-    """Страховка от возврата к перечислению полей в app.py.
+    """Поля, которых нет в values (russian_engine, gigaam_model), сохраняются."""
 
-    Тест на семантике replace() был бы тавтологией: он зелен и без правки в
-    app.py. Поэтому проверяется сам вызов.
-    """
-
-    import inspect
     from pressay import app as app_module
 
-    source = inspect.getsource(app_module)
-    start = source.index("def save_settings")
-    body = source[start:start + 3000]
-    assert "replace(\n            config," in body, (
-        "save_settings снова конструирует AppConfig поимённо — новые поля будут "
-        "молча сброшены к значениям по умолчанию"
+    config = AppConfig(
+        russian_engine="whisper",
+        gigaam_model="gigaam-v3-e2e-rnnt",
+        model="turbo",
+        prearm_capture=True,
     )
+    updated = app_module._build_updated_config(
+        config, {"model": "large-v3"}, config.microphone
+    )
+    assert updated.russian_engine == "whisper"
+    assert updated.gigaam_model == "gigaam-v3-e2e-rnnt"
+    assert updated.prearm_capture is True
+    assert updated.model == "large-v3"

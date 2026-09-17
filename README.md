@@ -35,6 +35,14 @@ translation. Translation uses a translation-capable model and may download that
 model the first time it is selected; the normal language selector remains a
 recognition hint and does not enable translation.
 
+When the language is pinned to Russian, Pressay transcribes with GigaAM v3
+(`gigaam-v3-e2e-rnnt` through `onnx-asr`, CPU only) and falls back to Whisper
+for English, translation, takes longer than 25 seconds, or whenever GigaAM is
+unavailable. `auto` and English always use Whisper. Set
+`"russian_engine": "whisper"` in `config.json` (with Pressay closed) to turn
+GigaAM off. GigaAM spells English terms inside Russian speech phonetically;
+the replacement dictionary in settings is the current workaround.
+
 The macOS beta uses CPU inference. CTranslate2 supports Intel and Apple Silicon
 macOS wheels, but its faster-whisper backend does not use Metal/MPS. A real Mac
 is still required for the final microphone, Accessibility, Input Monitoring,
@@ -94,6 +102,11 @@ Accessibility or Input Monitoring permissions.
 - RU/EN only; automatic language selection never returns a third language.
 - Choosing Russian or English skips language detection; it does not translate
   speech. Dictating in the other language may produce inaccurate text.
+- When automatic insertion fails, the transcript is copied to the clipboard
+  by default, replacing its previous content. Turn this off in settings
+  (`copy_on_insertion_failure`). Text that was already typed is not copied.
+- GigaAM is loaded offline from the local Hugging Face cache; Pressay never
+  downloads it during dictation.
 - No telemetry and no audio/transcript files.
 - Focus fingerprint is rechecked before every insertion batch and Enter.
 - Automatic insertion never falls back to overwriting the clipboard.

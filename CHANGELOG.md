@@ -5,14 +5,41 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.5.9` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.5.9` указана в текущем исходном коде,
+`0.6.6` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.6.6` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
 
 ### Added / Добавлено
 
+- Russian dictation with the language pinned to `ru` now runs on GigaAM v3
+  (`gigaam-v3-e2e-rnnt` through `onnx-asr`, CPU only, loaded offline from the
+  local Hugging Face cache). English, translation, takes longer than 25 seconds
+  and any GigaAM failure fall back to Whisper without losing the take. New
+  config fields `russian_engine` (`gigaam` by default, `whisper` to opt out) and
+  `gigaam_model`.
+- Русская диктовка при закреплённом языке `ru` теперь идёт через GigaAM v3
+  (`gigaam-v3-e2e-rnnt` через `onnx-asr`, только CPU, офлайн из локального кеша
+  Hugging Face). Английский, перевод, записи длиннее 25 секунд и любой сбой
+  GigaAM уходят на Whisper без потери записи. Новые поля конфига:
+  `russian_engine` (по умолчанию `gigaam`, `whisper` — отключить) и
+  `gigaam_model`.
+- When automatic insertion fails before any text was typed, the transcript is
+  copied to the clipboard and the notification explains why in plain language.
+  The new setting `copy_on_insertion_failure` (on by default) restores the old
+  behaviour. A cancelled or stale result is never copied.
+- Если автовставка не удалась до того, как что-либо напечатано, расшифровка
+  копируется в буфер обмена, а уведомление объясняет причину человеческой
+  фразой. Новая настройка `copy_on_insertion_failure` (включена по умолчанию)
+  возвращает прежнее поведение. Отменённый или устаревший результат не
+  копируется никогда.
+- Every dictation logs `capture_level` (peak and RMS dBFS, clipping, level
+  class) before recognition, and `transcription_completed` names the engine.
+  Neither line contains audio or text.
+- Каждая диктовка пишет в лог `capture_level` (пик и RMS в dBFS, клиппинг,
+  класс уровня) до распознавания, а `transcription_completed` называет движок.
+  Ни аудио, ни текста в этих строках нет.
 - The bounded microphone check now distinguishes silence, a weak level, a
   healthy level, and clipping, reports the measured dBFS and sample rate, and
   retains the final scalar meter without saving audio or running recognition.
@@ -104,6 +131,32 @@ have a matching tagged release. Версия `0.5.9` указана в теку�
 
 ### Fixed / Исправлено
 
+- Audio is peak-normalised to 0.5 before inference in both engines. At about
+  -45 dBFS Whisper silently dropped punctuation and capitalisation. Captures
+  that the level check classifies as silence are no longer amplified.
+- Перед распознаванием аудио нормализуется по пику до 0,5 в обоих движках. На
+  уровне около -45 dBFS Whisper молча терял пунктуацию и заглавные буквы.
+  Записи, которые проверка уровня считает тишиной, больше не усиливаются.
+- Saving the settings window no longer resets config fields the window does
+  not show (it used to revert `russian_engine`).
+- Сохранение окна настроек больше не сбрасывает поля конфига, которых в окне
+  нет (раньше откатывался `russian_engine`).
+- Text that was already typed is no longer copied to the clipboard with a
+  "paste it manually" hint when only Enter failed or focus moved after typing;
+  a partially typed text is reported as such.
+- Уже напечатанный текст больше не копируется в буфер с советом «вставьте
+  вручную», если сорвался только Enter или фокус ушёл после вставки; о
+  частично напечатанном тексте сообщается прямо.
+- A rejected GigaAM hallucination no longer puts the recognised text into the
+  system notification.
+- Отклонённая галлюцинация GigaAM больше не выводит распознанный текст в
+  системное уведомление.
+- A GigaAM model that cannot be loaded is tried once per run instead of on
+  every dictation; the corrupt upstream `gigaam-v3-e2e-ctc` is no longer
+  offered and an existing config naming it is mapped to `gigaam-v3-e2e-rnnt`.
+- Модель GigaAM, которую не удалось загрузить, пробуется один раз за запуск, а
+  не на каждой диктовке; битая в источнике `gigaam-v3-e2e-ctc` больше не
+  предлагается, а конфиг с ней приводится к `gigaam-v3-e2e-rnnt`.
 - Windows doctor now establishes an explicit UTF-8 native-output contract, so
   Cyrillic microphone names and JSON remain readable in Windows PowerShell 5.
 - A transient microphone device-open failure is retried once with a fresh
