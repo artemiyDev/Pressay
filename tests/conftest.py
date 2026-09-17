@@ -16,28 +16,38 @@ from typing import Any
 import pytest
 
 
+_REAL_LOAD_ATTEMPTS: list[str] = []
+
+
 class _BlockedOnnxAsr:
     """Stand-in for the ``onnx_asr`` module installed in the "with GigaAM" venv.
 
-    Its ``load_model`` always raises, so ``GigaAmTranscriber.load()`` wraps it
-    into a ``ModelLoadError`` with a clear message.  The controller already
-    treats ``ModelLoadError`` as "fall back to Whisper", so tests that do not
-    care about GigaAM get a deterministic Whisper-only path for free; tests
-    that do care must stub the engine explicitly (``model_factory=...`` or
-    ``controller._gigaam = ...``), which bypasses this module entirely.
+    ``GigaAmTranscriber.load()`` wraps whatever ``load_model`` raises into a
+    ``ModelLoadError``, and the controller answers that with a quiet fallback
+    to Whisper.  Raising here is therefore not enough to fail a test, so every
+    attempt is also recorded and the fixture below fails the test at teardown.
+    Tests that need GigaAM stub the engine (``model_factory=...`` or
+    ``controller._gigaam = ...``); tests that do not must pin
+    ``russian_engine="whisper"``.
     """
 
     @staticmethod
-    def load_model(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError(
-            "Test reached the real onnx_asr.load_model(). Stub GigaAM "
-            "explicitly instead (GigaAmTranscriber(model_factory=...) or "
-            "controller._gigaam = <fake>)."
-        )
+    def load_model(model: Any = None, *_args: Any, **_kwargs: Any) -> Any:
+        _REAL_LOAD_ATTEMPTS.append(str(model))
+        raise AssertionError("Test reached the real onnx_asr.load_model().")
 
 
 @pytest.fixture(autouse=True)
-def _block_real_gigaam_model_load(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Prevent any test from loading a real ONNX GigaAM model."""
+def _block_real_gigaam_model_load(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Fail any test that tries to load a real ONNX GigaAM model."""
 
+    _REAL_LOAD_ATTEMPTS.clear()
     monkeypatch.setitem(sys.modules, "onnx_asr", _BlockedOnnxAsr)
+    yield
+    attempts = list(_REAL_LOAD_ATTEMPTS)
+    _REAL_LOAD_ATTEMPTS.clear()
+    assert not attempts, (
+        f"Test reached the real onnx_asr.load_model() for {attempts}. Stub GigaAM "
+        "(GigaAmTranscriber(model_factory=...) or controller._gigaam = <fake>) or "
+        'pin russian_engine="whisper" in the test config.'
+    )

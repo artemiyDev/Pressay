@@ -39,6 +39,10 @@ def _run_powershell(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        # Windows PowerShell 5.1 localises the "WARNING:" prefix and writes it in
+        # the OEM code page (cp866 on a Russian system), so strict UTF-8
+        # decoding killed the reader thread and left stdout as None.
+        errors="replace",
         env=env,
     )
 
@@ -63,6 +67,10 @@ def _run_powershell_file(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        # Windows PowerShell 5.1 localises the "WARNING:" prefix and writes it in
+        # the OEM code page (cp866 on a Russian system), so strict UTF-8
+        # decoding killed the reader thread and left stdout as None.
+        errors="replace",
         env=env,
     )
 

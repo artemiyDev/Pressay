@@ -932,6 +932,9 @@ def test_update_config_is_serialized_and_active_job_uses_snapshot(monkeypatch) -
         AppConfig(
             model="small",
             language="ru",
+            # Pinned so the BlockingTranscriber below is the engine under test;
+            # the default would route Russian to GigaAM first.
+            russian_engine="whisper",
             auto_insert=False,
             replacements={"исходный": "старый"},
         ),
