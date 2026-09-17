@@ -189,6 +189,26 @@ def test_setup_macos_script_installs_dependencies_from_pyproject_not_a_duplicate
     )
 
 
+def test_setup_macos_prepares_gigaam_alongside_whisper_and_respects_skip_flags() -> None:
+    text = (SCRIPTS / "setup-macos.sh").read_text(encoding="utf-8")
+
+    assert "--skip-gigaam" in text
+    assert "pressay.model_setup" in text
+    # GigaAM preparation must live inside the same `skip_model` guard as the
+    # Whisper model_setup call, so `--skip-model` skips both.
+    skip_model_block = text.index('if [[ "${skip_model}" -eq 0 ]]; then')
+    model_setup_call = text.index('"${python_bin}" -m pressay.model_setup')
+    end_marker = text.index("echo \"Pressay macOS runtime is ready")
+    assert skip_model_block < model_setup_call < end_marker
+
+
+def test_install_macos_forwards_skip_gigaam_to_setup() -> None:
+    text = (SCRIPTS / "install-macos.sh").read_text(encoding="utf-8")
+
+    assert "--skip-gigaam" in text
+    assert 'if [[ "${skip_gigaam}" -eq 1 ]]; then setup_args+=(--skip-gigaam); fi' in text
+
+
 def test_project_python_and_macos_bundle_versions_match() -> None:
     """All public version declarations must move together."""
 

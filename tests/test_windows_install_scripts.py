@@ -247,6 +247,27 @@ def test_setup_passes_icon_paths_as_arguments_and_validates_runtime() -> None:
     assert "-UninstallerSource" in setup
 
 
+def test_setup_prepares_gigaam_alongside_whisper_and_respects_skip_flags() -> None:
+    setup = (SCRIPTS / "setup.ps1").read_text(encoding="utf-8")
+
+    assert "[switch]$SkipGigaam" in setup
+    assert "pressay.model_setup" in setup
+    assert "--skip-gigaam" in setup
+    # GigaAM preparation must live inside the same `if (-not $SkipModel)` block
+    # as the Whisper model_setup call, so `-SkipModel` skips both.
+    skip_model_block_start = setup.index("if (-not $SkipModel)")
+    model_setup_call = setup.index("& $venvPython @modelSetupArguments")
+    activation_call = setup.index("Complete-PressayActivation")
+    assert skip_model_block_start < model_setup_call < activation_call
+
+
+def test_install_ps1_forwards_skip_gigaam_to_setup() -> None:
+    install = (SCRIPTS / "install.ps1").read_text(encoding="utf-8")
+
+    assert "[switch]$SkipGigaam" in install
+    assert "$setupParameters.SkipGigaam = $true" in install
+
+
 def test_local_maintenance_scripts_resolve_the_active_runtime() -> None:
     for name in ("doctor.ps1", "test.ps1", "smoke-app.ps1", "e2e-input.ps1"):
         text = (SCRIPTS / name).read_text(encoding="utf-8")

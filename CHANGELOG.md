@@ -5,14 +5,29 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.6.6` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.6.6` указана в текущем исходном коде,
+`0.6.7` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.6.7` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
 
 ### Added / Добавлено
 
+- Setup now prepares the GigaAM model next to the Whisper model (only the
+  `gigaam-v3-e2e-rnnt` files, about 890 MB, skipped when already cached). A
+  failed GigaAM download does not fail setup. `-SkipGigaam` / `--skip-gigaam`
+  opts out, and `doctor` reports whether GigaAM is ready without loading it.
+- Установка теперь готовит модель GigaAM вместе с моделью Whisper (только файлы
+  `gigaam-v3-e2e-rnnt`, около 890 МБ; если модель уже в кеше, сеть не
+  используется). Сбой скачивания GigaAM установку не прерывает. Отказаться —
+  `-SkipGigaam` / `--skip-gigaam`; `doctor` сообщает о готовности GigaAM, не
+  загружая модель.
+- A refused insertion logs `insertion_target_mismatch` with what differed
+  (window, control identity, unavailable focus), control types, UIA class names
+  and executable names. Window titles and text are never logged.
+- Отказ вставки пишет в лог `insertion_target_mismatch`: что именно разошлось
+  (окно, идентичность контрола, недоступный фокус), типы контролов, UIA-классы
+  и имена исполняемых файлов. Заголовки окон и текст в лог не попадают.
 - Russian dictation with the language pinned to `ru` now runs on GigaAM v3
   (`gigaam-v3-e2e-rnnt` through `onnx-asr`, CPU only, loaded offline from the
   local Hugging Face cache). English, translation, takes longer than 25 seconds
@@ -131,6 +146,18 @@ have a matching tagged release. Версия `0.6.6` указана в теку�
 
 ### Fixed / Исправлено
 
+- On Windows, text longer than one 96-unit batch no longer stops after the
+  first batch in Document-type fields (contenteditable editors in Chromium and
+  Electron apps). The focus recheck compared editability evidence such as caret
+  presence, which the insertion itself changes; it now compares control
+  identity only. A different window, process, runtime id, class or control type
+  still stops the insertion.
+- В Windows текст длиннее одного пакета в 96 единиц больше не обрывается после
+  первого пакета в полях типа Document (contenteditable-редакторы Chromium и
+  Electron). Повторная проверка фокуса сравнивала свидетельства
+  редактируемости, например наличие каретки, которые меняет сама вставка;
+  теперь сравнивается только идентичность контрола. Другое окно, процесс,
+  runtime id, класс или тип контрола по-прежнему останавливают вставку.
 - Audio is peak-normalised to 0.5 before inference in both engines. At about
   -45 dBFS Whisper silently dropped punctuation and capitalisation. Captures
   that the level check classifies as silence are no longer amplified.

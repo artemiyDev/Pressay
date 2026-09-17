@@ -3,6 +3,7 @@ param(
     [string]$Python = "py",
     [string]$Model = "turbo",
     [switch]$SkipModel,
+    [switch]$SkipGigaam,
     [switch]$DesktopShortcut,
     [switch]$EnableAutostart,
     [switch]$NoLaunch
@@ -24,6 +25,9 @@ $setupParameters = @{
 }
 if ($SkipModel) {
     $setupParameters.SkipModel = $true
+}
+if ($SkipGigaam) {
+    $setupParameters.SkipGigaam = $true
 }
 
 Write-Host "Preparing Pressay..."

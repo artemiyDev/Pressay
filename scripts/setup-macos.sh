@@ -4,14 +4,16 @@ set -euo pipefail
 model="small"
 python_command="python3.11"
 skip_model=0
+skip_gigaam=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --model) model="${2:?--model requires a value}"; shift 2 ;;
     --python) python_command="${2:?--python requires a value}"; shift 2 ;;
     --skip-model) skip_model=1; shift ;;
+    --skip-gigaam) skip_gigaam=1; shift ;;
     -h|--help)
-      echo "Usage: bash scripts/setup-macos.sh [--model small] [--python python3.11] [--skip-model]"
+      echo "Usage: bash scripts/setup-macos.sh [--model small] [--python python3.11] [--skip-model] [--skip-gigaam]"
       exit 0
       ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -51,7 +53,11 @@ PY
 fi
 
 if [[ "${skip_model}" -eq 0 ]]; then
-  "${python_bin}" -m pressay.model_setup --model "${model}" --device cpu
+  # pressay.model_setup prepares both the Whisper model and, unless skipped,
+  # the GigaAM model used for Russian dictation, in one call.
+  model_setup_args=(--model "${model}" --device cpu)
+  if [[ "${skip_gigaam}" -eq 1 ]]; then model_setup_args+=(--skip-gigaam); fi
+  "${python_bin}" -m pressay.model_setup "${model_setup_args[@]}"
 fi
 
 echo "Pressay macOS runtime is ready at ${venv_root}"

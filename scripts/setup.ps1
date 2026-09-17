@@ -2,7 +2,8 @@
 param(
     [string]$Python = "py",
     [switch]$SkipModel,
-    [string]$Model = "turbo"
+    [string]$Model = "turbo",
+    [switch]$SkipGigaam
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,7 +100,13 @@ try {
             if ($cudaBins.Count -gt 0) {
                 $env:PATH = (($cudaBins -join ';') + ';' + $env:PATH)
             }
-            & $venvPython -m pressay.model_setup --model $Model
+            # pressay.model_setup prepares both the Whisper model and, unless
+            # skipped, the GigaAM model used for Russian dictation, in one call.
+            $modelSetupArguments = @("-m", "pressay.model_setup", "--model", $Model)
+            if ($SkipGigaam) {
+                $modelSetupArguments += "--skip-gigaam"
+            }
+            & $venvPython @modelSetupArguments
             if ($LASTEXITCODE -ne 0) { throw "Model setup failed." }
         }
 

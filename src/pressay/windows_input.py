@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 import importlib
+import logging
 import os
 import queue
 import threading
@@ -21,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
+
+_LOGGER = logging.getLogger(__name__)
 
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
@@ -183,7 +186,16 @@ def windows_input_available() -> bool:
 
 
 def targets_match(expected: ForegroundTarget, current: ForegroundTarget) -> bool:
-    """Match stable window identity; titles are informative and may change."""
+    """Match stable window and control identity.
+
+    Titles are informative and may change. Editability *evidence* flags
+    (enabled, keyboard-focusable, value/text writable, caret presence) are
+    likewise excluded: a control's identity does not change just because it
+    reports different capabilities on a later read (a Document/contenteditable
+    control's caret only becomes active once it holds text), and whether a
+    target is safe to type into is decided once, at capture time, by
+    ``target_looks_editable``.
+    """
 
     window_matches = (
         expected.is_valid
@@ -200,9 +212,36 @@ def targets_match(expected: ForegroundTarget, current: ForegroundTarget) -> bool
         return False
     if expected.focused_control is None:
         return current.focused_control is None
-    return _without_refetch_metadata(
-        expected.focused_control
-    ) == _without_refetch_metadata(current.focused_control)
+    if current.focused_control is None:
+        return False
+    expected_parsed = parse_focus_fingerprint(expected.focused_control)
+    current_parsed = parse_focus_fingerprint(current.focused_control)
+    if expected_parsed is None or current_parsed is None:
+        # Unknown/unrecognized fingerprint shapes keep the previous,
+        # stricter behaviour: compare the raw tuples (minus refetch
+        # diagnostics) wholesale, since there is no decoded identity to
+        # compare instead.
+        return _without_refetch_metadata(
+            expected.focused_control
+        ) == _without_refetch_metadata(current.focused_control)
+    if expected_parsed.kind != current_parsed.kind:
+        return False
+    return _focus_identity(expected_parsed) == _focus_identity(current_parsed)
+
+
+def _focus_identity(parsed: FocusFingerprint) -> tuple[object, ...]:
+    """Identifying fields of a focus fingerprint, excluding evidence flags."""
+
+    if parsed.kind == "win32_focus":
+        return (parsed.kind, parsed.process_id, parsed.control_hwnd, parsed.class_name)
+    return (
+        parsed.kind,
+        parsed.process_id,
+        parsed.runtime_id,
+        parsed.automation_id,
+        parsed.class_name,
+        parsed.control_type,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +483,15 @@ class FocusFingerprint:
     caret_active: bool = False
     win32_caret: bool = False
     refetched: bool = False
+    # Identity fields: stable across an insertion, unlike the editability
+    # evidence flags above (which a Document/contenteditable control may flip
+    # the moment it receives its first characters). ``runtime_id`` and
+    # ``automation_id`` are UIA-only; ``control_hwnd`` is the win32-focus
+    # analogue of ``runtime_id`` (the focused child HWND, as opposed to the
+    # top-level window HWND already carried on ``ForegroundTarget``).
+    runtime_id: tuple[int, ...] | None = None
+    automation_id: str | None = None
+    control_hwnd: int | None = None
 
 
 def _refetch_metadata(
@@ -498,15 +546,26 @@ def parse_focus_fingerprint(
         return FocusFingerprint(
             kind="win32_focus",
             process_id=int(fingerprint[1]) if len(fingerprint) > 1 else 0,
+            control_hwnd=int(fingerprint[2]) if len(fingerprint) > 2 else None,
             class_name=str(fingerprint[3]) if len(fingerprint) > 3 else None,
             caret_active=bool(fingerprint[4]) if len(fingerprint) > 4 else False,
             win32_caret=bool(fingerprint[5]) if len(fingerprint) > 5 else False,
         )
     if kind == "uia" and len(fingerprint) >= 10:
         evidence_offset = 2 if len(fingerprint) >= 12 else 0
+        # ``suffix_len`` counts the fixed trailing fields after the
+        # variable-length runtime id: automation id, class name, control
+        # type, and the four editability/caret evidence flags (two of which
+        # only exist once the caret-evidence extension is present).
+        suffix_len = 7 + evidence_offset
+        runtime_id = tuple(
+            int(part) for part in fingerprint[2 : len(fingerprint) - suffix_len]
+        )
         return FocusFingerprint(
             kind="uia",
             process_id=int(fingerprint[1]),
+            runtime_id=runtime_id,
+            automation_id=str(fingerprint[-suffix_len]),
             control_type=int(fingerprint[-5 - evidence_offset]),
             enabled=bool(fingerprint[-4 - evidence_offset]),
             keyboard_focusable=bool(fingerprint[-3 - evidence_offset]),
@@ -1625,6 +1684,171 @@ def _safe_snapshot(backend: InputBackend) -> tuple[Optional[ForegroundTarget], O
         return None, str(exc)
 
 
+def _process_executable_name(pid: Optional[int]) -> str:
+    """Best-effort exe basename for a pid, never the full path.
+
+    Returns ``"?"`` on any failure (invalid pid, denied access, non-Windows),
+    which is deliberately indistinguishable from other failure modes: this
+    value is diagnostic only and must never gate a decision.
+    """
+
+    if os.name != "nt" or not pid or pid <= 0:
+        return "?"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
+        if not handle:
+            return "?"
+        try:
+            buffer = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(len(buffer))
+            ok = kernel32.QueryFullProcessImageNameW(
+                handle, 0, buffer, ctypes.byref(size)
+            )
+            if not ok:
+                return "?"
+            return os.path.basename(buffer.value) or "?"
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return "?"
+
+
+_TARGET_MISMATCH_UIA_IDENTITY_FIELDS: tuple[str, ...] = (
+    "process_id",
+    "runtime_id",
+    "automation_id",
+    "class_name",
+    "control_type",
+)
+_TARGET_MISMATCH_WIN32_IDENTITY_FIELDS: tuple[str, ...] = (
+    "process_id",
+    "control_hwnd",
+    "class_name",
+)
+_TARGET_MISMATCH_UIA_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "enabled",
+    "keyboard_focusable",
+    "value_writable",
+    "text_editable",
+    "caret_active",
+)
+_TARGET_MISMATCH_WIN32_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "caret_active",
+    "win32_caret",
+)
+
+
+def _target_mismatch_kind_and_fields(
+    expected: ForegroundTarget, current: Optional[ForegroundTarget]
+) -> tuple[str, str]:
+    """Classify a failed recheck for ``insertion_target_mismatch`` logging.
+
+    Never raises and never includes window titles, AutomationId values, or
+    text; ``fields`` lists only the names of properties that differ.
+    """
+
+    if current is None:
+        return "snapshot_failed", "-"
+    if (
+        not expected.is_valid
+        or not current.is_valid
+        or expected.hwnd != current.hwnd
+        or expected.pid != current.pid
+    ):
+        fields = []
+        if expected.hwnd != current.hwnd:
+            fields.append("hwnd")
+        if expected.pid != current.pid:
+            fields.append("pid")
+        return "window", ",".join(fields) if fields else "-"
+    if (
+        expected.focused_control == _FOCUS_UNAVAILABLE
+        or current.focused_control == _FOCUS_UNAVAILABLE
+    ):
+        return "focus_unavailable", "-"
+    expected_parsed = parse_focus_fingerprint(expected.focused_control)
+    current_parsed = parse_focus_fingerprint(current.focused_control)
+    if expected_parsed is None or current_parsed is None:
+        return "control", "-"
+    if expected_parsed.kind != current_parsed.kind:
+        return "control", "kind"
+    if expected_parsed.kind == "win32_focus":
+        names = _TARGET_MISMATCH_WIN32_IDENTITY_FIELDS + _TARGET_MISMATCH_WIN32_EVIDENCE_FIELDS
+    else:
+        names = _TARGET_MISMATCH_UIA_IDENTITY_FIELDS + _TARGET_MISMATCH_UIA_EVIDENCE_FIELDS
+    fields = [
+        name
+        for name in names
+        if getattr(expected_parsed, name) != getattr(current_parsed, name)
+    ]
+    return "control", ",".join(fields) if fields else "-"
+
+
+def _log_target_mismatch(
+    expected: ForegroundTarget,
+    current: Optional[ForegroundTarget],
+    *,
+    characters_sent: int,
+) -> None:
+    kind, fields = _target_mismatch_kind_and_fields(expected, current)
+    expected_parsed = parse_focus_fingerprint(expected.focused_control)
+    current_parsed = (
+        parse_focus_fingerprint(current.focused_control) if current is not None else None
+    )
+    _LOGGER.info(
+        "insertion_target_mismatch kind=%s fields=%s expected_ct=%s current_ct=%s "
+        "expected_class=%s current_class=%s expected_process=%s current_process=%s "
+        "characters_sent=%d",
+        kind,
+        fields,
+        expected_parsed.control_type if expected_parsed is not None else "-",
+        current_parsed.control_type if current_parsed is not None else "-",
+        expected_parsed.class_name if expected_parsed is not None else "-",
+        current_parsed.class_name if current_parsed is not None else "-",
+        _process_executable_name(expected.pid),
+        _process_executable_name(current.pid) if current is not None else "?",
+        characters_sent,
+    )
+
+
+def _accumulate_evidence_diff(
+    diffs: set[str], expected: ForegroundTarget, current: ForegroundTarget
+) -> None:
+    """Record editability-evidence fields that changed despite matching identity.
+
+    Called only after ``targets_match`` already accepted the pair, so this is
+    purely diagnostic: it confirms (or refutes) that a control's evidence
+    flags can flip mid-insertion without its identity changing.
+    """
+
+    expected_parsed = parse_focus_fingerprint(expected.focused_control)
+    current_parsed = parse_focus_fingerprint(current.focused_control)
+    if expected_parsed is None or current_parsed is None:
+        return
+    names = (
+        _TARGET_MISMATCH_WIN32_EVIDENCE_FIELDS
+        if expected_parsed.kind == "win32_focus"
+        else _TARGET_MISMATCH_UIA_EVIDENCE_FIELDS
+    )
+    for name in names:
+        if getattr(expected_parsed, name) != getattr(current_parsed, name):
+            diffs.add(name)
+
+
+def _log_evidence_diff_if_any(diffs: set[str]) -> None:
+    if diffs:
+        _LOGGER.debug(
+            "insertion_target_flags_changed fields=%s", ",".join(sorted(diffs))
+        )
+
+
 def _guard_callback(
     backend: InputBackend,
     expected: ForegroundTarget,
@@ -1689,6 +1913,12 @@ def send_text(
             current_target=expected_target,
         )
 
+    # Editability *evidence* flags (caret presence, writable value/text
+    # patterns, ...) are decided once above and excluded from every recheck
+    # below (see ``targets_match``). Flags observed to change anyway are
+    # purely diagnostic and reported once at the end of this call.
+    evidence_diffs: set[str] = set()
+
     try:
         active_backend = backend or _default_backend()
     except Exception as exc:
@@ -1729,6 +1959,7 @@ def send_text(
             current_target=current,
         )
     if not targets_match(expected_target, current):
+        _log_target_mismatch(expected_target, current, characters_sent=0)
         return _failure(
             InputStatus.TARGET_MISMATCH,
             "foreground_target_changed",
@@ -1738,6 +1969,7 @@ def send_text(
             target=expected_target,
             current_target=current,
         )
+    _accumulate_evidence_diff(evidence_diffs, expected_target, current)
 
     try:
         modifiers_clear = wait_for_physical_modifiers_clear(
@@ -1781,6 +2013,7 @@ def send_text(
                 current_target=latest,
             )
         if latest is None or not targets_match(expected_target, latest):
+            _log_target_mismatch(expected_target, latest, characters_sent=0)
             return InputOutcome(
                 status=InputStatus.TARGET_MISMATCH,
                 success=False,
@@ -1789,6 +2022,7 @@ def send_text(
                 target=expected_target,
                 current_target=latest,
             )
+        _accumulate_evidence_diff(evidence_diffs, expected_target, latest)
         try:
             if _cancel_requested(cancelled):
                 return _cancelled_outcome(
@@ -1805,6 +2039,7 @@ def send_text(
                 target=expected_target,
                 current_target=latest,
             )
+        _log_evidence_diff_if_any(evidence_diffs)
         return InputOutcome(
             status=InputStatus.INSERTED_UNICODE,
             success=enter_sent,
@@ -1841,6 +2076,7 @@ def send_text(
             cancelled=cancelled,
         )
         if result.success:
+            _accumulate_evidence_diff(evidence_diffs, expected_target, observed[0])
             if press_enter:
                 latest, enter_guard_error = _safe_snapshot(active_backend)
                 if _cancel_requested(cancelled):
@@ -1850,6 +2086,9 @@ def send_text(
                         characters_sent=len(text),
                     )
                 if latest is None or not targets_match(expected_target, latest):
+                    _log_target_mismatch(
+                        expected_target, latest, characters_sent=len(text)
+                    )
                     return _failure(
                         InputStatus.TARGET_MISMATCH,
                         "foreground_target_changed_before_enter",
@@ -1861,6 +2100,7 @@ def send_text(
                         characters_sent=len(text),
                         detail=enter_guard_error,
                     )
+                _accumulate_evidence_diff(evidence_diffs, expected_target, latest)
                 try:
                     if _cancel_requested(cancelled):
                         return _cancelled_outcome(
@@ -1886,6 +2126,7 @@ def send_text(
                         characters_sent=len(text),
                         detail=enter_error,
                     )
+            _log_evidence_diff_if_any(evidence_diffs)
             return InputOutcome(
                 status=InputStatus.PASTED_CLIPBOARD,
                 success=True,
@@ -1912,6 +2153,8 @@ def send_text(
             if result.reason == "paste_input_failed"
             else InputStatus.CLIPBOARD_FAILED
         )
+        if status is InputStatus.TARGET_MISMATCH:
+            _log_target_mismatch(expected_target, observed[0], characters_sent=0)
         return InputOutcome(
             status=status,
             success=False,
@@ -1934,6 +2177,7 @@ def send_text(
                 characters_sent=sent_units,
             )
         if latest is None or not targets_match(expected_target, latest):
+            _log_target_mismatch(expected_target, latest, characters_sent=sent_units)
             return _failure(
                 InputStatus.TARGET_MISMATCH,
                 "foreground_target_changed",
@@ -1945,6 +2189,7 @@ def send_text(
                 characters_sent=sent_units,
                 detail=snapshot_error,
             )
+        _accumulate_evidence_diff(evidence_diffs, expected_target, latest)
         try:
             if _cancel_requested(cancelled):
                 return _cancelled_outcome(
@@ -1981,6 +2226,7 @@ def send_text(
                 characters_sent=sent_units,
             )
         if latest is None or not targets_match(expected_target, latest):
+            _log_target_mismatch(expected_target, latest, characters_sent=sent_units)
             return _failure(
                 InputStatus.TARGET_MISMATCH,
                 "foreground_target_changed_before_enter",
@@ -1992,6 +2238,7 @@ def send_text(
                 characters_sent=sent_units,
                 detail=enter_guard_error,
             )
+        _accumulate_evidence_diff(evidence_diffs, expected_target, latest)
         try:
             if _cancel_requested(cancelled):
                 return _cancelled_outcome(
@@ -2018,6 +2265,7 @@ def send_text(
                 detail=enter_error,
             )
 
+    _log_evidence_diff_if_any(evidence_diffs)
     return InputOutcome(
         status=InputStatus.INSERTED_UNICODE,
         success=True,

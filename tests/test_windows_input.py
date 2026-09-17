@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+import logging
 import os
 import threading
 import time
@@ -46,8 +47,9 @@ def _uia_fingerprint(
     keyboard_focusable: bool = True,
     value_writable: bool = True,
     text_editable: bool = False,
+    caret_active: bool | None = None,
 ) -> tuple[object, ...]:
-    return (
+    fingerprint: tuple[object, ...] = (
         "uia",
         process_id,
         *runtime_id,
@@ -59,6 +61,11 @@ def _uia_fingerprint(
         value_writable,
         text_editable,
     )
+    if caret_active is None:
+        return fingerprint
+    # Mirrors the worker's live output shape: caret evidence plus the
+    # trailing win32-style placeholder that is always False for UIA.
+    return (*fingerprint, caret_active, False)
 
 
 TARGET = ForegroundTarget(
@@ -753,6 +760,8 @@ def test_parse_focus_fingerprint_decodes_uia_format() -> None:
         value_writable=True,
         text_editable=False,
         class_name="RichEdit",
+        runtime_id=(1, 2),
+        automation_id="field",
     )
 
 
@@ -765,6 +774,7 @@ def test_parse_focus_fingerprint_decodes_win32_focus_format() -> None:
         kind="win32_focus",
         process_id=200,
         class_name="Edit",
+        control_hwnd=222,
     )
 
 
@@ -1681,3 +1691,231 @@ def test_copy_last_needs_no_target() -> None:
     assert outcome.success
     assert outcome.copied
     assert clipboard.text == "remembered"
+
+
+def _document_target(
+    *,
+    hwnd: int = 100,
+    pid: int = 200,
+    title: str = "Editor",
+    runtime_id: tuple[int, ...] = (7, 11),
+    class_name: str = "#document",
+    control_type: int = 50030,
+    value_writable: bool = True,
+    text_editable: bool = True,
+    caret_active: bool = False,
+) -> ForegroundTarget:
+    return ForegroundTarget(
+        hwnd=hwnd,
+        pid=pid,
+        title=title,
+        focused_control=_uia_fingerprint(
+            process_id=pid,
+            runtime_id=runtime_id,
+            automation_id="editor",
+            class_name=class_name,
+            control_type=control_type,
+            enabled=True,
+            keyboard_focusable=True,
+            value_writable=value_writable,
+            text_editable=text_editable,
+            caret_active=caret_active,
+        ),
+    )
+
+
+def test_document_target_survives_evidence_flags_flipping_after_first_batch() -> None:
+    # Chromium/Electron contenteditable ("Document", control_type 50030)
+    # controls report caret/value/text evidence as absent on an empty field
+    # and start reporting it once the field holds text. Identity (runtime id,
+    # class, control type) does not change; insertion must not abort.
+    initial = _document_target(value_writable=True, text_editable=True, caret_active=False)
+    after_first_batch = _document_target(
+        value_writable=False, text_editable=False, caret_active=True
+    )
+    backend = FakeBackend(
+        [initial, initial, after_first_batch, after_first_batch, after_first_batch]
+    )
+    clipboard = FakeClipboard()
+    text = "x" * 300
+
+    outcome = send_text(
+        text, initial, backend=backend, clipboard=clipboard, sleeper=lambda _seconds: None
+    )
+
+    assert outcome.status is InputStatus.INSERTED_UNICODE
+    assert outcome.success
+    assert outcome.characters_sent == 300
+
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_kind", "expected_field"),
+    [
+        (lambda base: _document_target(hwnd=base.hwnd + 1), "window", "hwnd"),
+        (lambda base: _document_target(pid=base.pid + 1), "window", "pid"),
+        (lambda base: _document_target(runtime_id=(9, 9)), "control", "runtime_id"),
+        (lambda base: _document_target(class_name="Other"), "control", "class_name"),
+        (lambda base: _document_target(control_type=50004), "control", "control_type"),
+    ],
+)
+def test_identity_change_mid_insertion_stops_and_logs(
+    mutate,
+    expected_kind: str,
+    expected_field: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = _document_target()
+    changed = mutate(base)
+    backend = FakeBackend([base, base, changed])
+    clipboard = FakeClipboard()
+
+    with caplog.at_level(logging.INFO, logger="pressay.windows_input"):
+        outcome = send_text(
+            "x" * 200,
+            base,
+            backend=backend,
+            clipboard=clipboard,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert outcome.status is InputStatus.TARGET_MISMATCH
+    assert outcome.characters_sent == 96
+
+    mismatch_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "insertion_target_mismatch" in record.getMessage()
+    ]
+    assert len(mismatch_lines) == 1
+    assert f"kind={expected_kind}" in mismatch_lines[0]
+    assert expected_field in mismatch_lines[0]
+
+
+def test_focus_unavailable_mid_insertion_logs_focus_unavailable_kind(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = _document_target()
+    unavailable = ForegroundTarget(
+        hwnd=base.hwnd, pid=base.pid, focused_control=_FOCUS_UNAVAILABLE
+    )
+    backend = FakeBackend([base, base, unavailable])
+    clipboard = FakeClipboard()
+
+    with caplog.at_level(logging.INFO, logger="pressay.windows_input"):
+        outcome = send_text(
+            "x" * 200,
+            base,
+            backend=backend,
+            clipboard=clipboard,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert outcome.status is InputStatus.TARGET_MISMATCH
+    mismatch_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "insertion_target_mismatch" in record.getMessage()
+    ]
+    assert len(mismatch_lines) == 1
+    assert "kind=focus_unavailable" in mismatch_lines[0]
+    assert "fields=-" in mismatch_lines[0]
+
+
+def test_snapshot_failure_mid_insertion_logs_snapshot_failed_kind(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = _document_target()
+
+    class _FailingSnapshotBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__([base])
+            self.calls = 0
+
+        def snapshot_foreground_target(self) -> ForegroundTarget:
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("probe failed")
+            return base
+
+    backend = _FailingSnapshotBackend()
+    clipboard = FakeClipboard()
+
+    with caplog.at_level(logging.INFO, logger="pressay.windows_input"):
+        outcome = send_text(
+            "x" * 200,
+            base,
+            backend=backend,
+            clipboard=clipboard,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert outcome.status is InputStatus.TARGET_MISMATCH
+    mismatch_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "insertion_target_mismatch" in record.getMessage()
+    ]
+    assert len(mismatch_lines) == 1
+    assert "kind=snapshot_failed" in mismatch_lines[0]
+    assert "fields=-" in mismatch_lines[0]
+
+
+def test_target_mismatch_log_omits_window_title_and_dictated_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker_title = "SECRET-TITLE-MARKER"
+    marker_text_unit = "SECRET-TEXT-MARKER"
+    base = _document_target(title=marker_title)
+    changed = _document_target(title=marker_title, class_name="Other")
+    backend = FakeBackend([base, base, changed])
+    clipboard = FakeClipboard()
+    text = (marker_text_unit * 6)[:200]
+
+    with caplog.at_level(logging.INFO, logger="pressay.windows_input"):
+        outcome = send_text(
+            text,
+            base,
+            backend=backend,
+            clipboard=clipboard,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert outcome.status is InputStatus.TARGET_MISMATCH
+    full_log = "\n".join(record.getMessage() for record in caplog.records)
+    assert marker_title not in full_log
+    assert marker_text_unit not in full_log
+    assert "insertion_target_mismatch" in full_log
+
+
+def test_evidence_flags_changed_log_is_emitted_once_per_insertion(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    initial = _document_target(value_writable=True, text_editable=True, caret_active=False)
+    after_first_batch = _document_target(
+        value_writable=False, text_editable=False, caret_active=True
+    )
+    backend = FakeBackend(
+        [initial, initial, after_first_batch, after_first_batch, after_first_batch]
+    )
+    clipboard = FakeClipboard()
+
+    with caplog.at_level(logging.DEBUG, logger="pressay.windows_input"):
+        outcome = send_text(
+            "x" * 300,
+            initial,
+            backend=backend,
+            clipboard=clipboard,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert outcome.success
+    flag_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "insertion_target_flags_changed" in record.getMessage()
+    ]
+    assert len(flag_lines) == 1
+    assert "value_writable" in flag_lines[0]
+    assert "text_editable" in flag_lines[0]
+    assert "caret_active" in flag_lines[0]

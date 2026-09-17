@@ -3,6 +3,7 @@ set -euo pipefail
 
 model="small"
 skip_model=0
+skip_gigaam=0
 enable_autostart=0
 no_launch=0
 
@@ -10,10 +11,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --model) model="${2:?--model requires a value}"; shift 2 ;;
     --skip-model) skip_model=1; shift ;;
+    --skip-gigaam) skip_gigaam=1; shift ;;
     --enable-autostart) enable_autostart=1; shift ;;
     --no-launch) no_launch=1; shift ;;
     -h|--help)
-      echo "Usage: bash scripts/install-macos.sh [--model small] [--skip-model] [--enable-autostart] [--no-launch]"
+      echo "Usage: bash scripts/install-macos.sh [--model small] [--skip-model] [--skip-gigaam] [--enable-autostart] [--no-launch]"
       exit 0
       ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -28,6 +30,7 @@ fi
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 setup_args=(--model "${model}")
 if [[ "${skip_model}" -eq 1 ]]; then setup_args+=(--skip-model); fi
+if [[ "${skip_gigaam}" -eq 1 ]]; then setup_args+=(--skip-gigaam); fi
 bash "${project_root}/scripts/setup-macos.sh" "${setup_args[@]}"
 
 applications_root="${HOME}/Applications"
@@ -72,7 +75,7 @@ cat > "${contents}/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Pressay</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.6.6</string>
+  <key>CFBundleShortVersionString</key><string>0.6.7</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>

@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from . import model_setup as model_setup_module
+from .config import AppConfig
 from .platform_support import is_macos, is_windows, platform_label, user_data_directory
 
 
@@ -134,7 +136,39 @@ def _model_cache_check(model: str) -> Check:
     )
 
 
-def collect_checks(model: str = "turbo") -> tuple[list[Check], list[dict[str, Any]]]:
+def _gigaam_check(config: AppConfig) -> Check:
+    """Report GigaAM readiness without loading the model or touching the network."""
+
+    onnx_asr_check = _module_check("onnx_asr")
+    if not onnx_asr_check.ok:
+        return Check(
+            "gigaam",
+            config.russian_engine != "gigaam",
+            f"onnx-asr is not installed ({onnx_asr_check.detail}); Russian dictation "
+            "falls back to Whisper. Reinstall Pressay to get it.",
+            "optional",
+        )
+    if not model_setup_module.gigaam_model_ready(config.gigaam_model):
+        return Check(
+            "gigaam",
+            config.russian_engine != "gigaam",
+            f"GigaAM model {config.gigaam_model!r} is not cached yet; Russian dictation "
+            "falls back to Whisper until you run `python -m pressay.model_setup`.",
+            "optional",
+        )
+    return Check(
+        "gigaam",
+        True,
+        f"GigaAM model {config.gigaam_model!r} is cached (russian_engine={config.russian_engine!r}).",
+        "optional",
+    )
+
+
+def collect_checks(
+    model: str = "turbo", *, config: AppConfig | None = None
+) -> tuple[list[Check], list[dict[str, Any]]]:
+    if config is None:
+        config = AppConfig.load()
     checks = [
         Check(
             "platform",
@@ -147,6 +181,7 @@ def collect_checks(model: str = "turbo") -> tuple[list[Check], list[dict[str, An
         _module_check("faster_whisper"),
         _module_check("PySide6"),
         _model_cache_check(model),
+        _gigaam_check(config),
     ]
     if is_windows():
         checks.extend(
