@@ -18,11 +18,14 @@ from .audio import (
     AudioRecorder,
     AudioTooShortError,
     SilentAudioError,
+    TARGET_SAMPLE_RATE,
+    describe_level,
     normalize_device_selector,
 )
 from .config import AppConfig
 from .state import SessionState
 from .text import process_transcript
+from .gigaam import EngineUnavailable, GigaAmTranscriber
 from .transcriber import (
     FasterWhisperTranscriber,
     ModelLoadError,
@@ -97,6 +100,38 @@ def _insertion_status_text(reason: str, bindings: Any | None = None) -> str:
     }:
         return "Не вставлено: поле ввода не определено"
     return "Не вставлено — текст сохранён ниже"
+
+
+def _insertion_failure_reason_text(reason: str) -> str:
+    """One human sentence explaining why automatic insertion failed.
+
+    The tray notification used to receive the raw adapter reason code, so
+    people saw ``focused_control_is_not_editable`` verbatim in a toast.  Codes
+    stay in the log; the notification gets a sentence.
+    """
+
+    if reason in {
+        "foreground_target_changed",
+        "foreground_target_changed_before_enter",
+        "target_mismatch",
+        "target_guard_failed",
+    }:
+        return "Пока шло распознавание, сменилось активное окно."
+    if reason == "focused_control_is_not_editable":
+        return "Pressay не нашёл поле ввода там, где стоял курсор."
+    if reason == "physical_modifiers_not_released":
+        return "Вставка отменена: клавиши сочетания ещё были зажаты."
+    if reason in {
+        "recording_target_required",
+        "foreground_snapshot_failed",
+        "no_foreground_window",
+    }:
+        return "Не удалось определить окно для вставки."
+    return "Текст не удалось вставить."
+
+
+def _paste_shortcut() -> str:
+    return "Cmd+V" if is_macos() else "Ctrl+V"
 
 
 def _duration_limit_notification_text(max_duration_seconds: float) -> str:
@@ -231,6 +266,7 @@ class DictationController:
         self._recorder: AudioRecorder | None = None
         self._transcriber: FasterWhisperTranscriber | None = None
         self._translator: FasterWhisperTranscriber | None = None
+        self._gigaam: GigaAmTranscriber | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pressay-asr")
         self._future: Future[Any] | None = None
         self._warmup_future: Future[Any] | None = None
@@ -339,6 +375,40 @@ class DictationController:
             return "Скопируйте его кнопкой в окне Pressay."
         return f"Скопируйте его кнопкой или {shortcut}."
 
+    def _copy_after_failed_insertion(
+        self,
+        text: str,
+        *,
+        enabled: bool,
+        session_id: int,
+        cancelled: Callable[[], bool],
+    ) -> tuple[bool, bool]:
+        """Put an undelivered transcript on the clipboard; return (attempted, copied).
+
+        Automatic delivery used to leave the clipboard alone on failure, so the
+        user had to notice the warning and press the copy hotkey.  It now copies
+        by default at the user's request; ``copy_on_insertion_failure`` restores
+        the old behaviour for anyone who keeps something valuable there.
+
+        The canonical transcript is copied, never the insertion text, which may
+        carry a smart-spacing suffix.  A stale or cancelled result is never
+        copied: overwriting the clipboard with an abandoned take would destroy
+        whatever was there for nothing.
+        """
+
+        if not enabled or not text:
+            return False, False
+        if cancelled() or not self._result_is_current(session_id):
+            return False, False
+        try:
+            outcome = self._copy_text(text)
+        except Exception as exc:  # noqa: BLE001 - a failed copy must not lose the result
+            LOGGER.warning("insertion_clipboard_fallback_failed: %s", type(exc).__name__)
+            return True, False
+        copied = bool(getattr(outcome, "success", False))
+        LOGGER.info("insertion_clipboard_fallback copied=%s", copied)
+        return True, copied
+
     def _new_recorder(self) -> AudioRecorder:
         return AudioRecorder(device=self._microphone_device())
 
@@ -389,11 +459,46 @@ class DictationController:
         except Exception:
             LOGGER.exception("translator_close_failed")
 
+    def _ensure_gigaam(self, model_name: str) -> GigaAmTranscriber:
+        """Return the resident Russian engine, rebuilding it if the model changed."""
+
+        if self._gigaam is None or self._gigaam.model_name != model_name:
+            self._dispose_gigaam()
+            self._gigaam = GigaAmTranscriber(model_name=model_name)
+        return self._gigaam
+
+    def _dispose_gigaam(self) -> None:
+        with self._lock:
+            engine = self._gigaam
+            self._gigaam = None
+        if engine is None:
+            return
+        try:
+            engine.close()
+        except Exception:
+            LOGGER.exception("gigaam_close_failed")
+
+    @staticmethod
+    def _gigaam_is_eligible(config: AppConfig, *, translating: bool) -> bool:
+        """GigaAM only runs when the user pinned Russian and did not ask to translate.
+
+        Routing on ``language="auto"`` would need a separate language detector;
+        Whisper's own detector is the thing we are trying to keep out of the hot
+        path, so ``auto`` deliberately stays on Whisper for now.
+        """
+
+        return (
+            not translating
+            and config.russian_engine == "gigaam"
+            and config.language == "ru"
+        )
+
     def _dispose_models(self) -> None:
         """Release both native model slots from the serialized ASR worker."""
 
         self._dispose_transcriber()
         self._dispose_translator()
+        self._dispose_gigaam()
 
     def warmup_model(self) -> bool:
         """Queue a local model preload without blocking the caller.
@@ -498,6 +603,17 @@ class DictationController:
                 self.notification_callback("Pressay", message, True)
             LOGGER.warning("model_warmup_failed: %s", type(exc).__name__)
             return
+
+        # Without this the user pays GigaAM's ~2.4 s load on their first
+        # dictation instead of at startup.  It runs on the same single worker,
+        # so it cannot race a transcription, and a failure here only costs that
+        # first-dictation delay -- Whisper is already warm and stays the
+        # fallback, so warmup must not be reported as broken.
+        if self._gigaam_is_eligible(self.config, translating=False):
+            try:
+                self._ensure_gigaam(self.config.gigaam_model).warmup()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("gigaam_warmup_failed: %s", type(exc).__name__)
 
         with self._warmup_status_gate:
             with self._lock:
@@ -1551,6 +1667,22 @@ class DictationController:
         with self._lock:
             if not self._job_is_active_locked(job.session_id):
                 return
+        # Emitted before transcription, not after, so a take that fails or is
+        # rejected still leaves its level behind.  Recognition quality on this
+        # machine swings between takes minutes apart and input level is the
+        # prime suspect; a diagnostic that only fires on success cannot see the
+        # bad ones.  Numbers only: no audio and no words reach the log.
+        try:
+            LOGGER.info(
+                "capture_level session=%d seconds=%.3f %s",
+                job.session_id,
+                len(job.audio) / TARGET_SAMPLE_RATE if len(job.audio) else 0.0,
+                describe_level(job.audio).as_log_fields(),
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never fail a dictation
+            LOGGER.debug("capture_level_failed", exc_info=True)
+
+        engine_used = "whisper"
         try:
             transcribe_options: dict[str, Any] = {"language": job.config.language}
             prompt = _initial_prompt(job.config.replacements)
@@ -1597,18 +1729,44 @@ class DictationController:
                             **transcribe_options,
                         )
             else:
-                selected_transcriber = self._ensure_transcriber(job.config.model)
-                if translating:
-                    result = selected_transcriber.transcribe(
-                        job.audio,
-                        task="translate",
-                        **transcribe_options,
-                    )
-                else:
-                    result = selected_transcriber.transcribe(
-                        job.audio,
-                        **transcribe_options,
-                    )
+                result = None
+                if self._gigaam_is_eligible(job.config, translating=translating):
+                    # GigaAM refuses anything it would handle worse than Whisper
+                    # (over ~25 s, wrong language); those raise EngineUnavailable
+                    # and fall through to Whisper below without losing the take.
+                    try:
+                        result = self._ensure_gigaam(
+                            job.config.gigaam_model
+                        ).transcribe(job.audio, **transcribe_options)
+                        engine_used = "gigaam"
+                    except NoSpeechDetected:
+                        # A deliberate verdict, not a malfunction: re-running the
+                        # same silence through Whisper would only cost latency.
+                        raise
+                    except EngineUnavailable as exc:
+                        LOGGER.info("gigaam_declined reason=%s", exc)
+                    except ModelLoadError:
+                        LOGGER.exception("gigaam_load_failed falling_back=whisper")
+                        self._dispose_gigaam()
+                    except Exception:  # noqa: BLE001
+                        # onnxruntime can fail mid-inference.  Losing the take
+                        # here would throw away speech the user already gave us,
+                        # so drop the engine and let Whisper finish the job.
+                        LOGGER.exception("gigaam_inference_failed falling_back=whisper")
+                        self._dispose_gigaam()
+                if result is None:
+                    selected_transcriber = self._ensure_transcriber(job.config.model)
+                    if translating:
+                        result = selected_transcriber.transcribe(
+                            job.audio,
+                            task="translate",
+                            **transcribe_options,
+                        )
+                    else:
+                        result = selected_transcriber.transcribe(
+                            job.audio,
+                            **transcribe_options,
+                        )
             postprocess_started = time.perf_counter()
             processed = process_transcript(
                 result.text,
@@ -1652,14 +1810,17 @@ class DictationController:
 
         timings = getattr(result, "timings", None)
         LOGGER.info(
-            "transcription_completed language=%s device=%s compute=%s "
+            "transcription_completed engine=%s language=%s device=%s compute=%s "
             "audio_seconds=%.3f vad_used=%s load_seconds=%.3f inference_seconds=%.3f "
             "total_seconds=%.3f characters=%d task=%s language_choice=%s",
+            engine_used,
             getattr(result, "language", "unknown"),
             getattr(result, "device", "unknown"),
             getattr(result, "compute_type", "unknown"),
             float(getattr(result, "audio_duration_seconds", 0.0) or 0.0),
-            job.vad_used is not False,
+            # GigaAM has no VAD stage at all, so reporting the requested flag
+            # would claim filtering that never happened.
+            engine_used == "whisper" and job.vad_used is not False,
             float(getattr(timings, "model_load_seconds", 0.0) or 0.0),
             float(getattr(timings, "inference_seconds", 0.0) or 0.0),
             float(getattr(timings, "total_seconds", 0.0) or 0.0),
@@ -1694,6 +1855,7 @@ class DictationController:
                 press_enter=processed.press_enter,
                 auto_insert=job.config.auto_insert,
                 smart_spacing=job.config.smart_spacing,
+                copy_on_failure=job.config.copy_on_insertion_failure,
                 session_id=job.session_id,
                 cancelled=lambda: self._delivery_cancelled(job),
                 display_only=job.display_only,
@@ -1732,6 +1894,7 @@ class DictationController:
         press_enter: bool,
         auto_insert: bool,
         smart_spacing: bool,
+        copy_on_failure: bool,
         session_id: int,
         cancelled: Callable[[], bool],
         display_only: bool,
@@ -1776,15 +1939,31 @@ class DictationController:
             LOGGER.warning("insertion_failed: %s", type(exc).__name__)
             if cancelled() or not self._result_is_current(session_id):
                 return
-            self.status_callback("Не вставлено — текст сохранён ниже", "warning")
+            attempted, copied = self._copy_after_failed_insertion(
+                text,
+                enabled=copy_on_failure,
+                session_id=session_id,
+                cancelled=cancelled,
+            )
             if cancelled() or not self._result_is_current(session_id):
                 return
-            self.notification_callback(
-                "Pressay",
-                "Автовставка не сработала; текст сохранён в окне Pressay. "
-                + self._copy_hint_sentence(),
-                True,
-            )
+            if copied:
+                self.status_callback("Не вставлено — текст скопирован в буфер", "warning")
+                notification = (
+                    "Автовставка не сработала. Текст скопирован в буфер обмена — "
+                    f"вставьте его вручную ({_paste_shortcut()})."
+                )
+            else:
+                self.status_callback("Не вставлено — текст сохранён ниже", "warning")
+                notification = (
+                    "Автовставка не сработала. "
+                    + ("Скопировать в буфер обмена не удалось. " if attempted else "")
+                    + "Текст сохранён в окне Pressay. "
+                    + self._copy_hint_sentence()
+                )
+            if cancelled() or not self._result_is_current(session_id):
+                return
+            self.notification_callback("Pressay", notification, True)
             return
         status_value = getattr(getattr(outcome, "status", None), "value", None)
         LOGGER.info(
@@ -1805,14 +1984,34 @@ class DictationController:
             if cancelled() or not self._result_is_current(session_id):
                 return
             reason = str(getattr(outcome, "reason", "Целевое окно изменилось"))
-            if cancelled() or not self._result_is_current(session_id):
-                return
-            self.status_callback(
-                _insertion_status_text(reason, self.config.hotkeys), "warning"
+            attempted, copied = self._copy_after_failed_insertion(
+                text,
+                enabled=copy_on_failure,
+                session_id=session_id,
+                cancelled=cancelled,
             )
             if cancelled() or not self._result_is_current(session_id):
                 return
-            self.notification_callback("Pressay", reason, True)
+            reason_sentence = _insertion_failure_reason_text(reason)
+            if copied:
+                self.status_callback("Не вставлено — текст скопирован в буфер", "warning")
+                notification = (
+                    f"{reason_sentence} Текст скопирован в буфер обмена — "
+                    f"вставьте его вручную ({_paste_shortcut()})."
+                )
+            else:
+                self.status_callback(
+                    _insertion_status_text(reason, self.config.hotkeys), "warning"
+                )
+                notification = (
+                    f"{reason_sentence} "
+                    + ("Скопировать в буфер обмена не удалось. " if attempted else "")
+                    + "Текст сохранён в окне Pressay. "
+                    + self._copy_hint_sentence()
+                )
+            if cancelled() or not self._result_is_current(session_id):
+                return
+            self.notification_callback("Pressay", notification, True)
 
     @staticmethod
     def _copy_text(text: str) -> Any:

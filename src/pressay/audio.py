@@ -423,6 +423,93 @@ def audio_rms(audio: Any) -> float:
     return float(np.sqrt(np.mean(values * values)))
 
 
+#: Peak levels that separate a usable dictation from one the model will struggle
+#: with.  Calibrated against this machine after the Realtek microphone APO (and
+#: with it the automatic gain control) was disabled: normal speech peaks around
+#: -12 dBFS, while captures below -30 dBFS measurably cost Whisper its
+#: punctuation and capitalisation.
+QUIET_PEAK_DBFS = -30.0
+SILENT_PEAK_DBFS = -55.0
+LOUD_PEAK_DBFS = -3.0
+
+
+@dataclass(frozen=True, slots=True)
+class LevelReport:
+    """Loudness of one capture, in numbers only — never audio, never words.
+
+    Recognition quality on this machine varies between takes minutes apart, and
+    input level is the prime suspect.  Nothing in the pipeline recorded it, so
+    every diagnosis had to argue from transcript length; this closes that gap
+    without putting anything private in the log.
+    """
+
+    peak_dbfs: float
+    rms_dbfs: float
+    clipped_samples: int
+    verdict: str
+
+    def as_log_fields(self) -> str:
+        return (
+            f"peak_dbfs={self.peak_dbfs:.1f} rms_dbfs={self.rms_dbfs:.1f} "
+            f"clipped={self.clipped_samples} level={self.verdict}"
+        )
+
+
+#: Peak the recogniser sees after normalisation.  Whisper and GigaAM both read
+#: raw amplitude, and on this machine speech arrives 20-30 dB below where the
+#: models were trained; scaling to a fixed peak measurably restores punctuation
+#: and capitalisation that Whisper otherwise drops.
+DEFAULT_TARGET_PEAK = 0.5
+
+#: Below this peak a capture is treated as silence rather than amplified --
+#: normalising pure noise by 60 dB only invents hallucinations.
+MIN_NORMALISABLE_PEAK = 1e-4
+
+
+def normalize_peak(
+    audio: np.ndarray, target_peak: float = DEFAULT_TARGET_PEAK
+) -> tuple[np.ndarray, float]:
+    """Scale ``audio`` so its loudest sample sits at ``target_peak``.
+
+    Returns the scaled waveform and the gain applied.  Silence is passed through
+    untouched (gain ``1.0``) so callers can still reject it as silence.
+    """
+
+    samples = np.asarray(audio, dtype=np.float32)
+    peak = float(np.abs(samples).max()) if samples.size else 0.0
+    if peak < MIN_NORMALISABLE_PEAK or target_peak <= 0:
+        return samples, 1.0
+    gain = float(target_peak / peak)
+    return np.clip(samples * gain, -1.0, 1.0).astype(np.float32), gain
+
+
+def _to_dbfs(value: float) -> float:
+    return -120.0 if value <= 1e-6 else float(20.0 * np.log10(value))
+
+
+def describe_level(audio: Any) -> LevelReport:
+    """Measure how loud a capture is, and judge whether that will hurt the model."""
+
+    samples = _mono_float32(audio)
+    if samples.size == 0:
+        return LevelReport(-120.0, -120.0, 0, "silent")
+    values = samples.astype(np.float64, copy=False)
+    peak = float(np.abs(values).max())
+    peak_dbfs = _to_dbfs(peak)
+    rms_dbfs = _to_dbfs(float(np.sqrt(np.mean(values * values))))
+    clipped = int(np.count_nonzero(np.abs(values) >= 0.999))
+
+    if clipped > 0 and peak_dbfs >= LOUD_PEAK_DBFS:
+        verdict = "clipping"
+    elif peak_dbfs < SILENT_PEAK_DBFS:
+        verdict = "silent"
+    elif peak_dbfs < QUIET_PEAK_DBFS:
+        verdict = "quiet"
+    else:
+        verdict = "normal"
+    return LevelReport(peak_dbfs, rms_dbfs, clipped, verdict)
+
+
 def resample_audio(
     audio: Any,
     source_sample_rate: int | float,

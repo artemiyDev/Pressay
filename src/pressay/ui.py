@@ -593,6 +593,16 @@ class SettingsWindow(QMainWindow):
             "Добавлять пробел между последовательными диктовками"
         )
         self.smart_spacing_checkbox.setChecked(bool(settings.get("smart_spacing", True)))
+        # Short like every other checkbox label here: at the 440 px minimum
+        # width a long label forced horizontal scrolling.  The detail lives in
+        # the wrapped hint placed right after it in the layout.
+        self.copy_on_insertion_failure_checkbox = QCheckBox("Копировать при сбое вставки")
+        self.copy_on_insertion_failure_checkbox.setToolTip(
+            "Копировать расшифровку в буфер обмена, если вставить её не удалось"
+        )
+        self.copy_on_insertion_failure_checkbox.setChecked(
+            bool(settings.get("copy_on_insertion_failure", True))
+        )
         self.remove_fillers_checkbox = QCheckBox("Удалять слова-паразиты")
         self.remove_fillers_checkbox.setToolTip(
             "Удалять только явные слова-паразиты"
@@ -633,6 +643,14 @@ class SettingsWindow(QMainWindow):
         )
         layout.addWidget(self.auto_insert_checkbox)
         layout.addWidget(self.smart_spacing_checkbox)
+        layout.addWidget(self.copy_on_insertion_failure_checkbox)
+        copy_on_insertion_failure_hint = QLabel(
+            "Если поле ввода не найдено или сменилось окно, расшифровка попадёт в "
+            "буфер обмена. Прежнее содержимое буфера при этом заменяется."
+        )
+        copy_on_insertion_failure_hint.setWordWrap(True)
+        self._hint_labels.append(copy_on_insertion_failure_hint)
+        layout.addWidget(copy_on_insertion_failure_hint)
         layout.addWidget(self.remove_fillers_checkbox)
         layout.addWidget(self.press_enter_checkbox)
         layout.addWidget(self.voice_formatting_checkbox)
@@ -993,6 +1011,7 @@ class SettingsWindow(QMainWindow):
             "resource_mode": self.resource_mode_combo.currentData(),
             "auto_insert": self.auto_insert_checkbox.isChecked(),
             "smart_spacing": self.smart_spacing_checkbox.isChecked(),
+            "copy_on_insertion_failure": self.copy_on_insertion_failure_checkbox.isChecked(),
             "remove_fillers": self.remove_fillers_checkbox.isChecked(),
             "press_enter": self.press_enter_checkbox.isChecked(),
             "voice_formatting": self.voice_formatting_checkbox.isChecked(),

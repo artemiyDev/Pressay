@@ -204,6 +204,7 @@ def test_target_width_has_no_horizontal_scroll_or_hidden_content(
             window.voice_translate_checkbox,
             window.push_to_talk_checkbox,
             window.strict_editable_check_checkbox,
+            window.copy_on_insertion_failure_checkbox,
             window.model_combo,
             window.clear_transcript_history_button,
         ):

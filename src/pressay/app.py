@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from logging.handlers import RotatingFileHandler
 import math
@@ -552,6 +552,7 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "resource_mode": config.resource_mode,
         "auto_insert": config.auto_insert,
         "smart_spacing": config.smart_spacing,
+        "copy_on_insertion_failure": config.copy_on_insertion_failure,
         "remove_fillers": config.remove_fillers,
         "press_enter": config.voice_press_enter,
         "voice_formatting": config.voice_formatting,
@@ -898,12 +899,20 @@ def main(argv: list[str] | None = None) -> int:
             window.update_status(message, "error")
             tray.notify("Pressay", message, warning=True)
             return
-        updated = AppConfig(
+        # replace() rather than AppConfig(): a hand-listed constructor silently
+        # resets every field the settings window does not know about, so saving
+        # settings once reverted russian_engine to its default and undid the
+        # documented way back to Whisper.  Anything absent here is carried over.
+        updated = replace(
+            config,
             model=str(values.get("model", config.model)),
             language=str(values.get("language", config.language)),
             microphone=microphone,
             auto_insert=bool(values.get("auto_insert", config.auto_insert)),
             smart_spacing=bool(values.get("smart_spacing", config.smart_spacing)),
+            copy_on_insertion_failure=bool(
+                values.get("copy_on_insertion_failure", config.copy_on_insertion_failure)
+            ),
             remove_fillers=bool(values.get("remove_fillers", config.remove_fillers)),
             voice_press_enter=bool(values.get("press_enter", config.voice_press_enter)),
             voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),

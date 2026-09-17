@@ -13,6 +13,7 @@ function Get-PressayWindowsRuntimeDependencySpecs {
     return [string[]]@(
         "faster-whisper>=1.2.1,<2",
         "numpy>=1.26,<3",
+        "onnx-asr[hub]>=0.12,<1",
         "PySide6>=6.8,<7",
         "pywin32>=306",
         "sounddevice>=0.5.1,<1",

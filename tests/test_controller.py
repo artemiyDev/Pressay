@@ -1041,11 +1041,13 @@ def test_auto_insert_disabled_never_mutates_clipboard(monkeypatch) -> None:
 
 
 def test_auto_insert_failure_keeps_result_without_copying(monkeypatch) -> None:
+    # С 0.6.5 копирование при отказе включено по умолчанию. Этот тест
+    # охраняет прежнее поведение как выключаемую опцию.
     statuses: list[tuple[str, str]] = []
     notifications: list[tuple[object, ...]] = []
     copied: list[str] = []
     controller = DictationController(
-        AppConfig(auto_insert=True),
+        AppConfig(auto_insert=True, copy_on_insertion_failure=False),
         status_callback=lambda text, state: statuses.append((text, state)),
         result_callback=lambda *_args: None,
         notification_callback=lambda *args: notifications.append(args),
@@ -1070,16 +1072,22 @@ def test_auto_insert_failure_keeps_result_without_copying(monkeypatch) -> None:
     assert copied == []
     assert controller.last_transcript == "тестовая фраза"
     assert statuses[-1] == ("Не вставлено: сменилось активное окно", "warning")
-    assert notifications and notifications[-1][1] == "foreground_target_changed"
+    # Раньше здесь закреплялся сырой код причины как текст уведомления: он
+    # уходил прямо в трей. Теперь в уведомлении человеческая фраза.
+    assert notifications
+    assert "foreground_target_changed" not in str(notifications[-1][1])
+    assert "сменилось активное окно" in str(notifications[-1][1])
+    assert hotkey_hint("copy") in str(notifications[-1][1])
     controller.close()
 
 
 def test_auto_insert_exception_keeps_result_without_copying(monkeypatch) -> None:
+    # Прежнее поведение как выключаемая опция, см. тест выше.
     statuses: list[tuple[str, str]] = []
     notifications: list[tuple[object, ...]] = []
     copied: list[str] = []
     controller = DictationController(
-        AppConfig(auto_insert=True),
+        AppConfig(auto_insert=True, copy_on_insertion_failure=False),
         status_callback=lambda text, state: statuses.append((text, state)),
         result_callback=lambda *_args: None,
         notification_callback=lambda *args: notifications.append(args),
@@ -1724,3 +1732,119 @@ def test_prepare_capture_is_a_noop_while_prearm_is_disabled() -> None:
 
     assert controller.prepare_capture() is False
     assert calls == []
+
+
+def _failing_insertion_controller(monkeypatch, *, config: AppConfig, send_text, copy_text):
+    statuses: list[tuple[str, str]] = []
+    notifications: list[tuple[object, ...]] = []
+    controller = DictationController(
+        config,
+        status_callback=lambda text, state: statuses.append((text, state)),
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *args: notifications.append(args),
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+    monkeypatch.setattr(controller, "_copy_text", copy_text)
+    monkeypatch.setattr("pressay.windows_input.send_text", send_text)
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+    return controller, statuses, notifications
+
+
+def test_failed_insertion_copies_the_canonical_transcript_by_default(monkeypatch) -> None:
+    """«Поле не найдено» — расшифровка оказывается в буфере без правок вставки."""
+
+    inserted: list[str] = []
+    copied: list[str] = []
+
+    def refuse(text, **_kwargs):
+        inserted.append(text)
+        return SimpleNamespace(success=False, reason="focused_control_is_not_editable")
+
+    def copy(text):
+        copied.append(text)
+        return SimpleNamespace(success=True)
+
+    controller, statuses, notifications = _failing_insertion_controller(
+        monkeypatch, config=AppConfig(auto_insert=True), send_text=refuse, copy_text=copy
+    )
+    try:
+        # В поле уходил текст с пробелом от «умных пробелов», в буфер — без него.
+        assert inserted == ["тестовая фраза "]
+        assert copied == ["тестовая фраза"]
+        assert statuses[-1] == ("Не вставлено — текст скопирован в буфер", "warning")
+        message = str(notifications[-1][1])
+        assert "скопирован в буфер обмена" in message
+        assert "поле ввода" in message
+        assert "focused_control_is_not_editable" not in message
+        assert controller.last_transcript == "тестовая фраза"
+    finally:
+        controller.close()
+
+
+def test_insertion_exception_copies_the_transcript_by_default(monkeypatch) -> None:
+    copied: list[str] = []
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("simulated input failure")
+
+    def copy(text):
+        copied.append(text)
+        return SimpleNamespace(success=True)
+
+    controller, statuses, notifications = _failing_insertion_controller(
+        monkeypatch, config=AppConfig(auto_insert=True), send_text=explode, copy_text=copy
+    )
+    try:
+        assert copied == ["тестовая фраза"]
+        assert statuses[-1] == ("Не вставлено — текст скопирован в буфер", "warning")
+        assert "скопирован в буфер обмена" in str(notifications[-1][1])
+    finally:
+        controller.close()
+
+
+def test_failed_copy_is_reported_instead_of_claimed(monkeypatch) -> None:
+    """Если буфер недоступен, нельзя писать «скопировано» — вставят старое."""
+
+    def refuse(*_args, **_kwargs):
+        return SimpleNamespace(success=False, reason="foreground_target_changed")
+
+    def broken_clipboard(_text):
+        raise RuntimeError("clipboard is locked by another process")
+
+    controller, statuses, notifications = _failing_insertion_controller(
+        monkeypatch,
+        config=AppConfig(auto_insert=True),
+        send_text=refuse,
+        copy_text=broken_clipboard,
+    )
+    try:
+        assert statuses[-1] == ("Не вставлено: сменилось активное окно", "warning")
+        message = str(notifications[-1][1])
+        assert "не удалось" in message
+        assert "скопирован в буфер обмена" not in message
+        assert hotkey_hint("copy") in message
+        assert controller.last_transcript == "тестовая фраза"
+    finally:
+        controller.close()
+
+
+def test_copy_reporting_unsuccessful_outcome_is_not_claimed_as_copied(monkeypatch) -> None:
+    def refuse(*_args, **_kwargs):
+        return SimpleNamespace(success=False, reason="focused_control_is_not_editable")
+
+    controller, statuses, notifications = _failing_insertion_controller(
+        monkeypatch,
+        config=AppConfig(auto_insert=True),
+        send_text=refuse,
+        copy_text=lambda _text: SimpleNamespace(success=False),
+    )
+    try:
+        assert statuses[-1][0] != "Не вставлено — текст скопирован в буфер"
+        assert "не удалось" in str(notifications[-1][1])
+    finally:
+        controller.close()

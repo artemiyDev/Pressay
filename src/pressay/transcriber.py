@@ -14,7 +14,13 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from .audio import TARGET_SAMPLE_RATE, audio_rms, resample_audio
+from .audio import (
+    DEFAULT_TARGET_PEAK,
+    TARGET_SAMPLE_RATE,
+    audio_rms,
+    normalize_peak,
+    resample_audio,
+)
 
 
 class TranscriptionError(RuntimeError):
@@ -274,6 +280,7 @@ class FasterWhisperTranscriber:
         log_prob_threshold: float = -1.0,
         min_audio_seconds: float = 0.10,
         silence_rms_threshold: float = 0.00001,
+        target_peak: float = DEFAULT_TARGET_PEAK,
         local_files_only: bool = True,
         model_factory: ModelFactory | None = None,
         model_downloader: ModelDownloader | None = None,
@@ -305,6 +312,7 @@ class FasterWhisperTranscriber:
         self.log_prob_threshold = float(log_prob_threshold)
         self.min_audio_seconds = float(min_audio_seconds)
         self.silence_rms_threshold = float(silence_rms_threshold)
+        self.target_peak = float(target_peak)
         self.local_files_only = bool(local_files_only)
         self._model_factory = model_factory or _default_model_factory
         self._model_downloader = model_downloader or _default_model_downloader
@@ -689,6 +697,14 @@ class FasterWhisperTranscriber:
             raise NoSpeechDetected("Audio is silent")
         if sample_rate != TARGET_SAMPLE_RATE:
             samples = resample_audio(samples, sample_rate, TARGET_SAMPLE_RATE)
+
+        # Measured on this machine's own recordings: at the ~-45 dBFS this
+        # microphone produces since its APO (and its automatic gain control) was
+        # disabled, Whisper drops punctuation and capitalisation outright, and
+        # recovers both once the peak is scaled.  Applied here rather than only
+        # in the GigaAM engine so that switching engines does not silently
+        # switch loudness handling too.
+        samples, _gain = normalize_peak(samples, self.target_peak)
 
         load_seconds = 0.0
         inference_seconds = 0.0

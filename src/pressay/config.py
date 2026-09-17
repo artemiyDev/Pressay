@@ -26,6 +26,15 @@ SUPPORTED_LANGUAGES = frozenset({"auto", "ru", "en"})
 SUPPORTED_RESOURCE_MODES = frozenset({"instant", "balanced", "eco"})
 SUPPORTED_TRANSLATE_MODELS = frozenset({"small", "medium", "large-v3"})
 
+#: Which engine transcribes Russian.  GigaAM v3 e2e is Russian-only but measured
+#: two to four times faster on the CPU than Whisper on the GPU here, and emits
+#: punctuation natively; Whisper stays the fallback and owns English.
+SUPPORTED_RUSSIAN_ENGINES = frozenset({"whisper", "gigaam"})
+
+#: Only the end-to-end heads are offered: the plain CTC/RNN-T ones return
+#: lowercase text with no punctuation, which dictation would have to undo.
+SUPPORTED_GIGAAM_MODELS = frozenset({"gigaam-v3-e2e-rnnt", "gigaam-v3-e2e-ctc"})
+
 
 class ConfigError(ValueError):
     """Raised when a configuration file cannot be read or validated."""
@@ -123,12 +132,18 @@ class AppConfig:
     microphone: str | int | None = None
     auto_insert: bool = True
     smart_spacing: bool = True
+    # When automatic insertion fails, put the transcript on the clipboard.  On
+    # by default because the user asked for it; the cost is that whatever was
+    # on the clipboard before is replaced, so it stays switchable.
+    copy_on_insertion_failure: bool = True
     remove_fillers: bool = False
     voice_press_enter: bool = False
     voice_formatting: bool = False
     voice_translate: bool = False
     prearm_capture: bool = False
     translate_model: str = "large-v3"
+    russian_engine: str = "gigaam"
+    gigaam_model: str = "gigaam-v3-e2e-rnnt"
     strict_editable_check: bool = False
     resource_mode: str = "instant"
     snippets: dict[str, str] = field(default_factory=dict)
@@ -175,6 +190,21 @@ class AppConfig:
                 "small, medium, large-v3 (turbo не поддерживает перевод)"
             )
 
+        russian_engine = _non_empty_string(
+            raw.get("russian_engine", defaults.russian_engine), "russian_engine"
+        ).casefold()
+        if russian_engine not in SUPPORTED_RUSSIAN_ENGINES:
+            raise ConfigError("russian_engine must be one of: whisper, gigaam")
+
+        gigaam_model = _non_empty_string(
+            raw.get("gigaam_model", defaults.gigaam_model), "gigaam_model"
+        )
+        if gigaam_model not in SUPPORTED_GIGAAM_MODELS:
+            raise ConfigError(
+                "gigaam_model должен быть одной из моделей: "
+                + ", ".join(sorted(SUPPORTED_GIGAAM_MODELS))
+            )
+
         microphone = raw.get("microphone", defaults.microphone)
         if type(microphone) is int:
             if microphone < 0:
@@ -189,6 +219,12 @@ class AppConfig:
             auto_insert=_bool(raw.get("auto_insert", defaults.auto_insert), "auto_insert"),
             smart_spacing=_bool(
                 raw.get("smart_spacing", defaults.smart_spacing), "smart_spacing"
+            ),
+            copy_on_insertion_failure=_bool(
+                raw.get(
+                    "copy_on_insertion_failure", defaults.copy_on_insertion_failure
+                ),
+                "copy_on_insertion_failure",
             ),
             remove_fillers=_bool(
                 raw.get("remove_fillers", defaults.remove_fillers), "remove_fillers"
@@ -209,6 +245,8 @@ class AppConfig:
                 "voice_translate",
             ),
             translate_model=translate_model,
+            russian_engine=russian_engine,
+            gigaam_model=gigaam_model,
             strict_editable_check=_bool(
                 raw.get("strict_editable_check", defaults.strict_editable_check),
                 "strict_editable_check",
