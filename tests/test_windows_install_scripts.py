@@ -489,6 +489,7 @@ def test_destructive_uninstall_refuses_before_shortcuts_but_shortcut_only_is_all
     assert all(path.exists() for path in preserved)
 
 
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
 def test_new_shortcut_gets_taskbar_app_user_model_id(tmp_path: Path) -> None:
     local_appdata = tmp_path / "app id local appdata"
     install_root = local_appdata / "Pressay"
@@ -508,6 +509,7 @@ def test_new_shortcut_gets_taskbar_app_user_model_id(tmp_path: Path) -> None:
     assert result.stdout.strip().splitlines()[-1] == "Pressay.Pressay"
 
 
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
 def test_shortcut_without_app_id_is_recreated_not_skipped(tmp_path: Path) -> None:
     local_appdata = tmp_path / "legacy id local appdata"
     install_root = local_appdata / "Pressay"
@@ -538,6 +540,7 @@ def test_shortcut_without_app_id_is_recreated_not_skipped(tmp_path: Path) -> Non
     assert result.stdout.strip().splitlines()[-1] == "Pressay.Pressay"
 
 
+@pytest.mark.skipif(not (Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").exists()), reason="Windows PowerShell required")
 def test_whisper_model_selection_prefers_explicit_then_config_then_default(
     tmp_path: Path,
 ) -> None:
