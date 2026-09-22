@@ -5,9 +5,11 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.6.8` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.6.8` указана в текущем исходном коде,
-но соответствующего тега выпуска пока нет.
+`0.6.9` is the version declared by the current source tree. Changes since
+0.3.0 are listed together under "Unreleased"; releases from 0.6.6 on are tagged
+`vX.Y.Z`. Версия `0.6.9` указана в текущем исходном коде. Изменения после 0.3.0
+собраны в разделе «Не выпущено»; выпуски начиная с 0.6.6 помечены тегами
+`vX.Y.Z`.
 
 ## Unreleased / Не выпущено
 
@@ -157,6 +159,21 @@ have a matching tagged release. Версия `0.6.8` указана в теку�
   AppUserModelID).
 - Панель задач Windows показывает значок Pressay, а не Python (явный
   AppUserModelID).
+- Pressay shortcuts (Start menu, desktop, autostart) carry the same
+  AppUserModelID, so a pinned taskbar icon groups with the running window.
+- Ярлыки Pressay (меню «Пуск», рабочий стол, автозагрузка) несут тот же
+  AppUserModelID: закреплённый значок в панели задач совпадает с окном.
+- The active-model line follows the Russian engine when it is switched in
+  settings, loaded on first dictation or reloaded after economy-mode unloading.
+  GigaAM is unloaded once it no longer applies (another engine or language).
+- Строка «Активна» следует за движком для русского: при переключении в
+  настройках, загрузке на первой диктовке и повторной загрузке после выгрузки в
+  экономном режиме. GigaAM выгружается из памяти, когда больше не используется
+  (другой движок или язык).
+- Setup prepares the Whisper model from the existing settings instead of always
+  `turbo`; an explicit `-Model` still wins.
+- Установка готовит модель Whisper из текущих настроек, а не всегда `turbo`;
+  явный `-Model` по-прежнему главнее.
 
 - On Windows, text longer than one 96-unit batch no longer stops after the
   first batch in Document-type fields (contenteditable editors in Chromium and

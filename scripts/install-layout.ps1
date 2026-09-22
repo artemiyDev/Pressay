@@ -87,7 +87,57 @@ function Get-PressayInstallLayout {
         # use RuntimeVersionsRoot for all new releases.
         RuntimeRoot = [System.IO.Path]::GetFullPath((Join-Path $root "venv"))
         IconPath = [System.IO.Path]::GetFullPath((Join-Path $root "pressay.ico"))
+        ConfigPath = [System.IO.Path]::GetFullPath((Join-Path $root "config.json"))
     }
+}
+
+function Get-PressayConfiguredWhisperModel {
+    [CmdletBinding()]
+    param(
+        [string]$LocalAppData = $env:LOCALAPPDATA,
+
+        [string]$FallbackModel = "turbo"
+    )
+
+    try {
+        $layout = Get-PressayInstallLayout -LocalAppData $LocalAppData
+    }
+    catch {
+        return $FallbackModel
+    }
+    if (-not (Test-Path -LiteralPath $layout.ConfigPath -PathType Leaf)) {
+        return $FallbackModel
+    }
+    try {
+        $config = [System.IO.File]::ReadAllText($layout.ConfigPath) | ConvertFrom-Json
+        $model = [string]$config.model
+    }
+    catch {
+        return $FallbackModel
+    }
+    if ([string]::IsNullOrWhiteSpace($model)) {
+        return $FallbackModel
+    }
+    return $model
+}
+
+function Get-PressayWhisperModelSelection {
+    [CmdletBinding()]
+    param(
+        [string]$LocalAppData = $env:LOCALAPPDATA,
+
+        [AllowNull()]
+        [string]$ExplicitModel = $null,
+
+        [string]$FallbackModel = "turbo"
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitModel)) {
+        return $ExplicitModel
+    }
+    return Get-PressayConfiguredWhisperModel `
+        -LocalAppData $LocalAppData `
+        -FallbackModel $FallbackModel
 }
 
 function Assert-PressayVersion {

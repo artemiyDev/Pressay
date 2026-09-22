@@ -11,6 +11,17 @@ Set-StrictMode -Version Latest
 $projectRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 . (Join-Path $PSScriptRoot "install-layout.ps1")
 
+# Only fall back to the user's already-configured model when -Model was not
+# passed explicitly; an explicit -Model (including one resolved by install.ps1)
+# always wins.
+$resolvedModel = if ($PSBoundParameters.ContainsKey('Model')) {
+    $Model
+}
+else {
+    Get-PressayWhisperModelSelection -ExplicitModel $null -FallbackModel $Model
+}
+Write-Host "Whisper model to prepare: $resolvedModel"
+
 $installerGuard = $null
 $appGuard = $null
 try {
@@ -102,7 +113,7 @@ try {
             }
             # pressay.model_setup prepares both the Whisper model and, unless
             # skipped, the GigaAM model used for Russian dictation, in one call.
-            $modelSetupArguments = @("-m", "pressay.model_setup", "--model", $Model)
+            $modelSetupArguments = @("-m", "pressay.model_setup", "--model", $resolvedModel)
             if ($SkipGigaam) {
                 $modelSetupArguments += "--skip-gigaam"
             }

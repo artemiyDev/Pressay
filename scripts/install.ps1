@@ -19,9 +19,19 @@ $autostartInstaller = Join-Path $PSScriptRoot "install-autostart.ps1"
 
 . $shortcutUtilities
 
+# Only fall back to the user's already-configured model when -Model was not
+# passed explicitly; an explicit -Model always wins. setup.ps1 then sees this
+# resolved value as its own explicit -Model, so it never re-reads the config.
+$resolvedModel = if ($PSBoundParameters.ContainsKey('Model')) {
+    $Model
+}
+else {
+    Get-PressayWhisperModelSelection -ExplicitModel $null -FallbackModel $Model
+}
+
 $setupParameters = @{
     Python = $Python
-    Model  = $Model
+    Model  = $resolvedModel
 }
 if ($SkipModel) {
     $setupParameters.SkipModel = $true

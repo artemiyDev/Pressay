@@ -740,3 +740,308 @@ def test_config_switch_away_from_gigaam_restores_whisper_label() -> None:
         controller.close()
 
     assert ("small", "cpu", "int8") in ready_calls
+
+
+class _GigaamFake:
+    """Минимальный резидентный GigaAM для тестов метки активной модели."""
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.active_device = "cpu"
+        self.active_compute_type = "float32"
+        self.closed = False
+
+    def warmup(self) -> None:
+        pass
+
+    def transcribe(self, *_a, **_k):
+        from pressay.transcriber import TranscriptionResult, TranscriptionTimings
+
+        return TranscriptionResult(
+            text="привет",
+            language="ru",
+            language_probability=0.9,
+            segments=(),
+            audio_duration_seconds=1.0,
+            timings=TranscriptionTimings(0.0, 0.01, 0.01),
+            device=self.active_device,
+            compute_type=self.active_compute_type,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_ineligible_to_eligible_switch_warms_gigaam_and_updates_label(monkeypatch) -> None:
+    """Переход whisper->gigaam при включённом preload прогревает GigaAM один раз."""
+
+    from dataclasses import replace
+
+    from pressay.controller import DictationController
+
+    config = AppConfig(language="ru", russian_engine="whisper", model="small")
+
+    class _WhisperStub:
+        model_size = config.model
+
+        def warmup(self):
+            return "cpu", "int8"
+
+        def close(self) -> None:
+            pass
+
+    ready_calls: list[tuple[str, str, str]] = []
+    controller = DictationController(
+        config,
+        status_callback=lambda *_a: None,
+        result_callback=lambda *_a: None,
+        notification_callback=lambda *_a: None,
+        model_ready_callback=lambda *args: ready_calls.append(args),
+    )
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: _WhisperStub())
+    build_calls: list[str] = []
+
+    def fake_ensure_gigaam(model_name: str):
+        build_calls.append(model_name)
+        return _GigaamFake(model_name)
+
+    monkeypatch.setattr(controller, "_ensure_gigaam", fake_ensure_gigaam)
+    try:
+        assert controller.warmup_model() is True
+        assert controller._warmup_future is not None
+        controller._warmup_future.result(timeout=2)
+        ready_calls.clear()
+
+        controller.update_config(replace(config, russian_engine="gigaam"))
+        # The standalone GigaAM warmup runs on the same serialized executor;
+        # submit a no-op and wait on it to know the warmup already finished.
+        controller._executor.submit(lambda: None).result(timeout=2)
+    finally:
+        controller.close()
+
+    assert build_calls == [config.gigaam_model]
+    assert ready_calls, "model_ready_callback не был вызван при переходе whisper->gigaam"
+    assert ready_calls[-1][0] == "GigaAM v3"
+    assert controller._active_label_is_gigaam is True
+
+
+def test_lazy_gigaam_load_announces_label_once(monkeypatch) -> None:
+    """Ленивая загрузка GigaAM (preload выключен) объявляет метку один раз за резидентность."""
+
+    from dataclasses import replace
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job1 = _worker_controller(config)
+    ready_calls: list[tuple[str, str, str]] = []
+    controller.model_ready_callback = lambda *args: ready_calls.append(args)
+
+    build_calls: list[str] = []
+
+    def fake_ensure_gigaam(model_name: str):
+        build_calls.append(model_name)
+        return _GigaamFake(model_name)
+
+    monkeypatch.setattr(controller, "_ensure_gigaam", fake_ensure_gigaam)
+    try:
+        controller._transcribe_worker(job1)
+        assert ready_calls == [("GigaAM v3", "cpu", "float32")]
+
+        controller.state = controller.state.start()
+        session_id2 = controller.state.session_id
+        controller.state = controller.state.begin_transcription(session_id2)
+        controller._session_cancelled = job1.cancelled
+        job2 = replace(job1, session_id=session_id2)
+        controller._transcribe_worker(job2)
+    finally:
+        controller.close()
+
+    assert len(build_calls) >= 1
+    assert ready_calls == [("GigaAM v3", "cpu", "float32")], (
+        "вторая успешная диктовка не должна повторять колбэк"
+    )
+
+
+def test_engine_unavailable_fallback_within_one_dictation_does_not_touch_label() -> None:
+    """Разовый откат на Whisper из-за EngineUnavailable не публикует метку."""
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job = _worker_controller(config)
+    ready_calls: list[tuple[str, str, str]] = []
+    controller.model_ready_callback = lambda *args: ready_calls.append(args)
+
+    class _EnglishOnly:
+        model_name = DEFAULT_MODEL
+
+        def transcribe(self, *_a, **_k):
+            raise EngineUnavailable("GigaAM handles Russian only")
+
+        def close(self) -> None:
+            pass
+
+    controller._gigaam = _EnglishOnly()
+    whisper_calls: list[dict] = []
+    controller._transcriber = _whisper_stub(config, whisper_calls)
+    try:
+        controller._transcribe_worker(job)
+    finally:
+        controller.close()
+
+    assert whisper_calls, "речь потеряна: Whisper даже не позвали"
+    assert ready_calls == []
+    assert controller._active_label_is_gigaam is False
+
+
+def test_eligible_to_ineligible_disposes_gigaam_and_restores_whisper_label() -> None:
+    """gigaam->whisper освобождает резидентный GigaAM через executor."""
+
+    from dataclasses import replace
+
+    from pressay.controller import DictationController
+
+    config = AppConfig(language="ru", russian_engine="gigaam", model="small")
+    ready_calls: list[tuple[str, str, str]] = []
+    controller = DictationController(
+        config,
+        status_callback=lambda *_a: None,
+        result_callback=lambda *_a: None,
+        notification_callback=lambda *_a: None,
+        model_ready_callback=lambda *args: ready_calls.append(args),
+    )
+    controller._last_whisper_ready = ("small", "cpu", "int8")
+    gigaam_engine = _GigaamFake(config.gigaam_model)
+    controller._gigaam = gigaam_engine
+    controller._active_label_is_gigaam = True
+    try:
+        controller.update_config(replace(config, russian_engine="whisper"))
+        # _dispose_gigaam is queued on the same serialized executor.
+        controller._executor.submit(lambda: None).result(timeout=2)
+    finally:
+        controller.close()
+
+    assert ("small", "cpu", "int8") in ready_calls
+    assert gigaam_engine.closed is True
+    assert controller._gigaam is None
+    assert controller._active_label_is_gigaam is False
+
+
+def test_dispose_models_makes_next_lazy_load_announce_label_again(monkeypatch) -> None:
+    """После _dispose_models следующая ленивая загрузка снова шлёт метку."""
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job1 = _worker_controller(config)
+    ready_calls: list[tuple[str, str, str]] = []
+    controller.model_ready_callback = lambda *args: ready_calls.append(args)
+
+    build_calls: list[str] = []
+    built: list[_GigaamFake] = []
+
+    def fake_ensure_gigaam(model_name: str):
+        build_calls.append(model_name)
+        engine = _GigaamFake(model_name)
+        built.append(engine)
+        # _ensure_gigaam is replaced wholesale here, so this fake must also
+        # publish the resident engine the real method would have stored.
+        controller._gigaam = engine
+        return engine
+
+    monkeypatch.setattr(controller, "_ensure_gigaam", fake_ensure_gigaam)
+    try:
+        controller._transcribe_worker(job1)
+        assert ready_calls == [("GigaAM v3", "cpu", "float32")]
+
+        controller._dispose_models()
+        assert controller._active_label_is_gigaam is False
+        assert built[-1].closed is True
+
+        controller.state = controller.state.start()
+        session_id2 = controller.state.session_id
+        controller.state = controller.state.begin_transcription(session_id2)
+        controller._session_cancelled = job1.cancelled
+        from dataclasses import replace
+
+        job2 = replace(job1, session_id=session_id2)
+        controller._transcribe_worker(job2)
+    finally:
+        controller.close()
+
+    assert ready_calls == [
+        ("GigaAM v3", "cpu", "float32"),
+        ("GigaAM v3", "cpu", "float32"),
+    ], "после dispose_models метка должна объявиться снова"
+
+
+def test_engine_switch_during_whisper_warmup_keeps_that_warmup_current(monkeypatch) -> None:
+    """Смена движка, пока Whisper ещё грузится, не делает его прогрев устаревшим."""
+
+    import threading
+    from dataclasses import replace
+
+    from pressay.controller import DictationController
+
+    config = AppConfig(language="ru", russian_engine="whisper", model="small")
+    release = threading.Event()
+    started = threading.Event()
+
+    class _SlowWhisper:
+        model_size = config.model
+
+        def warmup(self):
+            started.set()
+            assert release.wait(timeout=2)
+            return "cpu", "int8"
+
+        def close(self) -> None:
+            pass
+
+    ready_calls: list[tuple[str, str, str]] = []
+    statuses: list[tuple[str, str]] = []
+    controller = DictationController(
+        config,
+        status_callback=lambda text, kind: statuses.append((text, kind)),
+        result_callback=lambda *_a: None,
+        notification_callback=lambda *_a: None,
+        model_ready_callback=lambda *args: ready_calls.append(args),
+    )
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: _SlowWhisper())
+    monkeypatch.setattr(controller, "_ensure_gigaam", lambda name: _GigaamFake(name))
+    try:
+        assert controller.warmup_model() is True
+        assert started.wait(timeout=2)
+        controller.update_config(replace(config, russian_engine="gigaam"))
+        release.set()
+        assert controller._warmup_future is not None
+        controller._warmup_future.result(timeout=2)
+        controller._executor.submit(lambda: None).result(timeout=2)
+    finally:
+        controller.close()
+
+    assert any(kind == "ready" for _text, kind in statuses)
+    assert ready_calls and ready_calls[-1][0] == "GigaAM v3"
+
+
+def test_engine_switch_during_gigaam_take_is_not_overwritten_by_that_take(monkeypatch) -> None:
+    """Смена движка во время диктовки через GigaAM: метка остаётся Whisper."""
+
+    from dataclasses import replace
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job = _worker_controller(config)
+    ready_calls: list[tuple[str, str, str]] = []
+    controller.model_ready_callback = lambda *args: ready_calls.append(args)
+    controller._last_whisper_ready = ("small", "cpu", "int8")
+
+    class _SwitchingGigaam(_GigaamFake):
+        def transcribe(self, *args, **kwargs):
+            # The user switches to Whisper while this take is still running.
+            controller.update_config(replace(config, russian_engine="whisper"))
+            return super().transcribe(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "_ensure_gigaam", lambda name: _SwitchingGigaam(name))
+    try:
+        controller._transcribe_worker(job)
+    finally:
+        controller.close()
+
+    assert ready_calls, "метка Whisper должна быть восстановлена"
+    assert ready_calls[-1][0] == "small"
+    assert controller._active_label_is_gigaam is False

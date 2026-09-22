@@ -487,3 +487,100 @@ def test_destructive_uninstall_refuses_before_shortcuts_but_shortcut_only_is_all
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert all(path.exists() for path in preserved)
+
+
+def test_new_shortcut_gets_taskbar_app_user_model_id(tmp_path: Path) -> None:
+    local_appdata = tmp_path / "app id local appdata"
+    install_root = local_appdata / "Pressay"
+    install_root.mkdir(parents=True)
+    (install_root / "Pressay.ps1").write_text("# isolated launcher\n", encoding="utf-8")
+    shortcut = tmp_path / "app id shortcuts" / "Pressay.lnk"
+
+    result = _run_powershell(
+        f". {_ps_quote(SCRIPTS / 'shortcut-utils.ps1')}; "
+        f"$spec = Get-PressayLauncherSpec -LocalAppData {_ps_quote(local_appdata)}; "
+        f"New-PressayShortcut -ShortcutPath {_ps_quote(shortcut)} -Spec $spec; "
+        f"if (-not (Test-PressayShortcut -ShortcutPath {_ps_quote(shortcut)} -Spec $spec)) {{ throw 'verification failed' }}; "
+        f"Get-PressayShortcutAppId -ShortcutPath {_ps_quote(shortcut)}"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "Pressay.Pressay"
+
+
+def test_shortcut_without_app_id_is_recreated_not_skipped(tmp_path: Path) -> None:
+    local_appdata = tmp_path / "legacy id local appdata"
+    install_root = local_appdata / "Pressay"
+    install_root.mkdir(parents=True)
+    (install_root / "Pressay.ps1").write_text("# isolated launcher\n", encoding="utf-8")
+    shortcut = tmp_path / "legacy id shortcuts" / "Pressay.lnk"
+    shortcut.parent.mkdir(parents=True)
+
+    result = _run_powershell(
+        f". {_ps_quote(SCRIPTS / 'shortcut-utils.ps1')}; "
+        f"$spec = Get-PressayLauncherSpec -LocalAppData {_ps_quote(local_appdata)}; "
+        "$shell = New-Object -ComObject WScript.Shell; "
+        f"$old = $shell.CreateShortcut({_ps_quote(shortcut)}); "
+        "$old.TargetPath = $spec.TargetPath; $old.Arguments = $spec.Arguments; "
+        "$old.WorkingDirectory = $spec.WorkingDirectory; $old.Description = $spec.Description; "
+        "$old.Save(); "
+        f"if (Test-PressayShortcut -ShortcutPath {_ps_quote(shortcut)} -Spec $spec) {{ throw 'id-less shortcut should not verify' }}; "
+        f"$ownership = Get-PressayShortcutOwnership -ShortcutPath {_ps_quote(shortcut)} -Spec $spec; "
+        "if ($ownership -ne 'installed') { throw \"unexpected ownership: $ownership\" }; "
+        f"New-PressayShortcut -ShortcutPath {_ps_quote(shortcut)} -Spec $spec; "
+        f"if (-not (Test-PressayShortcut -ShortcutPath {_ps_quote(shortcut)} -Spec $spec)) {{ throw 'verification failed after recreation' }}; "
+        f"Get-PressayShortcutAppId -ShortcutPath {_ps_quote(shortcut)}"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Shortcut created" in result.stdout
+    assert "Shortcut is already ready" not in result.stdout
+    assert result.stdout.strip().splitlines()[-1] == "Pressay.Pressay"
+
+
+def test_whisper_model_selection_prefers_explicit_then_config_then_default(
+    tmp_path: Path,
+) -> None:
+    local_appdata = tmp_path / "model local appdata"
+    (local_appdata / "Pressay").mkdir(parents=True)
+    config_path = local_appdata / "Pressay" / "config.json"
+
+    def _select(explicit: str | None, config_text: str | None) -> str:
+        if config_text is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            config_path.write_text(config_text, encoding="utf-8")
+        explicit_arg = "$null" if explicit is None else _ps_quote(explicit)
+        result = _run_powershell(
+            f". {_ps_quote(SCRIPTS / 'install-layout.ps1')}; "
+            "Get-PressayWhisperModelSelection "
+            f"-LocalAppData {_ps_quote(local_appdata)} "
+            f"-ExplicitModel {explicit_arg} "
+            "-FallbackModel 'turbo'"
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result.stdout.strip().splitlines()[-1]
+
+    assert _select(None, None) == "turbo"
+    assert _select(None, json.dumps({"model": "large-v3"})) == "large-v3"
+    assert _select("small", json.dumps({"model": "large-v3"})) == "small"
+    assert _select(None, "{not valid json") == "turbo"
+    assert _select(None, json.dumps({"model": ""})) == "turbo"
+    assert _select(None, json.dumps({"other": "value"})) == "turbo"
+
+
+def test_setup_reports_and_uses_the_resolved_whisper_model() -> None:
+    setup = (SCRIPTS / "setup.ps1").read_text(encoding="utf-8")
+
+    assert "Get-PressayWhisperModelSelection" in setup
+    assert 'Write-Host "Whisper model to prepare: $resolvedModel"' in setup
+    assert '"--model", $resolvedModel' in setup
+    assert "$PSBoundParameters.ContainsKey('Model')" in setup
+
+
+def test_install_ps1_resolves_model_before_calling_setup() -> None:
+    install = (SCRIPTS / "install.ps1").read_text(encoding="utf-8")
+
+    assert "Get-PressayWhisperModelSelection" in install
+    assert "$PSBoundParameters.ContainsKey('Model')" in install
+    assert install.index("$resolvedModel") < install.index("$setupParameters")

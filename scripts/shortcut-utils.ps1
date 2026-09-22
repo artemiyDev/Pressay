@@ -1,7 +1,208 @@
 Set-StrictMode -Version Latest
 
 $script:PressayShortcutDescription = "Local Pressay voice dictation"
+$script:PressayShortcutAppId = "Pressay.Pressay"
 . (Join-Path $PSScriptRoot "install-layout.ps1")
+
+function Initialize-PressayShortcutAppIdType {
+    [CmdletBinding()]
+    param()
+
+    if ('Pressay.ShortcutAppId' -as [type]) {
+        return
+    }
+
+    # A minimal IShellLinkW/IPropertyStore interop surface. WScript.Shell has
+    # no way to set System.AppUserModel.ID on a .lnk, so this reads and writes
+    # PKEY_AppUserModel_ID directly through the shell link's property store.
+    # Loaded lazily (not at dot-source time) so a compile failure here cannot
+    # take down callers that only need the WScript.Shell-based functions, and
+    # guarded by a type check so repeated dot-sourcing in the same process
+    # (install.ps1 -> install-autostart.ps1) does not re-run Add-Type.
+    $csharp = @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace Pressay
+{
+    [ComImport]
+    [Guid("0000010b-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPersistFile
+    {
+        void GetClassID(out Guid pClassID);
+        [PreserveSig] int IsDirty();
+        void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
+        void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, [MarshalAs(UnmanagedType.Bool)] bool fRemember);
+        void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
+        void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROPERTYKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+        public PROPERTYKEY(Guid fmtid, uint pid) { this.fmtid = fmtid; this.pid = pid; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROPVARIANT : IDisposable
+    {
+        public ushort vt;
+        public ushort wReserved1;
+        public ushort wReserved2;
+        public ushort wReserved3;
+        public IntPtr p;
+        public int p2;
+
+        public void Dispose()
+        {
+            PropVariantClear(ref this);
+        }
+
+        public static PROPVARIANT FromString(string value)
+        {
+            PROPVARIANT pv = new PROPVARIANT();
+            pv.vt = 31; // VT_LPWSTR
+            pv.p = Marshal.StringToCoTaskMemUni(value);
+            return pv;
+        }
+
+        public string ToStringValue()
+        {
+            if (vt != 31) { return string.Empty; }
+            return Marshal.PtrToStringUni(p);
+        }
+
+        [DllImport("ole32.dll")]
+        private static extern int PropVariantClear(ref PROPVARIANT pvar);
+    }
+
+    [ComImport]
+    [Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyStore
+    {
+        int GetCount(out uint cProps);
+        int GetAt(uint iProp, out PROPERTYKEY pkey);
+        int GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+        int SetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
+        int Commit();
+    }
+
+    public static class ShortcutAppId
+    {
+        private static readonly Guid CLSID_ShellLink = new Guid("00021401-0000-0000-C000-000000000046");
+        private static readonly PROPERTYKEY PKEY_AppUserModel_ID = new PROPERTYKEY(
+            new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5);
+
+        public static void SetAppId(string shortcutPath, string appId)
+        {
+            object shellLinkObj = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ShellLink));
+            try
+            {
+                IPersistFile persistFile = (IPersistFile)shellLinkObj;
+                IPropertyStore propertyStore = (IPropertyStore)shellLinkObj;
+                try
+                {
+                    persistFile.Load(shortcutPath, 2); // STGM_READWRITE
+                    PROPERTYKEY key = PKEY_AppUserModel_ID;
+                    PROPVARIANT pv = PROPVARIANT.FromString(appId);
+                    try
+                    {
+                        int hr = propertyStore.SetValue(ref key, ref pv);
+                        if (hr != 0) { throw new System.ComponentModel.Win32Exception(hr); }
+                        int hrCommit = propertyStore.Commit();
+                        if (hrCommit != 0) { throw new System.ComponentModel.Win32Exception(hrCommit); }
+                    }
+                    finally
+                    {
+                        pv.Dispose();
+                    }
+                    persistFile.Save(null, true);
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(persistFile);
+                    Marshal.ReleaseComObject(propertyStore);
+                }
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(shellLinkObj);
+            }
+        }
+
+        public static string GetAppId(string shortcutPath)
+        {
+            object shellLinkObj = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ShellLink));
+            try
+            {
+                IPersistFile persistFile = (IPersistFile)shellLinkObj;
+                IPropertyStore propertyStore = (IPropertyStore)shellLinkObj;
+                try
+                {
+                    persistFile.Load(shortcutPath, 0); // STGM_READ
+                    PROPERTYKEY key = PKEY_AppUserModel_ID;
+                    PROPVARIANT pv;
+                    int hr = propertyStore.GetValue(ref key, out pv);
+                    if (hr != 0) { return string.Empty; }
+                    try
+                    {
+                        return pv.ToStringValue();
+                    }
+                    finally
+                    {
+                        pv.Dispose();
+                    }
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(persistFile);
+                    Marshal.ReleaseComObject(propertyStore);
+                }
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(shellLinkObj);
+            }
+        }
+    }
+}
+"@
+    Add-Type -TypeDefinition $csharp -Language CSharp
+}
+
+function Set-PressayShortcutAppId {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ShortcutPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AppId
+    )
+
+    Initialize-PressayShortcutAppIdType
+    [Pressay.ShortcutAppId]::SetAppId(
+        [System.IO.Path]::GetFullPath($ShortcutPath),
+        $AppId
+    )
+}
+
+function Get-PressayShortcutAppId {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ShortcutPath
+    )
+
+    Initialize-PressayShortcutAppIdType
+    return [Pressay.ShortcutAppId]::GetAppId(
+        [System.IO.Path]::GetFullPath($ShortcutPath)
+    )
+}
 
 function Get-PressayLauncherSpec {
     [CmdletBinding()]
@@ -17,6 +218,7 @@ function Get-PressayLauncherSpec {
         WorkingDirectory = $layout.Root
         Description      = $script:PressayShortcutDescription
         IconLocation     = if (Test-Path -LiteralPath $layout.IconPath -PathType Leaf) { $layout.IconPath } else { "" }
+        AppUserModelId   = $script:PressayShortcutAppId
     }
 }
 
@@ -144,7 +346,11 @@ function Test-PressayShortcut {
         [string]$ShortcutPath,
 
         [Parameter(Mandatory = $true)]
-        [psobject]$Spec
+        [psobject]$Spec,
+
+        # Set when a prior Set-PressayShortcutAppId call failed (COM error) so
+        # publication is not blocked and does not loop retrying the ID forever.
+        [switch]$IgnoreAppUserModelId
     )
 
     if (
@@ -166,9 +372,15 @@ function Test-PressayShortcut {
                 -Left (($shortcut.IconLocation -split ',')[0]) `
                 -Right ([string]$Spec.IconLocation))
         )
+        $appIdMatches = (
+            $IgnoreAppUserModelId -or
+            [string]::IsNullOrWhiteSpace([string]$Spec.AppUserModelId) -or
+            (Get-PressayShortcutAppId -ShortcutPath $ShortcutPath) -ceq [string]$Spec.AppUserModelId
+        )
         return (
             (Test-PressayInstalledShortcutObject -Shortcut $shortcut -Spec $Spec) -and
-            $iconMatches
+            $iconMatches -and
+            $appIdMatches
         )
     }
     catch {
@@ -247,11 +459,26 @@ function New-PressayShortcut {
         }
     }
 
+    $appIdApplied = $true
+    if (-not [string]::IsNullOrWhiteSpace([string]$Spec.AppUserModelId)) {
+        try {
+            Set-PressayShortcutAppId `
+                -ShortcutPath $safeTemporary `
+                -AppId ([string]$Spec.AppUserModelId)
+        }
+        catch {
+            # A taskbar pin mismatch is cosmetic, not fatal: publish the
+            # shortcut without the ID rather than fail the whole install.
+            $appIdApplied = $false
+            Write-Warning "Could not set the taskbar app identity on ${ShortcutPath}: $($_.Exception.Message)"
+        }
+    }
+
     $published = $false
     $verified = $false
     $replacingExisting = $false
     try {
-        if (-not (Test-PressayShortcut -ShortcutPath $safeTemporary -Spec $Spec)) {
+        if (-not (Test-PressayShortcut -ShortcutPath $safeTemporary -Spec $Spec -IgnoreAppUserModelId:(-not $appIdApplied))) {
             throw "Shortcut verification failed before publication: $ShortcutPath"
         }
         if (Test-Path -LiteralPath $ShortcutPath -PathType Leaf) {
@@ -270,7 +497,7 @@ function New-PressayShortcut {
             [System.IO.File]::Move($safeTemporary, $ShortcutPath)
         }
         $published = $true
-        if (-not (Test-PressayShortcut -ShortcutPath $ShortcutPath -Spec $Spec)) {
+        if (-not (Test-PressayShortcut -ShortcutPath $ShortcutPath -Spec $Spec -IgnoreAppUserModelId:(-not $appIdApplied))) {
             throw "Shortcut verification failed after publication: $ShortcutPath"
         }
         $verified = $true

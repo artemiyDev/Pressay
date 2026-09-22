@@ -280,6 +280,11 @@ class DictationController:
         # worker touches self._gigaam / this cache.
         self._gigaam_unavailable_model: str | None = None
         self._gigaam_unavailable_notified = False
+        # True once the active-model label last announced to the UI names
+        # GigaAM. Reset to False whenever GigaAM is actually disposed (engine
+        # switch, ineligibility, or economy-mode retirement), so the next lazy
+        # load in the transcription path re-announces it truthfully.
+        self._active_label_is_gigaam = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pressay-asr")
         self._future: Future[Any] | None = None
         self._warmup_future: Future[Any] | None = None
@@ -295,6 +300,9 @@ class DictationController:
         self._audio_close_complete = threading.Event()
         self._session_cancelled: threading.Event | None = None
         self._model_generation = 0
+        # Separate from _model_generation: a standalone GigaAM warmup must not
+        # invalidate a Whisper warmup that is still queued or loading.
+        self._gigaam_warmup_generation = 0
         self._translation_generation = 0
         self._preload_enabled = False
         self._residency_generation = 0
@@ -494,6 +502,8 @@ class DictationController:
         with self._lock:
             engine = self._gigaam
             self._gigaam = None
+            if engine is not None:
+                self._active_label_is_gigaam = False
         if engine is None:
             return
         try:
@@ -694,6 +704,8 @@ class DictationController:
             with self._lock:
                 current = self._warmup_is_current_locked(model_size, generation)
                 session_active = self.state.active
+                if current:
+                    self._active_label_is_gigaam = gigaam_ready is not None
             if current and self.model_ready_callback is not None:
                 if gigaam_ready is not None:
                     self.model_ready_callback(*gigaam_ready)
@@ -703,6 +715,57 @@ class DictationController:
                 self.status_callback(self._ready_status_text(), "ready")
         if current:
             self._schedule_model_retirement()
+
+    def _gigaam_standalone_warmup_worker(self, model_name: str, generation: int) -> None:
+        """Warm GigaAM after a settings change makes it eligible without touching Whisper.
+
+        A settings change that also changes the Whisper model runs through
+        ``_warmup_worker`` instead, which warms GigaAM itself as part of that
+        run; this method exists only for the ineligible->eligible transition
+        where Whisper is already resident and unchanged.
+        """
+
+        with self._lock:
+            current = (
+                not self._closed
+                and self._gigaam_warmup_generation == generation
+                and self._gigaam_is_eligible(self.config, translating=self.translating)
+                and self.config.gigaam_model == model_name
+            )
+        if not current:
+            return
+        try:
+            engine = self._ensure_gigaam(model_name)
+            engine.warmup()
+        except ModelLoadError:
+            self._dispose_gigaam()
+            if self._mark_gigaam_unavailable(model_name):
+                self.notification_callback(
+                    "Pressay",
+                    "Модель GigaAM недоступна — используется Whisper.",
+                    True,
+                )
+            return
+        except Exception as exc:  # noqa: BLE001 - warmup failure here is not fatal
+            LOGGER.warning("gigaam_warmup_failed: %s", type(exc).__name__)
+            return
+
+        with self._warmup_status_gate:
+            with self._lock:
+                current = (
+                    not self._closed
+                    and self._gigaam_warmup_generation == generation
+                    and self._gigaam_is_eligible(self.config, translating=self.translating)
+                    and self.config.gigaam_model == model_name
+                )
+                if current:
+                    self._active_label_is_gigaam = True
+            if current and self.model_ready_callback is not None:
+                self.model_ready_callback(
+                    "GigaAM v3",
+                    engine.active_device or "cpu",
+                    engine.active_compute_type or "float32",
+                )
 
     def _translation_warmup_is_current_locked(
         self, model_size: str, generation: int
@@ -1816,10 +1879,28 @@ class DictationController:
                     # (over ~25 s, wrong language); those raise EngineUnavailable
                     # and fall through to Whisper below without losing the take.
                     try:
-                        result = self._ensure_gigaam(
-                            gigaam_model_name
-                        ).transcribe(job.audio, **transcribe_options)
+                        gigaam_engine = self._ensure_gigaam(gigaam_model_name)
+                        result = gigaam_engine.transcribe(job.audio, **transcribe_options)
                         engine_used = "gigaam"
+                        # Same gate as update_config's label revert, and the
+                        # live config (not job.config): a settings change made
+                        # during this take must not be overwritten by it.
+                        with self._warmup_status_gate:
+                            with self._lock:
+                                announce = (
+                                    not self._active_label_is_gigaam
+                                    and self._gigaam_is_eligible(
+                                        self.config, translating=self.translating
+                                    )
+                                )
+                                if announce:
+                                    self._active_label_is_gigaam = True
+                            if announce and self.model_ready_callback is not None:
+                                self.model_ready_callback(
+                                    "GigaAM v3",
+                                    gigaam_engine.active_device or "cpu",
+                                    gigaam_engine.active_compute_type or "float32",
+                                )
                     except NoSpeechDetected:
                         # A deliberate verdict, not a malfunction: re-running the
                         # same silence through Whisper would only cost latency.
@@ -2333,19 +2414,32 @@ class DictationController:
                     self._reset_gigaam_unavailable_cache()
                 if translation_disabled:
                     self.translating = False
-                # GigaAM stays resident even once ineligible (out of scope
-                # here), but the active-model label must stop claiming it: if
+                # The active-model label must track eligibility precisely: if
                 # Whisper was already warmed up, restore its label now instead
-                # of waiting for the next warmup.
+                # of waiting for the next warmup, and release GigaAM since it
+                # no longer stays resident once ineligible.
                 now_gigaam_eligible = self._gigaam_is_eligible(
                     self.config, translating=self.translating
                 )
-                if (
-                    was_gigaam_eligible
-                    and not now_gigaam_eligible
-                    and self._last_whisper_ready is not None
+                if was_gigaam_eligible and not now_gigaam_eligible:
+                    self._executor.submit(self._dispose_gigaam)
+                    if self._last_whisper_ready is not None:
+                        revert_to_whisper = self._last_whisper_ready
+                        self._active_label_is_gigaam = False
+                elif (
+                    not was_gigaam_eligible
+                    and now_gigaam_eligible
+                    and not model_changed
+                    and self._preload_enabled
+                    and not self._gigaam_known_unavailable(config.gigaam_model)
                 ):
-                    revert_to_whisper = self._last_whisper_ready
+                    self._gigaam_warmup_generation += 1
+                    gigaam_generation = self._gigaam_warmup_generation
+                    self._executor.submit(
+                        self._gigaam_standalone_warmup_worker,
+                        config.gigaam_model,
+                        gigaam_generation,
+                    )
                 if resource_mode_changed:
                     self._cancel_model_retirement_locked()
                 if translator_cleanup_queued:
