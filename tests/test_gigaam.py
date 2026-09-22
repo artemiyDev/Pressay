@@ -1045,3 +1045,30 @@ def test_engine_switch_during_gigaam_take_is_not_overwritten_by_that_take(monkey
     assert ready_calls, "метка Whisper должна быть восстановлена"
     assert ready_calls[-1][0] == "small"
     assert controller._active_label_is_gigaam is False
+
+
+def test_take_queued_before_switch_does_not_leave_gigaam_resident(monkeypatch) -> None:
+    """Диктовка из очереди, начатая после переключения на Whisper, не оставляет GigaAM в памяти."""
+
+    from dataclasses import replace
+
+    config = AppConfig(language="ru", russian_engine="gigaam", auto_insert=False)
+    controller, job = _worker_controller(config)
+    ready_calls: list[tuple[str, str, str]] = []
+    controller.model_ready_callback = lambda *args: ready_calls.append(args)
+    # The take was queued with the old config; the live config already says Whisper.
+    controller.config = replace(config, russian_engine="whisper")
+
+    def fake_ensure_gigaam(model_name: str):
+        controller._gigaam = _GigaamFake(model_name)
+        return controller._gigaam
+
+    monkeypatch.setattr(controller, "_ensure_gigaam", fake_ensure_gigaam)
+    try:
+        controller._transcribe_worker(job)
+        resident = controller._gigaam is not None
+    finally:
+        controller.close()
+
+    assert not resident
+    assert not any(call[0] == "GigaAM v3" for call in ready_calls), ready_calls

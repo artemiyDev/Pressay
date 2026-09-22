@@ -827,9 +827,11 @@ def _set_windows_app_id() -> None:
     if not is_windows():
         return
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        result = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             "Pressay.Pressay"
         )
+        if result != 0:
+            LOGGER.warning("app_user_model_id_failed: hresult=0x%08X", result & 0xFFFFFFFF)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("app_user_model_id_failed: %s", type(exc).__name__)
 

@@ -704,6 +704,13 @@ class DictationController:
             with self._lock:
                 current = self._warmup_is_current_locked(model_size, generation)
                 session_active = self.state.active
+                # The user may have switched away from GigaAM while it was
+                # loading; update_config already restored the Whisper label
+                # and queued the disposal, so do not overwrite it here.
+                if gigaam_ready is not None and not self._gigaam_is_eligible(
+                    self.config, translating=False
+                ):
+                    gigaam_ready = None
                 if current:
                     self._active_label_is_gigaam = gigaam_ready is not None
             if current and self.model_ready_callback is not None:
@@ -729,7 +736,7 @@ class DictationController:
             current = (
                 not self._closed
                 and self._gigaam_warmup_generation == generation
-                and self._gigaam_is_eligible(self.config, translating=self.translating)
+                and self._gigaam_is_eligible(self.config, translating=False)
                 and self.config.gigaam_model == model_name
             )
         if not current:
@@ -755,7 +762,7 @@ class DictationController:
                 current = (
                     not self._closed
                     and self._gigaam_warmup_generation == generation
-                    and self._gigaam_is_eligible(self.config, translating=self.translating)
+                    and self._gigaam_is_eligible(self.config, translating=False)
                     and self.config.gigaam_model == model_name
                 )
                 if current:
@@ -1887,11 +1894,11 @@ class DictationController:
                         # during this take must not be overwritten by it.
                         with self._warmup_status_gate:
                             with self._lock:
+                                live_eligible = self._gigaam_is_eligible(
+                                    self.config, translating=False
+                                )
                                 announce = (
-                                    not self._active_label_is_gigaam
-                                    and self._gigaam_is_eligible(
-                                        self.config, translating=self.translating
-                                    )
+                                    live_eligible and not self._active_label_is_gigaam
                                 )
                                 if announce:
                                     self._active_label_is_gigaam = True
@@ -1901,6 +1908,11 @@ class DictationController:
                                     gigaam_engine.active_device or "cpu",
                                     gigaam_engine.active_compute_type or "float32",
                                 )
+                        if not live_eligible:
+                            # This take was queued before the settings change
+                            # that retired GigaAM and re-loaded it; release it
+                            # again instead of keeping it resident.
+                            self._dispose_gigaam()
                     except NoSpeechDetected:
                         # A deliberate verdict, not a malfunction: re-running the
                         # same silence through Whisper would only cost latency.
@@ -2406,8 +2418,11 @@ class DictationController:
                     config.russian_engine != self.config.russian_engine
                     or config.gigaam_model != self.config.gigaam_model
                 )
+                # Residency and the label follow the configured Russian
+                # engine; voice translation is a temporary mode that routes
+                # single takes to Whisper and must not hide an engine switch.
                 was_gigaam_eligible = self._gigaam_is_eligible(
-                    self.config, translating=self.translating
+                    self.config, translating=False
                 )
                 self.config = config
                 if gigaam_config_changed:
@@ -2419,7 +2434,7 @@ class DictationController:
                 # of waiting for the next warmup, and release GigaAM since it
                 # no longer stays resident once ineligible.
                 now_gigaam_eligible = self._gigaam_is_eligible(
-                    self.config, translating=self.translating
+                    self.config, translating=False
                 )
                 if was_gigaam_eligible and not now_gigaam_eligible:
                     self._executor.submit(self._dispose_gigaam)

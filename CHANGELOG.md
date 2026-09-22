@@ -5,9 +5,9 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.6.9` is the version declared by the current source tree. Changes since
+`0.6.10` is the version declared by the current source tree. Changes since
 0.3.0 are listed together under "Unreleased"; releases from 0.6.6 on are tagged
-`vX.Y.Z`. Версия `0.6.9` указана в текущем исходном коде. Изменения после 0.3.0
+`vX.Y.Z`. Версия `0.6.10` указана в текущем исходном коде. Изменения после 0.3.0
 собраны в разделе «Не выпущено»; выпуски начиная с 0.6.6 помечены тегами
 `vX.Y.Z`.
 
@@ -170,6 +170,16 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
   настройках, загрузке на первой диктовке и повторной загрузке после выгрузки в
   экономном режиме. GigaAM выгружается из памяти, когда больше не используется
   (другой движок или язык).
+- The active-model line no longer shows GigaAM after switching to Whisper while
+  GigaAM was still loading or while voice translation was on, and a take queued
+  before that switch no longer leaves GigaAM resident.
+- Строка «Активна» больше не показывает GigaAM после переключения на Whisper во
+  время загрузки GigaAM или при включённом голосовом переводе, а диктовка из
+  очереди, начатая до переключения, не оставляет GigaAM в памяти.
+- A taskbar pin made before 0.6.9 shows up as a separate button next to the
+  window; unpin it and pin the running Pressay again.
+- Закреплённый до 0.6.9 значок в панели задач будет отдельной кнопкой рядом с
+  окном: открепите его и закрепите запущенный Pressay заново.
 - Setup prepares the Whisper model from the existing settings instead of always
   `turbo`; an explicit `-Model` still wins.
 - Установка готовит модель Whisper из текущих настроек, а не всегда `turbo`;
