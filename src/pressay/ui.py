@@ -552,6 +552,24 @@ class SettingsWindow(QMainWindow):
         self._hint_labels.append(self.language_hint)
         form.addRow("", self.language_hint)
 
+        self.russian_engine_combo = QComboBox()
+        self._make_combo_responsive(self.russian_engine_combo)
+        self.russian_engine_combo.addItem(
+            "GigaAM — лучше для русского (CPU)", "gigaam"
+        )
+        self.russian_engine_combo.addItem("Whisper", "whisper")
+        russian_engine_index = self.russian_engine_combo.findData(
+            settings.get("russian_engine", "gigaam")
+        )
+        self.russian_engine_combo.setCurrentIndex(max(0, russian_engine_index))
+        form.addRow("Движок для русского", self.russian_engine_combo)
+        self.russian_engine_hint = QLabel(
+            "Применяется только при языке «Русский»."
+        )
+        self.russian_engine_hint.setWordWrap(True)
+        self._hint_labels.append(self.russian_engine_hint)
+        form.addRow("", self.russian_engine_hint)
+
         self.model_combo = QComboBox()
         self._make_combo_responsive(self.model_combo)
         for label, value in (
@@ -567,6 +585,13 @@ class SettingsWindow(QMainWindow):
         self.active_model_label = QLabel("Модель ещё не загружалась")
         self._hint_labels.append(self.active_model_label)
         form.addRow("", self.active_model_label)
+        self.model_hint = QLabel(
+            "Модель Whisper используется только для английского, "
+            "автоопределения языка, перевода и как запасная."
+        )
+        self.model_hint.setWordWrap(True)
+        self._hint_labels.append(self.model_hint)
+        form.addRow("", self.model_hint)
 
         self.resource_mode_combo = QComboBox()
         self._make_combo_responsive(self.resource_mode_combo)
@@ -956,7 +981,10 @@ class SettingsWindow(QMainWindow):
         self.setTabOrder(self.clear_transcript_history_button, self.toggle_button)
         self.setTabOrder(self.toggle_button, self.test_button)
         self.setTabOrder(self.test_button, self.save_button)
+        self.language_combo.currentIndexChanged.connect(self._refresh_engine_rows)
+        self.russian_engine_combo.currentIndexChanged.connect(self._refresh_engine_rows)
         self._apply_theme(self._color_scheme)
+        self._refresh_engine_rows()
 
         # The style hints singleton outlives this window; PySide auto-drops
         # the connection once this QObject (the receiver) is destroyed, so
@@ -1007,6 +1035,7 @@ class SettingsWindow(QMainWindow):
         return {
             "microphone": self.microphone_combo.currentData(),
             "language": self.language_combo.currentData(),
+            "russian_engine": self.russian_engine_combo.currentData(),
             "model": self.model_combo.currentData(),
             "resource_mode": self.resource_mode_combo.currentData(),
             "auto_insert": self.auto_insert_checkbox.isChecked(),
@@ -1114,6 +1143,21 @@ class SettingsWindow(QMainWindow):
 
         self.active_model_label.setText(
             f"Активна: {model} · {device.upper()} · {compute_type}"
+        )
+
+    def _refresh_engine_rows(self) -> None:
+        """Enable the Russian-engine combo only for the Russian language.
+
+        Reacts to the combos themselves (the settings the user is about to
+        save), not to the last-saved config, so a language switch inside the
+        open window is reflected immediately.
+        """
+
+        is_russian = self.language_combo.currentData() == "ru"
+        self.russian_engine_combo.setEnabled(is_russian)
+        self.russian_engine_hint.setVisible(not is_russian)
+        self.model_hint.setVisible(
+            is_russian and self.russian_engine_combo.currentData() == "gigaam"
         )
 
     def _restyle_status(self) -> None:

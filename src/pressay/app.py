@@ -39,6 +39,7 @@ from .ui import (
     StatusOverlay,
     TrayController,
     UiSignals,
+    make_icon,
     microphone_choice_index,
 )
 from .platform_support import input_adapter, is_macos, is_windows, user_data_directory
@@ -553,8 +554,8 @@ def _build_updated_config(
     silently resets every field the settings window does not know about, so
     building one that way once reverted ``russian_engine`` to its default and
     undid the documented way back to Whisper.  Anything absent from
-    ``values`` -- ``russian_engine`` and ``gigaam_model`` are not settings-window
-    fields -- is carried over from ``config`` unchanged.
+    ``values`` -- ``gigaam_model`` is not a settings-window field -- is
+    carried over from ``config`` unchanged.
 
     Raises ``hotkey_bindings.HotkeyBindingError`` if ``values["hotkeys"]`` does
     not parse; the caller is expected to report that to the user.
@@ -578,6 +579,7 @@ def _build_updated_config(
         voice_formatting=bool(values.get("voice_formatting", config.voice_formatting)),
         voice_translate=bool(values.get("voice_translate", config.voice_translate)),
         translate_model=str(values.get("translate_model", config.translate_model)),
+        russian_engine=str(values.get("russian_engine", config.russian_engine)),
         strict_editable_check=bool(
             values.get("strict_editable_check", config.strict_editable_check)
         ),
@@ -593,6 +595,7 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "microphone": config.microphone,
         "language": config.language,
         "model": config.model,
+        "russian_engine": config.russian_engine,
         "resource_mode": config.resource_mode,
         "auto_insert": config.auto_insert,
         "smart_spacing": config.smart_spacing,
@@ -812,6 +815,25 @@ def _snapshot_target(*, strict_editable_check: bool = False) -> Any | None:
         return None
 
 
+def _set_windows_app_id() -> None:
+    """Group Pressay under its own taskbar icon instead of Python's.
+
+    Without an explicit AppUserModelID, Windows falls back to grouping the
+    process by its host executable (``pythonw.exe``), so the taskbar shows
+    Python's icon even though the window itself carries Pressay's. Any
+    failure here is cosmetic and must never block startup.
+    """
+
+    if not is_windows():
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Pressay.Pressay"
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("app_user_model_id_failed: %s", type(exc).__name__)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--background", action="store_true", help="Start in the system tray")
@@ -830,10 +852,12 @@ def main(argv: list[str] | None = None) -> int:
         elif not args.background:
             print("Pressay is already running in the menu bar.", file=sys.stderr)
         return 0
+    _set_windows_app_id()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Pressay")
     app.setOrganizationName("Local")
     app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(make_icon())
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         LOGGER.error("system_tray_unavailable")

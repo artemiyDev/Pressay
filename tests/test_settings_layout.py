@@ -117,6 +117,54 @@ def test_small_window_scrolls_vertically_with_sticky_primary_actions(
         _close(app, window)
 
 
+def test_russian_engine_combo_enabled_only_for_russian_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app, _signals, window = _window(config=AppConfig(language="auto"))
+    try:
+        window.show()
+        app.processEvents()
+        assert window.russian_engine_combo.isEnabled() is False
+        assert window.russian_engine_hint.isVisible() is True
+
+        en_index = window.language_combo.findData("en")
+        window.language_combo.setCurrentIndex(en_index)
+        app.processEvents()
+        assert window.russian_engine_combo.isEnabled() is False
+
+        ru_index = window.language_combo.findData("ru")
+        window.language_combo.setCurrentIndex(ru_index)
+        app.processEvents()
+        assert window.russian_engine_combo.isEnabled() is True
+        assert window.russian_engine_hint.isVisible() is False
+    finally:
+        _close(app, window)
+
+
+def test_russian_engine_combo_is_in_settings_values_and_survives_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app, signals, window = _window(
+        config=AppConfig(language="ru", russian_engine="gigaam")
+    )
+    saved: list[dict[str, object]] = []
+    signals.save_requested.connect(saved.append)
+    try:
+        assert window.current_settings()["russian_engine"] == "gigaam"
+        assert window.russian_engine_combo.currentData() == "gigaam"
+
+        whisper_index = window.russian_engine_combo.findData("whisper")
+        window.russian_engine_combo.setCurrentIndex(whisper_index)
+        assert window.current_settings()["russian_engine"] == "whisper"
+
+        window._emit_save()
+        assert saved[-1]["russian_engine"] == "whisper"
+    finally:
+        _close(app, window)
+
+
 def test_missing_microphone_remains_explicit_and_preserves_original_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

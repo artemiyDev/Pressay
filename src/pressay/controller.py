@@ -269,6 +269,11 @@ class DictationController:
         self._transcriber: FasterWhisperTranscriber | None = None
         self._translator: FasterWhisperTranscriber | None = None
         self._gigaam: GigaAmTranscriber | None = None
+        # Last successfully warmed-up Whisper (model, device, compute_type),
+        # so a settings change that makes GigaAM ineligible again (engine
+        # switched back, or language left "ru") can restore a truthful active
+        # model label without re-running warmup.
+        self._last_whisper_ready: tuple[str, str, str] | None = None
         # Negative cache: once GigaAM fails to load for a given model name, do
         # not retry (and re-log a traceback) on every subsequent dictation
         # until the model or engine setting changes. Only the single ASR
@@ -653,17 +658,27 @@ class DictationController:
             LOGGER.warning("model_warmup_failed: %s", type(exc).__name__)
             return
 
+        with self._lock:
+            self._last_whisper_ready = (model_size, device, compute_type)
+
         # Without this the user pays GigaAM's ~2.4 s load on their first
         # dictation instead of at startup.  It runs on the same single worker,
         # so it cannot race a transcription, and a failure here only costs that
         # first-dictation delay -- Whisper is already warm and stays the
         # fallback, so warmup must not be reported as broken.
+        gigaam_ready: tuple[str, str, str] | None = None
         gigaam_model_name = self.config.gigaam_model
         if self._gigaam_is_eligible(
             self.config, translating=False
         ) and not self._gigaam_known_unavailable(gigaam_model_name):
             try:
-                self._ensure_gigaam(gigaam_model_name).warmup()
+                engine = self._ensure_gigaam(gigaam_model_name)
+                engine.warmup()
+                gigaam_ready = (
+                    "GigaAM v3",
+                    engine.active_device or "cpu",
+                    engine.active_compute_type or "float32",
+                )
             except ModelLoadError:
                 self._dispose_gigaam()
                 if self._mark_gigaam_unavailable(gigaam_model_name):
@@ -680,7 +695,10 @@ class DictationController:
                 current = self._warmup_is_current_locked(model_size, generation)
                 session_active = self.state.active
             if current and self.model_ready_callback is not None:
-                self.model_ready_callback(model_size, device, compute_type)
+                if gigaam_ready is not None:
+                    self.model_ready_callback(*gigaam_ready)
+                else:
+                    self.model_ready_callback(model_size, device, compute_type)
             if current and not session_active:
                 self.status_callback(self._ready_status_text(), "ready")
         if current:
@@ -2282,6 +2300,7 @@ class DictationController:
             return not self._closed and self.last_transcript == text
 
     def update_config(self, config: AppConfig) -> None:
+        revert_to_whisper: tuple[str, str, str] | None = None
         with self._warmup_status_gate:
             with self._lock:
                 if self._closed:
@@ -2306,11 +2325,27 @@ class DictationController:
                     config.russian_engine != self.config.russian_engine
                     or config.gigaam_model != self.config.gigaam_model
                 )
+                was_gigaam_eligible = self._gigaam_is_eligible(
+                    self.config, translating=self.translating
+                )
                 self.config = config
                 if gigaam_config_changed:
                     self._reset_gigaam_unavailable_cache()
                 if translation_disabled:
                     self.translating = False
+                # GigaAM stays resident even once ineligible (out of scope
+                # here), but the active-model label must stop claiming it: if
+                # Whisper was already warmed up, restore its label now instead
+                # of waiting for the next warmup.
+                now_gigaam_eligible = self._gigaam_is_eligible(
+                    self.config, translating=self.translating
+                )
+                if (
+                    was_gigaam_eligible
+                    and not now_gigaam_eligible
+                    and self._last_whisper_ready is not None
+                ):
+                    revert_to_whisper = self._last_whisper_ready
                 if resource_mode_changed:
                     self._cancel_model_retirement_locked()
                 if translator_cleanup_queued:
@@ -2342,6 +2377,8 @@ class DictationController:
                         self._queue_translation_warmup_locked()
                     elif translate_model_changed and not translator_cleanup_queued:
                         self._executor.submit(self._dispose_translator)
+            if revert_to_whisper is not None and self.model_ready_callback is not None:
+                self.model_ready_callback(*revert_to_whisper)
 
     def close(self) -> None:
         with self._warmup_status_gate:

@@ -13,6 +13,7 @@ from pressay.app import (
     _InputActionWorker,
     _SingleInstance,
     _build_microphone_test_handler,
+    _build_updated_config,
     _effective_tray_status,
     _load_config,
     _microphone_probe_presentation,
@@ -20,6 +21,7 @@ from pressay.app import (
     _overlay_auto_hide_ms,
     _release_single_instance_after_shutdown,
     _report_hotkey_start_failure,
+    _set_windows_app_id,
     _settings_dict,
     _save_settings_transaction,
     _start_native_shutdown,
@@ -47,6 +49,62 @@ from pressay.ui import (
 @pytest.fixture(autouse=True)
 def _windows_app_platform(monkeypatch):
     monkeypatch.setattr("pressay.platform_support.sys.platform", "win32")
+
+
+def test_set_windows_app_id_calls_shell32_on_windows(monkeypatch) -> None:
+    calls: list[str] = []
+    fake_shell32 = SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=lambda app_id: calls.append(app_id)
+    )
+    monkeypatch.setattr(
+        "pressay.app.ctypes.windll", SimpleNamespace(shell32=fake_shell32), raising=False
+    )
+    _set_windows_app_id()
+    assert calls == ["Pressay.Pressay"]
+
+
+def test_set_windows_app_id_failure_is_swallowed(monkeypatch, caplog) -> None:
+    def explode(_app_id: str) -> None:
+        raise OSError("no shell32 here")
+
+    fake_shell32 = SimpleNamespace(SetCurrentProcessExplicitAppUserModelID=explode)
+    monkeypatch.setattr(
+        "pressay.app.ctypes.windll", SimpleNamespace(shell32=fake_shell32), raising=False
+    )
+    with caplog.at_level("WARNING", logger="pressay.app"):
+        _set_windows_app_id()  # must not raise
+    assert any("app_user_model_id_failed" in r.getMessage() for r in caplog.records)
+
+
+def test_set_windows_app_id_is_noop_off_windows(monkeypatch) -> None:
+    calls: list[str] = []
+    fake_shell32 = SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=lambda app_id: calls.append(app_id)
+    )
+    monkeypatch.setattr(
+        "pressay.app.ctypes.windll", SimpleNamespace(shell32=fake_shell32), raising=False
+    )
+    monkeypatch.setattr("pressay.app.is_windows", lambda: False)
+    _set_windows_app_id()
+    assert calls == []
+
+
+def test_settings_dict_includes_russian_engine() -> None:
+    assert _settings_dict(AppConfig())["russian_engine"] == "gigaam"
+    assert _settings_dict(AppConfig(russian_engine="whisper"))["russian_engine"] == "whisper"
+
+
+def test_build_updated_config_round_trips_russian_engine() -> None:
+    config = AppConfig(russian_engine="gigaam", gigaam_model="gigaam-v3-e2e-rnnt")
+    values = _settings_dict(config)
+    unchanged = _build_updated_config(config, values, config.microphone)
+    assert unchanged.russian_engine == "gigaam"
+    assert unchanged.gigaam_model == "gigaam-v3-e2e-rnnt"
+
+    values["russian_engine"] = "whisper"
+    switched = _build_updated_config(config, values, config.microphone)
+    assert switched.russian_engine == "whisper"
+    assert switched.gigaam_model == "gigaam-v3-e2e-rnnt"
 
 
 def test_windows_single_instance_mutex_is_reacquirable() -> None:

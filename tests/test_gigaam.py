@@ -640,3 +640,103 @@ def test_settings_save_path_preserves_unknown_fields_structurally() -> None:
     assert updated.gigaam_model == "gigaam-v3-e2e-rnnt"
     assert updated.prearm_capture is True
     assert updated.model == "large-v3"
+
+
+def test_gigaam_warmup_reports_active_model_as_gigaam(monkeypatch) -> None:
+    """После прогрева GigaAM метка активной модели должна называть GigaAM."""
+
+    from pressay.controller import DictationController
+
+    config = AppConfig(language="ru", russian_engine="gigaam", model="small")
+
+    class _WhisperStub:
+        def warmup(self):
+            return "cpu", "int8"
+
+        def close(self) -> None:
+            pass
+
+    class _GigaamStub:
+        model_name = config.gigaam_model
+        active_device = "cpu"
+        active_compute_type = "float32"
+
+        def warmup(self) -> str:
+            return self.model_name
+
+        def close(self) -> None:
+            pass
+
+    ready_calls: list[tuple[str, str, str]] = []
+    controller = DictationController(
+        config,
+        status_callback=lambda *_a: None,
+        result_callback=lambda *_a: None,
+        notification_callback=lambda *_a: None,
+        model_ready_callback=lambda *args: ready_calls.append(args),
+    )
+    monkeypatch.setattr(controller, "_new_transcriber", lambda _model: _WhisperStub())
+    monkeypatch.setattr(controller, "_ensure_gigaam", lambda _name: _GigaamStub())
+    try:
+        assert controller.warmup_model() is True
+        assert controller._warmup_future is not None
+        controller._warmup_future.result(timeout=2)
+    finally:
+        controller.close()
+
+    assert ready_calls, "model_ready_callback не был вызван"
+    assert ready_calls[-1][0] == "GigaAM v3"
+    assert ready_calls[-1][1] == "cpu"
+    assert ready_calls[-1][2] == "float32"
+
+
+def test_active_model_label_shows_gigaam_after_ready_callback() -> None:
+    """SettingsWindow должно честно отображать GigaAM в метке активной модели."""
+
+    import os
+
+    from pressay.app import _settings_dict
+    from pressay.ui import MicrophoneChoice, SettingsWindow, UiSignals
+    from PySide6.QtWidgets import QApplication
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    signals = UiSignals()
+    window = SettingsWindow(
+        signals,
+        _settings_dict(AppConfig(language="ru", russian_engine="gigaam")),
+        [MicrophoneChoice(None, "Системный микрофон")],
+        macos=False,
+    )
+    try:
+        window.update_active_model("GigaAM v3", "cpu", "float32")
+        assert "GigaAM" in window.active_model_label.text()
+    finally:
+        window.prepare_to_quit()
+        window.close()
+        app.processEvents()
+
+
+def test_config_switch_away_from_gigaam_restores_whisper_label() -> None:
+    """Смена движка на Whisper не должна оставлять метку GigaAM активной."""
+
+    from dataclasses import replace
+
+    from pressay.controller import DictationController
+
+    config = AppConfig(language="ru", russian_engine="gigaam", model="small")
+    ready_calls: list[tuple[str, str, str]] = []
+    controller = DictationController(
+        config,
+        status_callback=lambda *_a: None,
+        result_callback=lambda *_a: None,
+        notification_callback=lambda *_a: None,
+        model_ready_callback=lambda *args: ready_calls.append(args),
+    )
+    controller._last_whisper_ready = ("small", "cpu", "int8")
+    try:
+        controller.update_config(replace(config, russian_engine="whisper"))
+    finally:
+        controller.close()
+
+    assert ("small", "cpu", "int8") in ready_calls

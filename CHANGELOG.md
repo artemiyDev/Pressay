@@ -5,13 +5,20 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.6.7` is the version declared by the current source tree; it does not yet
-have a matching tagged release. Версия `0.6.7` указана в текущем исходном коде,
+`0.6.8` is the version declared by the current source tree; it does not yet
+have a matching tagged release. Версия `0.6.8` указана в текущем исходном коде,
 но соответствующего тега выпуска пока нет.
 
 ## Unreleased / Не выпущено
 
 ### Added / Добавлено
+
+- The settings window has a "Russian engine" choice (GigaAM / Whisper), active
+  only for the Russian language. The active-model line now names GigaAM when it
+  is the engine in use instead of the idle Whisper model.
+- В окне настроек появился выбор «Движок для русского» (GigaAM / Whisper), он
+  работает только при языке «Русский». Строка «Активна» теперь показывает GigaAM,
+  когда распознаёт он, а не простаивающую модель Whisper.
 
 - Setup now prepares the GigaAM model next to the Whisper model (only the
   `gigaam-v3-e2e-rnnt` files, about 890 MB, skipped when already cached). A
@@ -145,6 +152,11 @@ have a matching tagged release. Версия `0.6.7` указана в теку�
   PowerShell.
 
 ### Fixed / Исправлено
+
+- The Windows taskbar shows the Pressay icon instead of Python's (explicit
+  AppUserModelID).
+- Панель задач Windows показывает значок Pressay, а не Python (явный
+  AppUserModelID).
 
 - On Windows, text longer than one 96-unit batch no longer stops after the
   first batch in Document-type fields (contenteditable editors in Chromium and
