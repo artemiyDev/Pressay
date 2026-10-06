@@ -51,3 +51,16 @@ def _block_real_gigaam_model_load(monkeypatch: pytest.MonkeyPatch) -> Any:
         "(GigaAmTranscriber(model_factory=...) or controller._gigaam = <fake>) or "
         'pin russian_engine="whisper" in the test config.'
     )
+
+
+@pytest.fixture(autouse=True)
+def _block_real_clipboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests must never read or overwrite the developer's real clipboard.
+
+    The live clipboard tests run in a subprocess and are unaffected.
+    """
+
+    def refuse() -> Any:
+        raise AssertionError("Test reached the real Windows clipboard; pass a fake clipboard.")
+
+    monkeypatch.setattr("pressay.windows_input._default_clipboard", refuse)

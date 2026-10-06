@@ -376,7 +376,7 @@ def _auto_insert_controller(
     statuses: list[tuple[str, str]] = []
     notifications: list[tuple[object, ...]] = []
     controller = DictationController(
-        AppConfig(auto_insert=True),
+        AppConfig(auto_insert=True, insert_method="type"),
         status_callback=lambda text, state: statuses.append((text, state)),
         result_callback=lambda *_args: None,
         notification_callback=lambda *args: notifications.append(args),
