@@ -297,10 +297,11 @@ def send_text(
     fallback_to_clipboard: bool = False,
     strict_editable_check: bool = False,
     backend: InputBackend | None = None,
+    insert_method: str = "type",
 ) -> InputOutcome:
     """Insert Unicode only while the same writable AX element keeps focus."""
 
-    del fallback_to_clipboard, strict_editable_check
+    del fallback_to_clipboard, strict_editable_check, insert_method
     adapter = _backend(backend)
     if _cancelled(cancelled):
         return InputOutcome(InputStatus.CANCELLED, False, reason="cancelled")

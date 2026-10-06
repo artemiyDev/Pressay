@@ -1091,3 +1091,14 @@ def test_settings_transaction_cancels_capture_before_deferring_changed_hotkeys(
     coordinator.persist()
     coordinator.on_applied()
     assert order == ["request", "cancel", "persist", "apply:Ctrl+Shift"]
+
+
+def test_insert_method_round_trips_through_settings_and_update() -> None:
+    config = AppConfig()
+    values = _settings_dict(config)
+    assert values["insert_method"] == "paste"
+    assert _build_updated_config(config, values, config.microphone).insert_method == "paste"
+
+    values["insert_method"] = "type"
+    assert _build_updated_config(config, values, config.microphone).insert_method == "type"
+    assert _settings_dict(AppConfig(insert_method="type"))["insert_method"] == "type"

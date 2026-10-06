@@ -580,6 +580,7 @@ def _build_updated_config(
         voice_translate=bool(values.get("voice_translate", config.voice_translate)),
         translate_model=str(values.get("translate_model", config.translate_model)),
         russian_engine=str(values.get("russian_engine", config.russian_engine)),
+        insert_method=str(values.get("insert_method", config.insert_method)),
         strict_editable_check=bool(
             values.get("strict_editable_check", config.strict_editable_check)
         ),
@@ -596,6 +597,7 @@ def _settings_dict(config: AppConfig) -> dict[str, Any]:
         "language": config.language,
         "model": config.model,
         "russian_engine": config.russian_engine,
+        "insert_method": config.insert_method,
         "resource_mode": config.resource_mode,
         "auto_insert": config.auto_insert,
         "smart_spacing": config.smart_spacing,

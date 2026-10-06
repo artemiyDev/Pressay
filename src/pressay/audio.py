@@ -384,6 +384,108 @@ class _StreamCloseOperation:
     succeeded: bool | None = None
 
 
+# Minimum spacing between PortAudio re-initialisations (loop guard).
+PORTAUDIO_REFRESH_MIN_INTERVAL_SECONDS = 5.0
+
+
+class _PortAudioActivity:
+    """Process-wide count of native PortAudio users, guarded by one lock.
+
+    ``busy`` counts open (or being opened) input streams plus in-flight native
+    calls (device queries/validation).  PortAudio may be re-initialised only
+    when it is zero; ``lock`` is held for the whole terminate/initialize so
+    nobody can open a stream in the middle.  A stream whose close failed stays
+    counted, which only ever prevents a refresh.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.busy = 0
+        self.last_refresh: float | None = None
+
+    def acquire(self) -> None:
+        with self.lock:
+            self.busy += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self.busy = max(0, self.busy - 1)
+
+
+_PORTAUDIO_ACTIVITY = _PortAudioActivity()
+
+
+class _native_call:
+    """Context manager marking an in-flight native PortAudio call."""
+
+    def __enter__(self) -> None:
+        _PORTAUDIO_ACTIVITY.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        _PORTAUDIO_ACTIVITY.release()
+
+
+def _is_portaudio_error(sd: Any, error: BaseException | None) -> bool:
+    error_type = getattr(sd, "PortAudioError", None)
+    if not isinstance(error_type, type):
+        return False
+    seen = 0
+    while error is not None and seen < 8:
+        if isinstance(error, error_type):
+            return True
+        error = error.__cause__ or error.__context__
+        seen += 1
+    return False
+
+
+def _refresh_portaudio(sd: Any, *, reason: str) -> bool:
+    """Re-initialise PortAudio's device table if nothing else is using it."""
+
+    terminate = getattr(sd, "_terminate", None)
+    initialize = getattr(sd, "_initialize", None)
+    if not callable(terminate) or not callable(initialize):
+        return False
+    activity = _PORTAUDIO_ACTIVITY
+    with activity.lock:
+        if activity.busy != 0:
+            return False
+        now = time.monotonic()
+        last = activity.last_refresh
+        if last is not None and now - last < PORTAUDIO_REFRESH_MIN_INTERVAL_SECONDS:
+            return False
+        activity.last_refresh = now
+
+        def count() -> int:
+            try:
+                return len(sd.query_devices())
+            except Exception:
+                return -1
+
+        before = count()
+        try:
+            terminate()
+            initialize()
+        except Exception as exc:
+            LOGGER.warning(
+                "audio_backend_refresh_failed reason=%s error=%s",
+                reason,
+                type(exc).__name__,
+            )
+            try:
+                initialize()
+            except Exception:
+                pass
+            return False
+        after = count()
+    LOGGER.info(
+        "audio_backend_refreshed reason=%s device_count_before=%d device_count_after=%d",
+        reason,
+        before,
+        after,
+    )
+    return True
+
+
 def _import_sounddevice() -> Any:
     try:
         import sounddevice  # type: ignore[import-not-found]
@@ -625,6 +727,7 @@ class AudioRecorder:
         self._active_stream_generation: int | None = None
         self._resolved_device: object | int | None = _UNRESOLVED_DEVICE
         self._preferred_default_backend = False
+        self._backend_refresh_attempted = False
         self._prearmed = False
         self._first_frame_origin: float | None = None
         self._first_frame_at: float | None = None
@@ -724,7 +827,8 @@ class AudioRecorder:
 
         sd = _import_sounddevice()
         try:
-            return AudioRecorder._list_input_devices(sd)
+            with _native_call():
+                return AudioRecorder._list_input_devices(sd)
         except AudioCaptureError:
             raise
         except Exception as exc:
@@ -829,6 +933,14 @@ class AudioRecorder:
 
         if self.device is not None or not self._preferred_default_backend:
             return False
+        if not self._backend_refresh_attempted:
+            self._backend_refresh_attempted = True
+            sd = _import_sounddevice()
+            if _is_portaudio_error(sd, error) and _refresh_portaudio(sd, reason=stage):
+                # Stale device table: retry the WASAPI path with a fresh one.
+                self._resolved_device = _UNRESOLVED_DEVICE
+                self._native_sample_rate = None
+                return True
         self._preferred_default_backend = False
         self._resolved_device = None
         self._native_sample_rate = None
@@ -920,14 +1032,15 @@ class AudioRecorder:
         sd = _import_sounddevice()
         while True:
             try:
-                rate = self._resolve_native_sample_rate(sd)
-                resolved_device = self._resolve_device(sd)
-                sd.check_input_settings(
-                    device=resolved_device,
-                    channels=1,
-                    dtype="float32",
-                    samplerate=rate,
-                )
+                with _native_call():
+                    rate = self._resolve_native_sample_rate(sd)
+                    resolved_device = self._resolve_device(sd)
+                    sd.check_input_settings(
+                        device=resolved_device,
+                        channels=1,
+                        dtype="float32",
+                        samplerate=rate,
+                    )
                 return rate
             except AudioDeviceError as exc:
                 if self._fallback_to_portaudio_default(stage="prepare", error=exc):
@@ -940,6 +1053,24 @@ class AudioRecorder:
                 if self._fallback_to_portaudio_default(stage="prepare", error=exc):
                     continue
                 raise error from exc
+
+    @staticmethod
+    def _open_input_stream(sd: Any, kwargs: dict[str, Any]) -> Any:
+        """Open an input stream, counting it as a PortAudio user until closed."""
+
+        _PORTAUDIO_ACTIVITY.acquire()
+        try:
+            return sd.InputStream(**kwargs)
+        except BaseException:
+            _PORTAUDIO_ACTIVITY.release()
+            raise
+
+    @staticmethod
+    def _close_input_stream(stream: Any) -> None:
+        """Close a stream from :meth:`_open_input_stream`; release only on success."""
+
+        stream.close()
+        _PORTAUDIO_ACTIVITY.release()
 
     def _stream_kwargs(
         self,
@@ -979,8 +1110,8 @@ class AudioRecorder:
             started = False
             retry = False
             try:
-                stream = sd.InputStream(
-                    **self._stream_kwargs(rate, lambda *_args: None, sd)
+                stream = self._open_input_stream(
+                    sd, self._stream_kwargs(rate, lambda *_args: None, sd)
                 )
                 stream.start()
                 started = True
@@ -992,7 +1123,7 @@ class AudioRecorder:
                 close_ok = stream is None
                 if stream is not None:
                     try:
-                        stream.close()
+                        self._close_input_stream(stream)
                         close_ok = True
                         stream = None
                     except Exception:
@@ -1014,7 +1145,7 @@ class AudioRecorder:
             finally:
                 if stream is not None:
                     try:
-                        stream.close()
+                        self._close_input_stream(stream)
                     except Exception:
                         pass
             if retry:
@@ -1170,8 +1301,9 @@ class AudioRecorder:
                 self._stream_generation += 1
                 generation = self._stream_generation
             try:
-                stream = sd.InputStream(
-                    **self._stream_kwargs(
+                stream = self._open_input_stream(
+                    sd,
+                    self._stream_kwargs(
                         rate,
                         lambda indata, frames, time_info, status: self._audio_callback(
                             indata,
@@ -1207,7 +1339,7 @@ class AudioRecorder:
                 close_ok = stream is None
                 if stream is not None:
                     try:
-                        stream.close()
+                        self._close_input_stream(stream)
                         close_ok = True
                     except Exception:
                         close_ok = False
@@ -1243,8 +1375,9 @@ class AudioRecorder:
                 self._stream_generation += 1
                 generation = self._stream_generation
             try:
-                stream = sd.InputStream(
-                    **self._stream_kwargs(
+                stream = self._open_input_stream(
+                    sd,
+                    self._stream_kwargs(
                         rate,
                         lambda indata, frames, time_info, status: self._audio_callback(
                             indata,
@@ -1278,7 +1411,7 @@ class AudioRecorder:
                 close_ok = stream is None
                 if stream is not None:
                     try:
-                        stream.close()
+                        self._close_input_stream(stream)
                         close_ok = True
                     except Exception:
                         close_ok = False
@@ -1354,7 +1487,7 @@ class AudioRecorder:
             except Exception as exc:
                 error = exc
             try:
-                stream.close()
+                self._close_input_stream(stream)
             except Exception as exc:
                 error = error or exc
             elapsed = time.perf_counter() - started

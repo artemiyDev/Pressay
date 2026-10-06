@@ -168,3 +168,18 @@ def test_failed_replace_keeps_previous_file_and_removes_temp(monkeypatch, tmp_pa
 
     assert target.read_text(encoding="utf-8") == '{"model": "old"}'
     assert list(tmp_path.glob(".config.json.*.tmp")) == []
+
+
+def test_insert_method_defaults_to_paste_and_round_trips(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert AppConfig().insert_method == "paste"
+    config = AppConfig(insert_method="type")
+    config.save()
+    assert AppConfig.load().insert_method == "type"
+    assert AppConfig.from_dict({}).insert_method == "paste"
+    assert AppConfig.from_dict({"model": "medium"}).insert_method == "paste"
+
+
+def test_insert_method_rejects_unknown_value():
+    with pytest.raises(ConfigError, match="insert_method"):
+        AppConfig.from_dict({"insert_method": "teleport"})

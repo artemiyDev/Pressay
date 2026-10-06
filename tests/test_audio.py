@@ -1233,3 +1233,140 @@ def test_async_stream_close_failure_is_logged_without_affecting_recording(
         and "ok=False" in record.message
         for record in caplog.records
     )
+
+
+class _FakePortAudioError(Exception):
+    pass
+
+
+def _stale_table_fake(*, refresh_fixes: bool = True) -> FakeSoundDevice:
+    """WASAPI default (index 1) is stale until PortAudio is re-initialised."""
+
+    fake = _windows_default_backend_fake()
+    fake.PortAudioError = _FakePortAudioError  # type: ignore[attr-defined]
+    fake.opened = []  # type: ignore[attr-defined]
+    fake.terminated = 0  # type: ignore[attr-defined]
+    fake.initialized = 0  # type: ignore[attr-defined]
+    stale_devices = list(fake.devices)
+
+    def _terminate() -> None:
+        fake.terminated += 1  # type: ignore[attr-defined]
+
+    def _initialize() -> None:
+        fake.initialized += 1  # type: ignore[attr-defined]
+        if refresh_fixes:
+            fake.devices = stale_devices + [
+                {
+                    "name": "Built-in Microphone",
+                    "max_input_channels": 2,
+                    "default_samplerate": 48_000.0,
+                    "hostapi": 1,
+                }
+            ]
+            fake.hostapis[1]["default_input_device"] = 2
+
+    def input_stream(**kwargs: object) -> FakeStream:
+        fake.opened.append(kwargs["device"])  # type: ignore[attr-defined]
+        if kwargs["device"] == 1:
+            raise _FakePortAudioError("stale device table")
+        return FakeStream(fake, **kwargs)
+
+    fake._terminate = _terminate  # type: ignore[attr-defined]
+    fake._initialize = _initialize  # type: ignore[attr-defined]
+    fake.InputStream = input_stream  # type: ignore[method-assign]
+    return fake
+
+
+@pytest.fixture()
+def fresh_portaudio_activity(monkeypatch: pytest.MonkeyPatch):
+    activity = audio_module._PortAudioActivity()
+    monkeypatch.setattr(audio_module, "_PORTAUDIO_ACTIVITY", activity)
+    return activity
+
+
+def test_stale_wasapi_table_is_refreshed_and_wasapi_reused(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fresh_portaudio_activity,
+) -> None:
+    import logging
+
+    fake = _stale_table_fake()
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+    caplog.set_level(logging.INFO, logger="pressay.audio")
+
+    recorder = AudioRecorder(device=None)
+    rate = recorder.start()
+    recorder.cancel()
+
+    assert rate == 48_000
+    assert fake.opened == [1, 2]
+    assert (fake.terminated, fake.initialized) == (1, 1)
+    messages = [record.message for record in caplog.records]
+    assert any(
+        "audio_backend_refreshed reason=start device_count_before=2 device_count_after=3"
+        in message
+        for message in messages
+    )
+    assert not any("preferred_default_audio_backend_failed" in m for m in messages)
+    assert recorder.wait_closed(timeout=1) is True
+    assert fresh_portaudio_activity.busy == 0
+
+
+def test_no_refresh_while_another_recorder_has_open_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_portaudio_activity,
+) -> None:
+    fake = _stale_table_fake()
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+    other = AudioRecorder(device=0)  # explicit device, unaffected by the stale index
+    other.start()
+    assert fresh_portaudio_activity.busy == 1
+
+    recorder = AudioRecorder(device=None)
+    rate = recorder.start()
+    recorder.cancel()
+
+    assert rate == 44_100
+    assert (fake.terminated, fake.initialized) == (0, 0)
+    assert fake.opened == [0, 1, None]
+    other.cancel()
+    assert other.wait_closed(timeout=1) is True
+    assert recorder.wait_closed(timeout=1) is True
+
+
+def test_refresh_that_does_not_help_falls_back_after_one_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_portaudio_activity,
+) -> None:
+    fake = _stale_table_fake(refresh_fixes=False)
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+
+    recorder = AudioRecorder(device=None)
+    rate = recorder.start()
+    recorder.cancel()
+
+    assert rate == 44_100
+    assert (fake.terminated, fake.initialized) == (1, 1)
+    assert fake.opened == [1, 1, None]
+    assert recorder.wait_closed(timeout=1) is True
+
+
+def test_refresh_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_portaudio_activity,
+) -> None:
+    fake = _stale_table_fake(refresh_fixes=False)
+    install_fake(monkeypatch, fake)
+    monkeypatch.setattr(audio_module.sys, "platform", "win32")
+
+    for _ in range(2):
+        recorder = AudioRecorder(device=None)
+        recorder.start()
+        recorder.cancel()
+        assert recorder.wait_closed(timeout=1) is True
+
+    assert fake.terminated == 1

@@ -1960,3 +1960,31 @@ def test_copy_reporting_unsuccessful_outcome_is_not_claimed_as_copied(monkeypatc
         assert "не удалось" in str(notifications[-1][1])
     finally:
         controller.close()
+
+
+@pytest.mark.parametrize("method", ["paste", "type"])
+def test_controller_passes_live_insert_method_to_send_text(monkeypatch, method) -> None:
+    options: list[dict[str, object]] = []
+    controller = DictationController(
+        AppConfig(auto_insert=True, insert_method=method),
+        status_callback=lambda *_args: None,
+        result_callback=lambda *_args: None,
+        notification_callback=lambda *_args: None,
+    )
+    recorder = FakeRecorder()
+    controller._new_recorder = lambda: recorder  # type: ignore[method-assign]
+    controller._transcriber = FakeTranscriber(controller.config.model)  # type: ignore[assignment]
+
+    def capture_insertion(text, **kwargs):
+        options.append(dict(kwargs))
+        return SimpleNamespace(success=True)
+
+    monkeypatch.setattr("pressay.windows_input.send_text", capture_insertion)
+
+    assert controller.start_recording(target="editor") is True
+    assert controller.stop_recording() is True
+    assert controller._future is not None
+    controller._future.result(timeout=2)
+
+    assert options[0]["insert_method"] == method
+    controller.close()

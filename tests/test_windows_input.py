@@ -1555,7 +1555,6 @@ def _partial_write_clipboard(
     )
     clipboard.open_timeout_s = 0.01
     clipboard.retry_interval_s = 0.001
-    clipboard._com_transaction_depth = 1
     rich_object = object()
     return clipboard, rich_object, SimpleNamespace(user32=user32, kernel32=kernel32)
 
@@ -1919,3 +1918,431 @@ def test_evidence_flags_changed_log_is_emitted_once_per_insertion(
     assert "value_writable" in flag_lines[0]
     assert "text_editable" in flag_lines[0]
     assert "caret_active" in flag_lines[0]
+
+
+def test_paste_method_pastes_single_line_text_without_typing() -> None:
+    backend = FakeBackend([TARGET])
+    clipboard = FakeClipboard("prior clipboard")
+
+    outcome = send_text(
+        "hello",
+        TARGET,
+        backend=backend,
+        clipboard=clipboard,
+        insert_method="paste",
+        clipboard_settle_s=0,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert outcome.status is InputStatus.PASTED_CLIPBOARD
+    assert outcome.success
+    assert outcome.method == "clipboard_paste"
+    assert backend.ctrl_v_calls == 1
+    assert backend.unicode_batches == []
+    assert clipboard.writes == ["hello", "prior clipboard"]
+    assert clipboard.text == "prior clipboard"
+
+
+def test_type_method_keeps_sendinput_typing_for_single_line_text() -> None:
+    backend = FakeBackend([TARGET])
+    clipboard = FakeClipboard("prior clipboard")
+
+    outcome = send_text(
+        "hello",
+        TARGET,
+        backend=backend,
+        clipboard=clipboard,
+        insert_method="type",
+        sleeper=lambda _seconds: None,
+    )
+
+    assert outcome.success
+    assert outcome.method != "clipboard_paste"
+    assert backend.ctrl_v_calls == 0
+    assert backend.unicode_batches
+    assert clipboard.writes == []
+
+
+def test_paste_method_press_enter_sends_enter_after_paste() -> None:
+    backend = FakeBackend([TARGET])
+    clipboard = FakeClipboard("prior clipboard")
+
+    outcome = send_text(
+        "hello",
+        TARGET,
+        backend=backend,
+        clipboard=clipboard,
+        insert_method="paste",
+        press_enter=True,
+        clipboard_settle_s=0,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert outcome.success
+    assert outcome.method == "clipboard_paste"
+    assert backend.ctrl_v_calls == 1
+    assert backend.enter_calls == 1
+    assert backend.unicode_batches == []
+
+
+def _history_format_clipboard(*, fail_register: bool = False, fail_set: bool = False):
+    class FakeUser32:
+        def __init__(self) -> None:
+            self.sequence = 10
+            self.opened = False
+            self.registered: dict[str, int] = {}
+            self.set_formats: list[int] = []
+
+        def OpenClipboard(self, _owner: object) -> bool:
+            self.opened = True
+            return True
+
+        def CloseClipboard(self) -> bool:
+            self.opened = False
+            return True
+
+        def EmptyClipboard(self) -> bool:
+            self.sequence += 1
+            return True
+
+        def GetClipboardSequenceNumber(self) -> int:
+            return self.sequence
+
+        def RegisterClipboardFormatW(self, name: str) -> int:
+            if fail_register:
+                raise OSError("register failed")
+            return self.registered.setdefault(name, 0xC000 + len(self.registered))
+
+        def SetClipboardData(self, fmt: int, _memory: object) -> int:
+            if fail_set and fmt != Win32Clipboard.CF_UNICODETEXT:
+                return 0
+            self.set_formats.append(fmt)
+            return 1
+
+    class FakeKernel32:
+        @staticmethod
+        def GlobalAlloc(_flags: int, size: int) -> object:
+            return bytearray(size)
+
+        @staticmethod
+        def GlobalLock(_memory: object) -> int:
+            return 1
+
+        @staticmethod
+        def GlobalUnlock(_memory: object) -> int:
+            return 1
+
+        @staticmethod
+        def GlobalFree(_memory: object) -> int:
+            return 0
+
+    class FakeCtypes:
+        @staticmethod
+        def memmove(_pointer: object, _data: bytes, _size: int) -> None:
+            return None
+
+        @staticmethod
+        def get_last_error() -> int:
+            return 5
+
+    user32 = FakeUser32()
+    clipboard = object.__new__(Win32Clipboard)
+    clipboard._api = SimpleNamespace(
+        ctypes=FakeCtypes, user32=user32, kernel32=FakeKernel32()
+    )
+    clipboard.open_timeout_s = 0.01
+    clipboard.retry_interval_s = 0.001
+    return clipboard, user32
+
+
+def test_win32_temporary_text_registers_history_exclusion_formats() -> None:
+    clipboard, user32 = _history_format_clipboard()
+
+    assert clipboard.replace_text_if_sequence("transcript", 10) is True
+
+    assert set(user32.registered) == {
+        "CanIncludeInClipboardHistory",
+        "CanUploadToCloudClipboard",
+        "ExcludeClipboardContentFromMonitorProcessing",
+    }
+    assert user32.set_formats[0] == Win32Clipboard.CF_UNICODETEXT
+    assert set(user32.set_formats[1:]) == set(user32.registered.values())
+
+
+@pytest.mark.parametrize("failure", ["register", "set"])
+def test_win32_history_exclusion_failure_does_not_break_text_write(failure) -> None:
+    clipboard, user32 = _history_format_clipboard(
+        fail_register=failure == "register", fail_set=failure == "set"
+    )
+
+    assert clipboard.replace_text_if_sequence("transcript", 10) is True
+    assert user32.set_formats[0] == Win32Clipboard.CF_UNICODETEXT
+    assert user32.opened is False
+
+
+# ---------------------------------------------------------------------------
+# Native multi-format clipboard snapshot / restore (fake _api layer)
+# ---------------------------------------------------------------------------
+
+
+class _FakeNativeClipboard:
+    """In-memory model of user32/kernel32/ctypes calls used by the snapshot."""
+
+    def __init__(self, formats: dict[int, bytes], names: dict[int, str] | None = None):
+        self.formats = dict(formats)  # id -> bytes (the "clipboard")
+        self.names = dict(names or {})
+        self.memory: dict[int, bytes] = {}
+        self.next_handle = 1000
+        self.freed: list[int] = []
+        self.set_calls: list[tuple[int, bytes]] = []
+        self.fail_set_for: set[int] = set()
+        self.emptied = 0
+        self.registered: dict[str, int] = {}
+        self.opened = False
+        for fid, data in self.formats.items():
+            self.memory[fid + 5000] = data  # handle = id + 5000
+
+        outer = self
+
+        class User32:
+            @staticmethod
+            def OpenClipboard(_hwnd):
+                outer.opened = True
+                return 1
+
+            @staticmethod
+            def CloseClipboard():
+                outer.opened = False
+                return 1
+
+            @staticmethod
+            def EnumClipboardFormats(previous):
+                ids = sorted(outer.formats)
+                if previous == 0:
+                    return ids[0] if ids else 0
+                later = [i for i in ids if i > previous]
+                return later[0] if later else 0
+
+            @staticmethod
+            def GetClipboardData(fid):
+                return fid + 5000
+
+            @staticmethod
+            def GetClipboardFormatNameW(fid, buffer, _n):
+                if fid in outer.names:
+                    buffer.value = outer.names[fid]
+                    return len(outer.names[fid])
+                return 0
+
+            @staticmethod
+            def RegisterClipboardFormatW(name):
+                return outer.registered.setdefault(name, 0xC100 + len(outer.registered))
+
+            @staticmethod
+            def EmptyClipboard():
+                outer.emptied += 1
+                return 1
+
+            @staticmethod
+            def SetClipboardData(fid, handle):
+                if fid in outer.fail_set_for:
+                    return 0
+                outer.set_calls.append((fid, outer.memory[handle]))
+                return handle
+
+        class Kernel32:
+            @staticmethod
+            def GlobalSize(handle):
+                return len(outer.memory[handle])
+
+            @staticmethod
+            def GlobalLock(handle):
+                return handle
+
+            @staticmethod
+            def GlobalUnlock(_handle):
+                return 1
+
+            @staticmethod
+            def GlobalAlloc(_flags, size):
+                outer.next_handle += 1
+                outer.memory[outer.next_handle] = bytes(size)
+                return outer.next_handle
+
+            @staticmethod
+            def GlobalFree(handle):
+                outer.freed.append(handle)
+                return 0
+
+        class FakeCtypes:
+            create_unicode_buffer = staticmethod(ctypes.create_unicode_buffer)
+
+            @staticmethod
+            def string_at(pointer, size):
+                return outer.memory[pointer][:size]
+
+            @staticmethod
+            def memmove(pointer, data, size):
+                outer.memory[pointer] = bytes(data)[:size]
+
+            @staticmethod
+            def get_last_error():
+                return 5
+
+        self.api = SimpleNamespace(
+            ctypes=FakeCtypes, user32=User32(), kernel32=Kernel32()
+        )
+
+
+def _native_clipboard(fake: _FakeNativeClipboard) -> Win32Clipboard:
+    clipboard = object.__new__(Win32Clipboard)
+    clipboard._api = fake.api
+    clipboard.open_timeout_s = 0.01
+    clipboard.retry_interval_s = 0.001
+    return clipboard
+
+
+def test_snapshot_copies_bytes_and_skips_gdi_formats() -> None:
+    fake = _FakeNativeClipboard(
+        {13: b"h\x00i\x00\x00\x00", 2: b"BITMAP", 8: b"DIB", 14: b"EMF", 0xC001: b"\x01\x02\x03"},
+        names={0xC001: "PressayTestFormat"},
+    )
+    snapshot = _native_clipboard(fake).capture_all_formats()
+
+    assert [(e.format_id, e.name, e.data) for e in snapshot.entries] == [
+        (8, None, b"DIB"),
+        (13, None, b"h\x00i\x00\x00\x00"),
+        (0xC001, "PressayTestFormat", b"\x01\x02\x03"),
+    ]
+    assert fake.opened is False
+    # the snapshot holds copies, independent of later clipboard changes
+    fake.memory[8 + 5000] = b"CHANGED"
+    assert snapshot.entries[0].data == b"DIB"
+
+
+def test_restore_sets_every_format_and_history_exclusion() -> None:
+    fake = _FakeNativeClipboard(
+        {13: b"abc", 0xC001: b"\x01\x02\x03"}, names={0xC001: "PressayTestFormat"}
+    )
+    clipboard = _native_clipboard(fake)
+    snapshot = clipboard.capture_all_formats()
+    fake.set_calls.clear()
+
+    clipboard.restore_all_formats(snapshot)
+
+    assert fake.emptied == 1
+    assert fake.set_calls[0] == (13, b"abc")
+    assert fake.set_calls[1] == (fake.registered["PressayTestFormat"], b"\x01\x02\x03")
+    exclusion_ids = {
+        fake.registered[n]
+        for n in (
+            "CanIncludeInClipboardHistory",
+            "CanUploadToCloudClipboard",
+            "ExcludeClipboardContentFromMonitorProcessing",
+        )
+    }
+    assert {fid for fid, _ in fake.set_calls[2:]} == exclusion_ids
+    assert fake.freed == []
+    assert fake.opened is False
+
+
+def test_restore_of_empty_snapshot_only_clears_clipboard() -> None:
+    fake = _FakeNativeClipboard({})
+    clipboard = _native_clipboard(fake)
+    snapshot = clipboard.capture_all_formats()
+    assert snapshot.entries == ()
+
+    clipboard.restore_all_formats(snapshot)
+
+    assert fake.emptied == 1
+    assert fake.set_calls == []
+
+
+def test_restore_frees_memory_when_set_clipboard_data_fails() -> None:
+    fake = _FakeNativeClipboard({13: b"abc", 1: b"def"})
+    clipboard = _native_clipboard(fake)
+    snapshot = clipboard.capture_all_formats()
+    fake.fail_set_for = {1}
+    fake.set_calls.clear()
+
+    with pytest.raises(Exception, match="restore incomplete"):
+        clipboard.restore_all_formats(snapshot)
+
+    assert len(fake.freed) == 1  # only the rejected block is freed
+    assert (13, b"abc") in fake.set_calls  # other formats are still restored
+    assert fake.opened is False
+
+
+class _NativeTransactionAdapter(FakeClipboard):
+    """FakeClipboard text/sequence plus the real Win32Clipboard restore."""
+
+    def __init__(self, win32: Win32Clipboard, snapshot) -> None:
+        super().__init__("prior")
+        self._win32 = win32
+        self._snapshot = snapshot
+
+    def capture_all_formats(self):
+        return self._snapshot
+
+    def restore_all_formats(self, snapshot) -> None:
+        self._win32.restore_all_formats(snapshot)
+
+
+def test_snapshot_over_size_limit_is_not_copied_and_restore_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pressay.windows_input as wi
+
+    monkeypatch.setattr(wi, "CLIPBOARD_SNAPSHOT_LIMIT_BYTES", 8)
+    fake = _FakeNativeClipboard({13: b"12345", 1: b"6789"})
+    clipboard = _native_clipboard(fake)
+
+    snapshot = clipboard.capture_all_formats()
+    assert snapshot.oversized and snapshot.entries == ()
+
+    result = clipboard_paste_transaction(
+        "transcript",
+        clipboard=_NativeTransactionAdapter(clipboard, snapshot),
+        paste=lambda: True,
+        settle_s=0,
+    )
+    assert result.success is True
+    assert result.copied is True and result.restored is False
+    assert result.reason == "clipboard_restore_failed"
+    assert "clipboard_snapshot_too_large" in (result.detail or "")
+    assert fake.emptied == 0  # nothing was wiped by the failed restore
+
+
+def test_transaction_skips_restore_when_sequence_changed_after_paste() -> None:
+    clipboard = AtomicClipboard("plain", rich=object())
+
+    def paste() -> bool:
+        clipboard.external_change("user copied something new")
+        return True
+
+    result = clipboard_paste_transaction(
+        "transcript", clipboard=clipboard, paste=paste, settle_s=0
+    )
+
+    assert result.reason == "clipboard_changed_not_restored"
+    assert clipboard.restored_object is None
+    assert clipboard.text == "user copied something new"
+
+
+def test_snapshot_skips_ole_markers_and_private_range() -> None:
+    fake = _FakeNativeClipboard(
+        {
+            13: b"t\x00\x00\x00",
+            0x0200: b"PRIVATE",
+            0xC001: b"OLEOBJ",
+            0xC002: b"OLEPRIV",
+            0xC003: b"\x01",
+        },
+        names={0xC001: "DataObject", 0xC002: "Ole Private Data", 0xC003: "HTML Format"},
+    )
+    snapshot = _native_clipboard(fake).capture_all_formats()
+
+    assert [(e.format_id, e.name) for e in snapshot.entries] == [
+        (13, None),
+        (0xC003, "HTML Format"),
+    ]

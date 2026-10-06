@@ -432,3 +432,30 @@ def test_sticky_save_emits_settings_and_translation_controls_stay_in_scroll(
         assert saved[0]["translate_model"] == "medium"
     finally:
         _close(app, window)
+
+
+def test_insert_method_combo_is_in_settings_values_and_survives_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app, signals, window = _window(config=AppConfig())
+    saved: list[dict[str, object]] = []
+    signals.save_requested.connect(saved.append)
+    try:
+        assert window.current_settings()["insert_method"] == "paste"
+        assert window.insert_method_combo.itemText(0) == "Мгновенно (через буфер обмена)"
+        assert window.insert_method_combo.itemText(1) == "Набором символов"
+        window.insert_method_combo.setCurrentIndex(
+            window.insert_method_combo.findData("type")
+        )
+        assert window.current_settings()["insert_method"] == "type"
+        window._emit_save()
+        assert saved[-1]["insert_method"] == "type"
+    finally:
+        _close(app, window)
+
+    app, _signals, window = _window(config=AppConfig(insert_method="type"))
+    try:
+        assert window.insert_method_combo.currentData() == "type"
+    finally:
+        _close(app, window)

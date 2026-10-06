@@ -2106,6 +2106,7 @@ class DictationController:
                     expected_target=target,
                     press_enter=press_enter,
                     strict_editable_check=self.config.strict_editable_check,
+                    insert_method=self.config.insert_method,
                     cancelled=cancelled,
                     # Automatic delivery never overwrites the user's clipboard on
                     # failure. The transcript is already retained in memory/UI;

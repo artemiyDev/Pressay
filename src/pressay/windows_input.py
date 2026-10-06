@@ -761,24 +761,15 @@ def clipboard_paste_transaction(
     newer value is never overwritten.
     """
 
-    begin_transaction = getattr(clipboard, "begin_transaction", None)
-    end_transaction = getattr(clipboard, "end_transaction", None)
-    transaction_started = callable(begin_transaction)
-    if transaction_started:
-        begin_transaction()
-    try:
-        return _clipboard_paste_transaction_inner(
-            text,
-            clipboard=clipboard,
-            paste=paste,
-            guard=guard,
-            settle_s=settle_s,
-            sleeper=sleeper,
-            cancelled=cancelled,
-        )
-    finally:
-        if transaction_started and callable(end_transaction):
-            end_transaction()
+    return _clipboard_paste_transaction_inner(
+        text,
+        clipboard=clipboard,
+        paste=paste,
+        guard=guard,
+        settle_s=settle_s,
+        sleeper=sleeper,
+        cancelled=cancelled,
+    )
 
 
 def _clipboard_paste_transaction_inner(
@@ -999,7 +990,7 @@ def _rollback_temporary_clipboard(
     Restoration is allowed only while our clipboard sequence still owns the
     clipboard.  A concurrent user/application update therefore always wins.
     The sequence check is retried once so a transient query failure can still
-    restore the retained OLE object without weakening that ownership guard.
+    restore the retained snapshot without weakening that ownership guard.
     """
 
     current_sequence: int | None = None
@@ -1186,6 +1177,8 @@ def _load_win32_api() -> SimpleNamespace:
     user32.GetClipboardData.restype = wintypes.HANDLE
     user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
     user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes = (wintypes.LPCWSTR,)
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
     user32.GetClipboardSequenceNumber.argtypes = ()
     user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 
@@ -1197,6 +1190,16 @@ def _load_win32_api() -> SimpleNamespace:
     kernel32.GlobalUnlock.restype = wintypes.BOOL
     kernel32.GlobalFree.argtypes = (wintypes.HGLOBAL,)
     kernel32.GlobalFree.restype = wintypes.HGLOBAL
+    kernel32.GlobalSize.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+    user32.EnumClipboardFormats.argtypes = (wintypes.UINT,)
+    user32.EnumClipboardFormats.restype = wintypes.UINT
+    user32.GetClipboardFormatNameW.argtypes = (
+        wintypes.UINT,
+        wintypes.LPWSTR,
+        ctypes.c_int,
+    )
+    user32.GetClipboardFormatNameW.restype = ctypes.c_int
 
     _WIN32_API = SimpleNamespace(
         ctypes=ctypes,
@@ -1399,8 +1402,48 @@ class Win32InputBackend:
         )
 
 
+CLIPBOARD_SNAPSHOT_LIMIT_BYTES = 64 * 1024 * 1024
+_SKIPPED_CLIPBOARD_FORMATS = frozenset(
+    {2, 3, 9, 14, 0x0080, 0x0082, 0x0083, 0x008E}
+)
+_HISTORY_EXCLUSION_FORMATS = frozenset(
+    {
+        "CanIncludeInClipboardHistory",
+        "CanUploadToCloudClipboard",
+        "ExcludeClipboardContentFromMonitorProcessing",
+    }
+)
+
+
+def _is_skipped_clipboard_format(format_id: int) -> bool:
+    # 0x200-0x2FF (CF_PRIVATE range) are owner-defined handles that need not
+    # be HGLOBALs; 0x300-0x3FF (CF_GDIOBJ range) hold GDI handles.
+    return (
+        format_id in _SKIPPED_CLIPBOARD_FORMATS
+        or 0x0200 <= format_id <= 0x03FF
+    )
+
+
+# OLE's own markers point at the previous owner's live IDataObject; replayed
+# as raw bytes after that owner lost the clipboard they would dangle.
+_SKIPPED_CLIPBOARD_FORMAT_NAMES = frozenset({"DataObject", "Ole Private Data"})
+
+
+@dataclass(frozen=True)
+class ClipboardFormatEntry:
+    format_id: int
+    name: str | None  # set for registered formats (id >= 0xC000)
+    data: bytes
+
+
+@dataclass(frozen=True)
+class ClipboardFormatsSnapshot:
+    entries: tuple[ClipboardFormatEntry, ...]
+    oversized: bool = False
+
+
 class Win32Clipboard:
-    """Unicode-text-only Windows clipboard adapter."""
+    """Windows clipboard adapter with native multi-format snapshot/restore."""
 
     CF_UNICODETEXT = 13
     supports_transactional_restore = True
@@ -1414,23 +1457,6 @@ class Win32Clipboard:
         self._api = _load_win32_api()
         self.open_timeout_s = open_timeout_s
         self.retry_interval_s = retry_interval_s
-        self._com_transaction_depth = 0
-
-    def begin_transaction(self) -> None:
-        import pythoncom
-
-        if self._com_transaction_depth == 0:
-            pythoncom.CoInitialize()
-        self._com_transaction_depth += 1
-
-    def end_transaction(self) -> None:
-        import pythoncom
-
-        if self._com_transaction_depth <= 0:
-            return
-        self._com_transaction_depth -= 1
-        if self._com_transaction_depth == 0:
-            pythoncom.CoUninitialize()
 
     def _open(self) -> None:
         deadline = time.monotonic() + self.open_timeout_s
@@ -1443,34 +1469,119 @@ class Win32Clipboard:
     def sequence_number(self) -> int:
         return int(self._api.user32.GetClipboardSequenceNumber())
 
-    def capture_all_formats(self) -> object:
-        """Hold the complete OLE IDataObject, including rich/private formats."""
+    def capture_all_formats(self) -> "ClipboardFormatsSnapshot":
+        """Copy the bytes of every HGLOBAL clipboard format under one open.
 
-        import pythoncom
+        ``OleGetClipboard`` is a live proxy of the current clipboard, so it
+        cannot preserve the previous content once we overwrite it.  Instead
+        the data is copied natively.  GDI/handle formats are skipped (Windows
+        synthesizes CF_BITMAP etc. from CF_DIB).  If the total exceeds
+        ``CLIPBOARD_SNAPSHOT_LIMIT_BYTES`` an ``oversized`` snapshot is
+        returned and restoring it fails with a clear reason.
+        """
 
-        owns_com = self._com_transaction_depth == 0
-        if owns_com:
-            pythoncom.CoInitialize()
+        api = self._api
+        entries: list[ClipboardFormatEntry] = []
+        total = 0
+        oversized = False
+        self._open()
         try:
-            return pythoncom.OleGetClipboard()
+            format_id = 0
+            while True:
+                format_id = int(api.user32.EnumClipboardFormats(format_id))
+                if not format_id:
+                    break
+                if _is_skipped_clipboard_format(format_id):
+                    continue
+                handle = api.user32.GetClipboardData(format_id)
+                if not handle:
+                    continue
+                size = int(api.kernel32.GlobalSize(handle))
+                if total + size > CLIPBOARD_SNAPSHOT_LIMIT_BYTES:
+                    oversized = True
+                    break
+                pointer = api.kernel32.GlobalLock(handle)
+                if not pointer:
+                    continue
+                try:
+                    data = api.ctypes.string_at(pointer, size)
+                finally:
+                    api.kernel32.GlobalUnlock(handle)
+                total += size
+                name = None
+                if format_id >= 0xC000:
+                    buffer = api.ctypes.create_unicode_buffer(256)
+                    if api.user32.GetClipboardFormatNameW(format_id, buffer, 256):
+                        name = buffer.value
+                    else:
+                        continue  # cannot be re-registered reliably
+                    if name in _SKIPPED_CLIPBOARD_FORMAT_NAMES:
+                        total -= size
+                        continue
+                entries.append(ClipboardFormatEntry(format_id, name, data))
         finally:
-            if owns_com:
-                pythoncom.CoUninitialize()
+            api.user32.CloseClipboard()
+        if oversized:
+            return ClipboardFormatsSnapshot(entries=(), oversized=True)
+        return ClipboardFormatsSnapshot(entries=tuple(entries))
 
-    def restore_all_formats(self, data_object: object) -> None:
-        """Restore and materialize a previously retained OLE data object."""
+    def restore_all_formats(self, snapshot: "ClipboardFormatsSnapshot") -> None:
+        """Rewrite a previously copied snapshot (empty snapshot clears)."""
 
-        import pythoncom
-
-        owns_com = self._com_transaction_depth == 0
-        if owns_com:
-            pythoncom.CoInitialize()
+        if snapshot.oversized:
+            raise WindowsInputError(
+                "clipboard_snapshot_too_large: previous clipboard exceeded "
+                f"{CLIPBOARD_SNAPSHOT_LIMIT_BYTES} bytes and was not restored"
+            )
+        api = self._api
+        failures: list[str] = []
+        self._open()
         try:
-            pythoncom.OleSetClipboard(data_object)
-            pythoncom.OleFlushClipboard()
+            if not api.user32.EmptyClipboard():
+                error = api.ctypes.get_last_error()
+                raise WindowsInputError(f"EmptyClipboard failed ({error})")
+            for entry in snapshot.entries:
+                if entry.name in _HISTORY_EXCLUSION_FORMATS:
+                    continue  # overridden by _exclude_from_history below
+                try:
+                    format_id = entry.format_id
+                    if entry.name is not None:
+                        format_id = api.user32.RegisterClipboardFormatW(entry.name)
+                        if not format_id:
+                            raise WindowsInputError("RegisterClipboardFormatW failed")
+                    self._set_global_data(format_id, entry.data)
+                except Exception as exc:
+                    failures.append(f"{entry.name or entry.format_id}: {exc}")
+            if snapshot.entries:
+                self._exclude_from_history()
         finally:
-            if owns_com:
-                pythoncom.CoUninitialize()
+            api.user32.CloseClipboard()
+        if failures:
+            raise WindowsInputError("clipboard restore incomplete: " + "; ".join(failures))
+
+    def _set_global_data(self, format_id: int, data: bytes) -> None:
+        api = self._api
+        memory = api.kernel32.GlobalAlloc(0x0002, max(1, len(data)))
+        if not memory:
+            raise WindowsInputError(f"GlobalAlloc failed ({api.ctypes.get_last_error()})")
+        transferred = False
+        try:
+            pointer = api.kernel32.GlobalLock(memory)
+            if not pointer:
+                raise WindowsInputError(f"GlobalLock failed ({api.ctypes.get_last_error()})")
+            try:
+                if data:
+                    api.ctypes.memmove(pointer, data, len(data))
+            finally:
+                api.kernel32.GlobalUnlock(memory)
+            if not api.user32.SetClipboardData(format_id, memory):
+                raise WindowsInputError(
+                    f"SetClipboardData failed ({api.ctypes.get_last_error()})"
+                )
+            transferred = True
+        finally:
+            if not transferred:
+                api.kernel32.GlobalFree(memory)
 
     def replace_text_if_sequence(
         self,
@@ -1483,8 +1594,8 @@ class Win32Clipboard:
 
         Only this backend can know that ``EmptyClipboard`` succeeded while it
         owned the clipboard lock. If a later allocation/copy/SetClipboardData
-        step fails, it closes the native lock and restores the retained OLE
-        object while the surrounding COM transaction is still alive. A changed
+        step fails, it closes the native lock and restores the retained
+        native snapshot. A changed
         sequence is treated as external ownership and is never overwritten.
         """
 
@@ -1522,6 +1633,7 @@ class Win32Clipboard:
                 raise WindowsInputError(f"SetClipboardData failed ({error})")
             transferred = True
             replaced = True
+            self._exclude_from_history()
         except Exception as exc:
             failure = exc
         finally:
@@ -1562,6 +1674,53 @@ class Win32Clipboard:
             reason="clipboard_write_failed",
             restored=True,
         ) from failure
+
+    def _exclude_from_history(self) -> None:
+        """Keep the temporary dictation text out of Win+V history and cloud sync.
+
+        Must be called while the clipboard is open and after the text was set.
+        Best effort: any failure is logged and never affects the paste.
+        """
+
+        api = self._api
+        for name, payload in (
+            ("CanIncludeInClipboardHistory", 0),
+            ("CanUploadToCloudClipboard", 0),
+            ("ExcludeClipboardContentFromMonitorProcessing", 0),
+        ):
+            memory = None
+            transferred = False
+            try:
+                format_id = api.user32.RegisterClipboardFormatW(name)
+                if not format_id:
+                    raise WindowsInputError(
+                        f"RegisterClipboardFormatW failed ({api.ctypes.get_last_error()})"
+                    )
+                memory = api.kernel32.GlobalAlloc(0x0002, 4)
+                if not memory:
+                    raise WindowsInputError("GlobalAlloc failed")
+                pointer = api.kernel32.GlobalLock(memory)
+                if not pointer:
+                    raise WindowsInputError("GlobalLock failed")
+                try:
+                    api.ctypes.memmove(
+                        pointer, int(payload).to_bytes(4, "little"), 4
+                    )
+                finally:
+                    api.kernel32.GlobalUnlock(memory)
+                if not api.user32.SetClipboardData(format_id, memory):
+                    raise WindowsInputError(
+                        f"SetClipboardData failed ({api.ctypes.get_last_error()})"
+                    )
+                transferred = True
+            except Exception as exc:
+                _LOGGER.debug("clipboard history exclusion %s skipped: %s", name, exc)
+            finally:
+                if memory and not transferred:
+                    try:
+                        api.kernel32.GlobalFree(memory)
+                    except Exception:
+                        pass
 
     def get_text(self) -> tuple[bool, str]:
         api = self._api
@@ -1870,12 +2029,16 @@ def send_text(
     clipboard: Optional[ClipboardBackend] = None,
     modifier_timeout_s: float = 0.8,
     batch_size: int = 96,
-    clipboard_settle_s: float = 0.08,
+    # Time the target gets to read the temporary clipboard after Ctrl+V
+    # before the previous content is restored. Busy Electron/Chromium apps
+    # read it asynchronously; restoring too early pastes the old clipboard.
+    clipboard_settle_s: float = 0.25,
     fallback_to_clipboard: bool = True,
     press_enter: bool = False,
     strict_editable_check: bool = False,
     sleeper: Callable[[float], None] = time.sleep,
     cancelled: Callable[[], bool] | None = None,
+    insert_method: str = "type",
 ) -> InputOutcome:
     """Deliver transcribed text to the window captured at recording start.
 
@@ -2052,7 +2215,12 @@ def send_text(
     # Some Windows controls reorder a surrogate pair delivered as separate
     # KEYEVENTF_UNICODE events. Use one clipboard paste for non-BMP text so
     # emoji and historic scripts preserve exact character order.
-    if "\n" in text or "\r" in text or any(ord(character) > 0xFFFF for character in text):
+    if (
+        insert_method == "paste"
+        or "\n" in text
+        or "\r" in text
+        or any(ord(character) > 0xFFFF for character in text)
+    ):
         try:
             active_clipboard = clipboard or _default_clipboard()
         except Exception as exc:
@@ -2287,7 +2455,7 @@ def paste_last(
     backend: Optional[InputBackend] = None,
     clipboard: Optional[ClipboardBackend] = None,
     modifier_timeout_s: float = 0.8,
-    clipboard_settle_s: float = 0.08,
+    clipboard_settle_s: float = 0.25,
     strict_editable_check: bool = False,
     sleeper: Callable[[float], None] = time.sleep,
     cancelled: Callable[[], bool] | None = None,

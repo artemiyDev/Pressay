@@ -27,6 +27,7 @@ LEGACY_APP_DIRECTORY = "WhisperFlow"
 CONFIG_FILENAME = "config.json"
 SUPPORTED_LANGUAGES = frozenset({"auto", "ru", "en"})
 SUPPORTED_RESOURCE_MODES = frozenset({"instant", "balanced", "eco"})
+SUPPORTED_INSERT_METHODS = frozenset({"paste", "type"})
 SUPPORTED_TRANSLATE_MODELS = frozenset({"small", "medium", "large-v3"})
 
 #: Which engine transcribes Russian.  GigaAM v3 e2e is Russian-only but measured
@@ -154,6 +155,7 @@ class AppConfig:
     russian_engine: str = "gigaam"
     gigaam_model: str = "gigaam-v3-e2e-rnnt"
     strict_editable_check: bool = False
+    insert_method: str = "paste"
     resource_mode: str = "instant"
     snippets: dict[str, str] = field(default_factory=dict)
     replacements: dict[str, str] = field(default_factory=dict)
@@ -204,6 +206,12 @@ class AppConfig:
         ).casefold()
         if russian_engine not in SUPPORTED_RUSSIAN_ENGINES:
             raise ConfigError("russian_engine must be one of: whisper, gigaam")
+
+        insert_method = _non_empty_string(
+            raw.get("insert_method", defaults.insert_method), "insert_method"
+        ).casefold()
+        if insert_method not in SUPPORTED_INSERT_METHODS:
+            raise ConfigError("insert_method must be one of: paste, type")
 
         gigaam_model = _non_empty_string(
             raw.get("gigaam_model", defaults.gigaam_model), "gigaam_model"
@@ -263,6 +271,7 @@ class AppConfig:
             ),
             translate_model=translate_model,
             russian_engine=russian_engine,
+            insert_method=insert_method,
             gigaam_model=gigaam_model,
             strict_editable_check=_bool(
                 raw.get("strict_editable_check", defaults.strict_editable_check),

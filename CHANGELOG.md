@@ -5,9 +5,9 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 Здесь перечислены заметные пользовательские изменения. Даты указаны в формате
 `YYYY-MM-DD`.
 
-`0.6.10` is the version declared by the current source tree. Changes since
+`0.6.11` is the version declared by the current source tree. Changes since
 0.3.0 are listed together under "Unreleased"; releases from 0.6.6 on are tagged
-`vX.Y.Z`. Версия `0.6.10` указана в текущем исходном коде. Изменения после 0.3.0
+`vX.Y.Z`. Версия `0.6.11` указана в текущем исходном коде. Изменения после 0.3.0
 собраны в разделе «Не выпущено»; выпуски начиная с 0.6.6 помечены тегами
 `vX.Y.Z`.
 
@@ -15,6 +15,14 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 
 ### Added / Добавлено
 
+- Dictated text is pasted in one step through the clipboard by default instead
+  of being typed character by character; the previous clipboard is restored
+  and the temporary text is kept out of Windows clipboard history. "Typing"
+  stays available in settings for apps where paste does not work.
+- Продиктованный текст по умолчанию вставляется сразу целиком через буфер
+  обмена, а не набирается по буквам; прежнее содержимое буфера возвращается, а
+  временный текст не попадает в журнал буфера Windows. Набор символов остаётся
+  в настройках для приложений, где вставка не срабатывает.
 - The settings window has a "Russian engine" choice (GigaAM / Whisper), active
   only for the Russian language. The active-model line now names GigaAM when it
   is the engine in use instead of the idle Whisper model.
@@ -155,6 +163,14 @@ Notable user-visible changes are recorded here. Dates use `YYYY-MM-DD`.
 
 ### Fixed / Исправлено
 
+- After audio devices change (a headset or dock is plugged in or removed),
+  Pressay refreshes PortAudio's device list and keeps recording through WASAPI
+  instead of falling back to the legacy MME path until restart, which made
+  recordings quieter and recognition worse.
+- После смены аудиоустройств (подключили или отключили гарнитуру, док) Pressay
+  обновляет список устройств PortAudio и продолжает писать через WASAPI, а не
+  переходит до перезапуска на старый путь MME, из-за которого запись была тише,
+  а распознавание хуже.
 - The Windows taskbar shows the Pressay icon instead of Python's (explicit
   AppUserModelID).
 - Панель задач Windows показывает значок Pressay, а не Python (явный

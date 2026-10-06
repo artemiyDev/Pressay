@@ -682,6 +682,32 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(voice_formatting_hint)
         layout.addWidget(self.voice_translate_checkbox)
 
+        insert_form = QFormLayout()
+        insert_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        insert_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        insert_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.insert_method_combo = QComboBox()
+        self._make_combo_responsive(self.insert_method_combo)
+        self.insert_method_combo.addItem(
+            "Мгновенно (через буфер обмена)", "paste"
+        )
+        self.insert_method_combo.addItem("Набором символов", "type")
+        insert_method_index = self.insert_method_combo.findData(
+            settings.get("insert_method", "paste")
+        )
+        self.insert_method_combo.setCurrentIndex(max(0, insert_method_index))
+        insert_form.addRow("Вставка текста", self.insert_method_combo)
+        self.insert_method_hint = QLabel(
+            "Если в каком-то приложении вставка не срабатывает, "
+            "выберите набор символов."
+        )
+        self.insert_method_hint.setWordWrap(True)
+        self._hint_labels.append(self.insert_method_hint)
+        insert_form.addRow("", self.insert_method_hint)
+        layout.addLayout(insert_form)
+
         translation_form = QFormLayout()
         translation_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         translation_form.setFieldGrowthPolicy(
@@ -1036,6 +1062,7 @@ class SettingsWindow(QMainWindow):
             "microphone": self.microphone_combo.currentData(),
             "language": self.language_combo.currentData(),
             "russian_engine": self.russian_engine_combo.currentData(),
+            "insert_method": self.insert_method_combo.currentData(),
             "model": self.model_combo.currentData(),
             "resource_mode": self.resource_mode_combo.currentData(),
             "auto_insert": self.auto_insert_checkbox.isChecked(),
